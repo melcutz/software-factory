@@ -1,0 +1,6 @@
+/factory/jobs/*
+!/factory/jobs/.gitkeep
+/.worktrees/
+/.superpowers/
+__pycache__/
+*.py[cod]

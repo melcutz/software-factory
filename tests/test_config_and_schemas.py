@@ -1,0 +1,159 @@
+import json
+import os
+import tempfile
+import unittest
+
+from factory.lib.config import load_config, resolve_reviewers
+from factory.lib.schemas import (
+    SCHEMAS,
+    render_approve_md,
+    render_build_md,
+    render_intake_md,
+    render_pr_body,
+    render_review_md,
+    render_spec_md,
+    validate_stage_output,
+)
+
+
+class ConfigAndSchemaTests(unittest.TestCase):
+    def test_load_repo_config_and_route_all_surfaces(self):
+        cfg = load_config(os.path.abspath("factory"))
+        self.assertEqual(cfg["auto_merge"], "low")
+        rev = resolve_reviewers(cfg, "high", ["ui", "security"])
+        self.assertEqual(set(rev.keys()), {"code", "security", "ux", "ui"})
+        self.assertEqual(rev["code"], "gemini-3.8-flash-medium")
+        self.assertEqual(rev["security"], "gemini-4-argon-high")
+        rev_low = resolve_reviewers(cfg, "low", [])
+        self.assertEqual(rev_low, {"code": "gemini-3.6-flash-low"})
+
+    def test_nit_only_review_normalizes_to_pass(self):
+        raw = {
+            "verdict": "CHANGES",
+            "summary": ["Minor style comment"],
+            "findings": [
+                {"severity": "nit", "file": "a.py", "line": 3, "issue": "name", "fix": "rename"}
+            ],
+            "checked": ["spec compliance"],
+        }
+        out = validate_stage_output("review", raw)
+        self.assertEqual(out["verdict"], "PASS")
+        self.assertIn("VERDICT: PASS", render_review_md("code", out))
+
+    def test_actionable_review_keeps_changes_verdict(self):
+        raw = {
+            "verdict": "CHANGES",
+            "summary": ["Bug in auth check"],
+            "findings": [
+                {"severity": "must_fix", "file": "auth.py", "line": 12, "issue": "missing check", "fix": "verify token"}
+            ],
+            "checked": ["auth boundary"],
+        }
+        out = validate_stage_output("review", raw)
+        self.assertEqual(out["verdict"], "CHANGES")
+        self.assertIn("VERDICT: CHANGES", render_review_md("security", out))
+
+    def test_spec_validation_enforces_one_to_six_slices(self):
+        with self.assertRaises(ValueError):
+            validate_stage_output(
+                "spec",
+                {
+                    "summary": ["x"],
+                    "problem": "p",
+                    "solution": "s",
+                    "user_stories": ["u"],
+                    "implementation_decisions": [],
+                    "testing_decisions": [],
+                    "glossary_updates": [],
+                    "out_of_scope": [],
+                    "slices": [],
+                },
+            )
+
+    def test_invalid_auto_merge_and_merge_method_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "config.json"), "w") as f:
+                json.dump({"auto_merge": "yolo"}, f)
+            with self.assertRaises(ValueError):
+                load_config(d)
+            with open(os.path.join(d, "config.json"), "w") as f:
+                json.dump({"merge_method": "fast-forward"}, f)
+            with self.assertRaises(ValueError):
+                load_config(d)
+
+    def test_markdown_renderers_and_schemas_cover_all_stages(self):
+        self.assertEqual(set(SCHEMAS.keys()), {"intake", "spec", "build", "review", "approve"})
+        intake = validate_stage_output(
+            "intake",
+            {
+                "decision": "ACCEPT",
+                "risk": "medium",
+                "surfaces": ["security"],
+                "summary": ["Add token rotation"],
+                "scope_in": "Token rotation endpoint",
+                "scope_out": "UI dashboard",
+                "questions": [],
+                "reasoning": "Clear backend feature.",
+            },
+        )
+        spec = validate_stage_output(
+            "spec",
+            {
+                "summary": ["Rotate refresh tokens"],
+                "problem": "Stale tokens remain valid",
+                "solution": "Rotate on refresh",
+                "user_stories": ["As a user, my refresh token rotates"],
+                "implementation_decisions": ["Store token family id"],
+                "testing_decisions": ["Test public refresh handler seam"],
+                "glossary_updates": [],
+                "out_of_scope": ["Admin UI"],
+                "slices": [
+                    {
+                        "id": "slice-1",
+                        "title": "Token rotation core",
+                        "goal": "Rotate and invalidate reused tokens",
+                        "files": ["src/auth.py"],
+                        "test_seams": ["refresh_session()"],
+                        "acceptance_criteria": ["Old token fails after rotation"],
+                    }
+                ],
+            },
+        )
+        build = validate_stage_output(
+            "build",
+            {
+                "verdict": "DONE",
+                "summary": ["Implemented slice 1"],
+                "changes": ["Added refresh_session rotation"],
+                "tests_added": ["test_reused_token_revokes_family"],
+                "blocked_reason": "",
+                "notes": "",
+            },
+        )
+        approve = validate_stage_output(
+            "approve",
+            {
+                "decision": "APPROVE",
+                "summary": ["All checks and security review passed"],
+                "reasoning": "Matches spec cleanly",
+                "merge_danger": "Two-way door; isolated to refresh endpoint",
+                "question": "",
+            },
+        )
+        self.assertIn("DECISION: ACCEPT", render_intake_md(intake))
+        self.assertIn("## Vertical Slices", render_spec_md(spec))
+        self.assertIn("VERDICT: DONE", render_build_md(build))
+        self.assertIn("DECISION: APPROVE", render_approve_md(approve))
+        pr_body = render_pr_body(
+            {"issue": 42, "risk": "medium", "round": 1},
+            intake,
+            spec,
+            {"code": {"verdict": "PASS", "summary": ["Clean"]}},
+            approve,
+        )
+        self.assertIn("Closes #42", pr_body)
+        self.assertIn("Two-way door", pr_body)
+
+
+if __name__ == "__main__":
+    unittest.main()
