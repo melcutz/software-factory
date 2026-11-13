@@ -1,53 +1,82 @@
-# Software Factory for Google Antigravity (agy) (V2)
+# Autonomous Software Factory for Google Antigravity (`agy`)
 
-A software factory that works through your GitHub issues. Label an issue `factory`, run `/factory run`, and agents decide whether it's worth building, write a spec, build it, test it with your own checks, review it, and open a pull request that closes the issue.
+An installable, zero-dependency software factory that turns GitHub issues—from small bugfixes to **complex, multi-file features**—into tested, multi-axis-reviewed Pull Requests using **Google Antigravity (`agy`)**.
 
-## Adapted from
+Label an issue `factory` and run `/factory run` (inside `agy`) or `./factory/bin/factory run` (headless from any terminal, SSH session, or cron job).
 
-[ZazenCodes' Software Factory V2](https://github.com/zazencodes/zazencodes-season-3/tree/main/src/software-factory-claude-code-v2) — adapted for Google Antigravity (agy) with Herdr for subagent spawning.
+## How It Works
 
-## What's different from the OpenCode version
+```text
+GitHub Issue (`factory` label)
+  │
+  ▼
+intake (sandboxed JSON) ──► ACCEPT / NEEDS_INFO / REJECT + risk + surfaces (ui, security)
+  │
+  ▼
+spec-writer (sandboxed JSON) ──► spec.md + 1..6 ordered vertical TDD slices (plan.json)
+  │
+  ▼
+builder + gate loop (in isolated .worktrees/job-<N> on branch factory/job-<N>)
+  ├─ Builds each vertical slice with Red-Green-Refactor TDD at public seams
+  ├─ Runs protected_paths diff check + main checkout's factory/checks.sh after every slice
+  └─ Self-heals slice gate failures before moving to the next slice
+  │
+  ▼
+parallel reviewers (sandboxed ThreadPoolExecutor)
+  ├─ reviewer-code (Standards + Spec fidelity)
+  ├─ reviewer-security (routed for security surface; applies ponytail-audit checks)
+  └─ reviewer-ux + reviewer-ui (routed for UI surface)
+  │  (nit-only reviews pass automatically; actionable findings loop back to builder up to max_rounds)
+  ▼
+approver (sandboxed JSON)
+  ├─ Low risk (or auto_merge="all"): syncs base branch, re-runs gate, auto-merges PR
+  └─ Medium/High risk (default auto_merge="low"): marks PR ready (`gh pr ready`) with full evidence for 1-click merge
+```
 
-| OpenCode version | agy (Antigravity) version |
-|---|---|
-| `.opencode/agents/*.md` (project-level agents) | `factory/agents/*.md` (agent definitions passed via prompt) |
-| `.opencode/skills/` | `.agents/skills/` |
-| `opencode run --agent X` | `agy -p` with agent definition prepended |
-| OpenCode Go models | Google Gemini models (via agy) |
-| `--auto` for permissions | `--dangerously-skip-permissions` |
+## Key Design Highlights
 
-## Model routing (Google Gemini via agy)
+- **Built for complex features:** Instead of trying to one-shot large features in a single prompt, `spec-writer` decomposes complex issues into 2–6 vertical TDD slices verified individually by `factory/checks.sh` before full-branch review.
+- **Deterministic Python orchestrator (`factory/bin/factory`):** Zero third-party Python packages and **no `herdr` dependency**. State transitions, atomic `job.json` updates, resume-after-crash, git worktrees, and `gh` PR mutations live in tested Python code rather than fragile chat loops.
+- **Hard safety & trust boundaries:**
+  - Issue descriptions and comments are isolated inside escaped `<untrusted_issue_data>` blocks.
+  - Non-builder stages (`intake`, `spec-writer`, `reviewers`, `approver`) run with `agy -p --sandbox --output-format json --json-schema`, verified clean against git `HEAD`.
+  - `gate` enforces a hardcoded protected-path floor (`factory/`, `.agents/`, plus configured paths like `.github/`) using `--no-renames` diff checks so branches cannot weaken their own test gates.
+  - Only the Python runner pushes branches or invokes `gh pr`.
+- **Crash-safe & resumable:** Re-running `factory run` resumes interrupted jobs at their exact stage and last completed vertical slice, and automatically resumes `factory:needs-info` / `factory:needs-human` issues once you reply and re-apply the `factory` label.
 
-| Role | Model | Notes |
+## Model Routing (`factory/config.json`)
+
+| Role | Default Model | Notes |
 |---|---|---|
-| Intake | gemini-3.8-flash-medium | Good reasoning, moderate cost |
-| Spec writer | gemini-4-argon-high | Strong reasoning |
-| Builder | gemini-4-argon-high | Strong coding |
-| Code reviewer (low risk) | gemini-3.6-flash-low | Cheapest |
-| Code reviewer (med/high) | gemini-3.8-flash-low/medium | Moderate |
-| Security reviewer | gemini-4-argon-high | Uses ponytail-audit skill for thorough security audit |
-| UX reviewer | gemini-3.8-flash-medium | Moderate |
-| UI reviewer | gemini-3.6-flash-low | Cheapest |
-| Approver | gemini-4-argon-high | Strong reasoning |
+| `intake` | `gemini-3.8-flash-medium` | Fast triage, risk & surface classification |
+| `spec_writer` | `gemini-4-argon-high` | Architecture, domain check & vertical slice planning |
+| `builder` | `gemini-4-argon-high` | Slice-by-slice TDD & review-fix implementation |
+| `code_low` | `gemini-3.6-flash-low` | Code review for low-risk changes |
+| `code_medium` | `gemini-3.8-flash-low` | Code review for medium-risk changes |
+| `code_high` | `gemini-3.8-flash-medium` | Code review for high-risk changes |
+| `security` | `gemini-4-argon-high` | Security, data-loss & concurrency audit (`ponytail-audit`) |
+| `ux` / `ui` | `gemini-3.8-flash-medium` / `gemini-3.6-flash-low` | UX flows, accessibility & visual fit |
+| `approver` | `gemini-4-argon-high` | Final readiness check & merge-danger summary |
 
-## Install
+## CLI & `/factory` Skill Commands
 
-See INSTALL.md.
+| Command | CLI Equivalent | Purpose |
+|---|---|---|
+| `/factory run [n]` | `./factory/bin/factory run [n]` | Drain queue or run/resume issue `#n` |
+| `/factory status [job-id]` | `./factory/bin/factory status [job-id]` | View live job stages, slice progress, tokens & PR URLs |
+| `/factory queue` | `./factory/bin/factory queue` | List open eligible `factory` issues |
+| `/factory doctor` | `./factory/bin/factory doctor` | Check git, `gh`, `agy`, config, `checks.sh` & `.gitignore` |
+| `/factory research <topic>` | *(interactive in `agy`)* | Primary-source research saved to `docs/research/` |
+| `/factory improve [area]` | *(interactive in `agy`)* | Visual HTML architecture review for module deepening |
 
-## Incorporated skills from mattpocock/skills
+## Install & Test
 
-The factory agents now incorporate principles from [mattpocock/skills](https://github.com/mattpocock/skills):
+See [INSTALL.md](INSTALL.md) to install into any GitHub repository. To run this repository's unit and end-to-end test suite:
 
-- **TDD** (builder): Red-green-refactor, test at seams, anti-patterns
-- **Code review** (reviewer-code): Two-axis review (Standards + Spec)
-- **to-spec** (spec-writer): Spec template with user stories, implementation decisions, testing decisions
-- **Grilling** (intake): Relentless interview discipline for NEEDS-INFO
-- **Domain modeling** (spec-writer): Build/sharpen domain model, update GLOSSARY.md, offer ADRs
-- **Implement** (builder): TDD at seams, regular checks, code-review at end
-- **Improve codebase architecture** (architect): Survey for deepening opportunities, HTML report
-- **Research** (researcher): Investigate against primary sources, write findings to Markdown
-- **PR body** (builder): Summary + evidence + merge-danger call
+```bash
+bash factory/checks.sh
+```
 
-## License
+## Credits & License
 
-GPLv3 (same as original).
+Adapted from [ZazenCodes' Software Factory V2](https://github.com/zazencodes/zazencodes-season-3/tree/main/src/software-factory-claude-code-v2) with engineering workflows inspired by [mattpocock/skills](https://github.com/mattpocock/skills). Licensed under GPLv3.

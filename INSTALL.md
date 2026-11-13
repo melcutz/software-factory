@@ -1,18 +1,26 @@
-# Install the Software Factory (Google Antigravity / agy edition)
+# Install the Software Factory (Google Antigravity / `agy` Edition)
 
 ## Prerequisites
 
-- Git repo with `origin` on GitHub; `gh auth status` shows push access.
-- `agy --version` available.
-- `herdr --version` available (0.9+).
-- `python3 --version` 3.10+.
-- Running inside a herdr pane (`HERDR_ENV=1`).
-- None of the target files already exist.
+- Git repository with `origin` on GitHub and `gh auth status` authenticated with push access.
+- `agy --version` installed and authenticated on `PATH`.
+- `python3 --version` 3.10+ (standard library only; zero `pip` packages and no `herdr` required).
 
-## 1. Copy
+## 1. Copy Into Target Repository
 
-```
+Copy the skill and `factory/` directory into the root of your repository:
+
+```text
 .agents/skills/factory/SKILL.md
+factory/bin/factory
+factory/lib/__init__.py
+factory/lib/config.py
+factory/lib/schemas.py
+factory/lib/state.py
+factory/lib/git_ops.py
+factory/lib/gate_runner.py
+factory/lib/agy_runner.py
+factory/lib/pipeline.py
 factory/agents/intake.md
 factory/agents/spec-writer.md
 factory/agents/builder.md
@@ -25,37 +33,51 @@ factory/agents/researcher.md
 factory/agents/architect.md
 factory/config.json
 factory/checks.sh
-factory/bin/job
-factory/bin/gate
-factory/bin/route
-factory/bin/spawn-agent
+factory/jobs/.gitkeep
 ```
 
-## 2. Adapt
+Ensure executables have `+x`:
 
-- **`factory/checks.sh`**: Replace placeholder with real checks.
-- **`factory/config.json`**: Set `base_branch`, `merge_method`, adjust models.
-- **`factory/agents/*.md`**: Tailor checklists to your stack (except reviewer-security which uses ponytail-audit).
+```bash
+chmod +x factory/bin/factory factory/checks.sh
+```
 
-Note: Security review uses the ponytail-audit skill (already installed via the ponytail plugin in agy). The reviewer-security agent instructs agy to invoke /ponytail-audit for a thorough security audit of the codebase.
-- **`AGENTS.md`** (or `GEMINI.md`): Add software factory section.
-- **`.gitignore`**: Append `/factory/jobs/` and `/.worktrees/`.
-- **Labels**: Create `factory`, `factory:needs-info`, `factory:needs-human` on GitHub.
+## 2. Configure for Your Stack
 
-## 3. Verify
+1. **`factory/checks.sh`**: Replace the template test command with your project's deterministic, non-interactive verification suite (e.g. `npm run typecheck && npm test`, `pytest`, `cargo test --all-targets`). It must exit non-zero on any failure and must not rewrite tracked files.
+2. **`factory/config.json`**:
+   - Set `base_branch` (`"main"`, `"master"`, etc.) and `merge_method` (`"merge"`, `"squash"`, or `"rebase"`).
+   - Set `auto_merge`:
+     - `"low"` *(default)*: Auto-merge passing `low`-risk PRs; mark passing `medium`/`high`-risk PRs ready (`gh pr ready`) for 1-click human merge.
+     - `"all"`: Auto-merge all approved PRs regardless of risk tier.
+     - `"none"`: Never auto-merge; stop every approved PR at `ready`.
+   - Adjust `concurrency` (default `3`) and `models` if desired.
+3. **`.gitignore`**: Append:
+   ```gitignore
+   /factory/jobs/*
+   !/factory/jobs/.gitkeep
+   /.worktrees/
+   ```
+4. **GitHub Labels**: Create `factory`, `factory:needs-info`, and `factory:needs-human` on your GitHub repository:
+   ```bash
+   gh label create "factory" --color "0E8A16" --description "Queued for autonomous software factory" --force
+   gh label create "factory:needs-info" --color "FBCA04" --description "Factory waiting for clarification" --force
+   gh label create "factory:needs-human" --color "D93F0B" --description "Factory escalated for human review" --force
+   ```
 
-1. `bash factory/checks.sh` exits 0.
-2. `factory/bin/job queue` runs without error.
-3. `python3 -m json.tool factory/config.json` succeeds.
-4. `git check-ignore factory/jobs/x .worktrees/x` prints both paths.
-5. `HERDR_ENV=1` is set.
+## 3. Verify Installation
 
-## 4. Hand over
+Run the built-in doctor check and your gate script:
 
-Commit the install. Ask before pushing.
+```bash
+./factory/bin/factory doctor
+bash factory/checks.sh
+```
 
-Tell the user:
-- Label one or two small issues `factory`, then run `/factory run` in agy from the project root (inside a herdr pane).
-- Every job ends as a PR.
-- Watch subagents work in real-time in separate herdr panes.
-- To start carefully, set `concurrency` to 1.
+Both commands must exit `0`.
+
+## 4. Run
+
+- Label any GitHub issue `factory` (from small bugfixes to complex multi-file features).
+- Inside `agy`, run `/factory run` (or run `./factory/bin/factory run` directly from any terminal, SSH session, or cron job).
+- Check progress anytime with `/factory status` or `./factory/bin/factory status`.
