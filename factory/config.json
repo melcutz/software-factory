@@ -1,0 +1,37 @@
+{
+  "concurrency": 3,
+  "max_rounds": 3,
+  "base_branch": "main",
+  "merge_method": "merge",
+  "labels": {
+    "queue": "factory",
+    "needs_info": "factory:needs-info",
+    "needs_human": "factory:needs-human"
+  },
+  "routing": {
+    "low":    { "code": "gemini-3.8-flash-low" },
+    "medium": { "code": "gemini-3.8-flash-medium" },
+    "high":   { "code": "gemini-3.8-flash-high" }
+  },
+  "surface_reviewers": {
+    "ui": { "ux": "gemini-3.8-flash-medium", "ui": "gemini-3.6-flash-low" },
+    "security": { "security": "gemini-4-argon-high" }
+  },
+  "protected_paths": [
+    "factory/checks.sh",
+    "factory/config.json"
+  ],
+  "ports": { "base": 5100, "step": 10 },
+  "models": {
+    "intake": "gemini-3.8-flash-medium",
+    "spec_writer": "gemini-4-argon-high",
+    "builder": "gemini-4-argon-high",
+    "approver": "gemini-4-argon-high",
+    "code_reviewer_low": "gemini-3.6-flash-low",
+    "code_reviewer_med": "gemini-3.8-flash-low",
+    "code_reviewer_high": "gemini-3.8-flash-medium",
+    "security_reviewer": "gemini-4-argon-high",
+    "ux_reviewer": "gemini-3.8-flash-medium",
+    "ui_reviewer": "gemini-3.6-flash-low"
+  }
+}

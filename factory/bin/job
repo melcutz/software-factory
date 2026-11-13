@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""factory/bin/job — the only writer of job.json. Refuses illegal moves.
+
+Subcommands:
+  queue              List open 'factory' labeled issues from GitHub
+  create <issue>     Create a new job for an issue number
+  advance <job-id> <stage>   Move job to a new stage (validates transition)
+  merge <job-id>     Merge the job's PR via gh pr merge
+  cost <job-id>      Calculate cost from transcripts
+"""
+import json, os, sys, subprocess, re
+from datetime import datetime, timezone
+
+FACTORY_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+JOBS_DIR = os.path.join(FACTORY_DIR, "jobs")
+
+TRANSITIONS = {
+    "intake": ["needs-info", "spec", "rejected"],
+    "needs-info": ["intake", "rejected"],
+    "spec": ["build"],
+    "build": ["gate"],
+    "gate": ["review", "build"],
+    "review": ["approve", "build"],
+    "approve": ["merging", "needs-human"],
+    "merging": ["merged", "needs-human"],
+    "needs-human": ["build", "rejected"],
+    "merged": [],
+    "rejected": [],
+}
+
+def job_dir(job_id):
+    return os.path.join(JOBS_DIR, job_id)
+
+def load_job(job_id):
+    path = os.path.join(job_dir(job_id), "job.json")
+    if not os.path.exists(path):
+        print(f"Job {job_id} not found", file=sys.stderr)
+        sys.exit(1)
+    with open(path) as f:
+        return json.load(f)
+
+def save_job(job_id, data):
+    d = job_dir(job_id)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "job.json")
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+def cmd_queue():
+    """List open issues labeled 'factory' from GitHub."""
+    try:
+        result = subprocess.run(
+            ["gh", "issue", "list", "--label", "factory", "--state", "open", "--json", "number,title,url"],
+            capture_output=True, text=True, check=True
+        )
+        issues = json.loads(result.stdout)
+        for issue in issues:
+            print(f"{issue['number']}\t{issue['title']}\t{issue['url']}")
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_create(issue_number):
+    """Create a new job for an issue number."""
+    # Get issue details
+    try:
+        result = subprocess.run(
+            ["gh", "issue", "view", str(issue_number), "--json", "number,title,body,url"],
+            capture_output=True, text=True, check=True
+        )
+        issue = json.loads(result.stdout)
+    except Exception as e:
+        print(f"Error fetching issue: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    job_id = f"job-{issue_number}"
+    os.makedirs(job_dir(job_id), exist_ok=True)
+
+    # Write issue.md
+    with open(os.path.join(job_dir(job_id), "issue.md"), "w") as f:
+        f.write(f"# Issue #{issue['number']}: {issue['title']}\n\n")
+        f.write(f"URL: {issue['url']}\n\n")
+        f.write(issue.get("body", "") or "")
+
+    job = {
+        "id": job_id,
+        "issue": issue_number,
+        "issue_url": issue["url"],
+        "issue_title": issue["title"],
+        "stage": "intake",
+        "round": 0,
+        "created": datetime.now(timezone.utc).isoformat(),
+        "updated": datetime.now(timezone.utc).isoformat(),
+    }
+    save_job(job_id, job)
+    print(job_id)
+
+def cmd_advance(job_id, stage):
+    """Move job to a new stage (validates transition)."""
+    job = load_job(job_id)
+    current = job["stage"]
+    if stage not in TRANSITIONS.get(current, []):
+        print(f"Illegal transition: {current} -> {stage}", file=sys.stderr)
+        sys.exit(1)
+    job["stage"] = stage
+    job["updated"] = datetime.now(timezone.utc).isoformat()
+    if stage == "build":
+        job["round"] = job.get("round", 0) + 1
+    save_job(job_id, job)
+    print(f"{job_id}: {current} -> {stage}")
+
+def cmd_merge(job_id):
+    """Merge the job's PR via gh pr merge."""
+    job = load_job(job_id)
+    # Find PR number from job folder
+    pr_file = os.path.join(job_dir(job_id), "pr.md")
+    pr_number = None
+    if os.path.exists(pr_file):
+        with open(pr_file) as f:
+            for line in f:
+                m = re.search(r"PR:\s*#?(\d+)", line)
+                if m:
+                    pr_number = m.group(1)
+                    break
+    if not pr_number:
+        print("No PR number found in pr.md", file=sys.stderr)
+        sys.exit(1)
+    try:
+        subprocess.run(["gh", "pr", "merge", pr_number, "--merge"], check=True)
+        cmd_advance(job_id, "merged")
+    except Exception as e:
+        print(f"Merge failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_cost(job_id):
+    """Calculate cost from transcripts (best-effort)."""
+    # This is a simplified version; full implementation would parse Claude Code transcripts.
+    # For opencode/herdr, we'd parse opencode session logs.
+    print(f"Cost calculation not yet implemented for opencode/herdr")
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: job <subcommand> [args]", file=sys.stderr)
+        sys.exit(1)
+    cmd = sys.argv[1]
+    if cmd == "queue":
+        cmd_queue()
+    elif cmd == "create":
+        cmd_create(sys.argv[2])
+    elif cmd == "advance":
+        cmd_advance(sys.argv[2], sys.argv[3])
+    elif cmd == "merge":
+        cmd_merge(sys.argv[2])
+    elif cmd == "cost":
+        cmd_cost(sys.argv[2])
+    else:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# factory/bin/gate — runs checks.sh in a job's worktree.
+# Usage: gate <job-id> <worktree-path> [round]
+# Writes round-N/checks.md with the verdict.
+set -euo pipefail
+
+JOB_ID="${1:?Usage: gate <job-id> <worktree-path> [round]}"
+WORKTREE="${2:?Usage: gate <job-id> <worktree-path> [round]}"
+ROUND="${3:-1}"
+
+FACTORY_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+JOB_DIR="${FACTORY_DIR}/jobs/${JOB_ID}"
+ROUND_DIR="${JOB_DIR}/round-${ROUND}"
+CHECKS="${FACTORY_DIR}/checks.sh"
+
+mkdir -p "${ROUND_DIR}"
+
+# Run checks.sh in the worktree (main checkout's copy, not the branch's)
+OUTPUT_FILE="${ROUND_DIR}/checks.log"
+set +e
+(cd "${WORKTREE}" && bash "${CHECKS}") > "${OUTPUT_FILE}" 2>&1
+EXIT_CODE=$?
+set -e
+
+# Write checks.md
+if [ ${EXIT_CODE} -eq 0 ]; then
+    VERDICT="PASS"
+else
+    VERDICT="FAIL"
+fi
+
+cat > "${ROUND_DIR}/checks.md" <<EOF
+VERDICT: ${VERDICT}
+
+## Summary
+- Gate ran \`checks.sh\` in worktree \`${WORKTREE}\`
+- Exit code: ${EXIT_CODE}
+- Full output in \`checks.log\`
+
+## Output
+\`\`\`
+$(cat "${OUTPUT_FILE}")
+\`\`\`
+EOF
+
+echo "VERDICT: ${VERDICT}"
+exit ${EXIT_CODE}
