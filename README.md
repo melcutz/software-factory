@@ -79,4 +79,4 @@ bash factory/checks.sh
 
 ## Credits & License
 
-Adapted from [ZazenCodes' Software Factory V2](https://github.com/zazencodes/zazencodes-season-3/tree/main/src/software-factory-claude-code-v2) with engineering workflows inspired by [mattpocock/skills](https://github.com/mattpocock/skills). Licensed under GPLv3.
+Inspired by [ZazenCodes' Software Factory V2](https://github.com/zazencodes/zazencodes-season-3/tree/main/src/software-factory-claude-code-v2) and engineering workflows from [mattpocock/skills](https://github.com/mattpocock/skills). Licensed under the [MIT License](LICENSE).
