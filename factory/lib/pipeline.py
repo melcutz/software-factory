@@ -18,6 +18,7 @@ from factory.lib.git_ops import (
     ensure_worktree,
     is_worktree_clean,
     push_branch,
+    repo_lock,
     reset_worktree_clean,
     sync_with_base,
 )
@@ -110,6 +111,45 @@ def _collect_actionable_review_findings(round_dir: str) -> str:
     return "\n".join(lines)
 
 
+def _aggregate_slice_builds(jdir: str, total_completed: int) -> tuple[dict, str]:
+    """Aggregate completed slice JSON/Markdown outputs across rounds into one unified build summary."""
+    summaries: list[str] = []
+    changes: list[str] = []
+    tests_added: list[str] = []
+    notes_list: list[str] = []
+    slice_mds: list[str] = []
+
+    round_dirs = sorted(
+        (d for d in os.listdir(jdir) if d.startswith("round-") and os.path.isdir(os.path.join(jdir, d))),
+        key=lambda x: int(x.split("-", 1)[1]) if x.split("-", 1)[1].isdigit() else 0,
+    )
+    for s_num in range(1, total_completed + 1):
+        # Find latest slice-{s_num}-build.json / .md across rounds
+        for rdir in reversed(round_dirs):
+            s_json_path = os.path.join(jdir, rdir, f"slice-{s_num}-build.json")
+            s_md_path = os.path.join(jdir, rdir, f"slice-{s_num}-build.md")
+            if os.path.isfile(s_json_path):
+                s_data = _read_json(s_json_path)
+                summaries.extend(s_data.get("summary") or [])
+                changes.extend(s_data.get("changes") or [])
+                tests_added.extend(s_data.get("tests_added") or [])
+                if s_data.get("notes"):
+                    notes_list.append(str(s_data["notes"]).strip())
+                if os.path.isfile(s_md_path):
+                    slice_mds.append(_read_text(s_md_path).strip())
+                break
+
+    agg = {
+        "verdict": "DONE",
+        "summary": summaries or ["Completed vertical slices"],
+        "changes": changes,
+        "tests_added": tests_added,
+        "blocked_reason": "",
+        "notes": "\n".join(notes_list),
+    }
+    return agg, "\n\n".join(slice_mds)
+
+
 def process_job(
     repo_root: str,
     issue_number: int,
@@ -133,12 +173,15 @@ def process_job(
     _write_text(os.path.join(jdir, "issue.md"), issue_md)
 
     if action == "skip":
-        gh_client.edit_labels(issue_number, remove=[labels["queue"]])
+        try:
+            gh_client.edit_labels(issue_number, remove=[labels["queue"]])
+        except Exception as exc:
+            print(f"[{job_id}] warning: failed to remove queue label on skipped job: {exc}", file=sys.stderr)
         return job
 
-    worktree, branch = ensure_worktree(repo_root, job_id, base_branch)
-
     try:
+        worktree, branch = ensure_worktree(repo_root, job_id, base_branch)
+
         while True:
             job = load_job(jobs_dir, job_id)
             stage = job["stage"]
@@ -230,14 +273,15 @@ def process_job(
                 plan_data = _read_json(os.path.join(jdir, "plan.json"), {"slices": []})
                 slices = plan_data.get("slices", [])
                 total_slices = len(slices)
+                prior_escalation = job.get("last_error") or ""
 
                 if job["completed_slices"] < total_slices:
-                    # Execute remaining vertical TDD slices one by one
                     for idx in range(job["completed_slices"], total_slices):
                         slice_num = idx + 1
                         sl = slices[idx]
                         retry_feedback = ""
                         slice_done = False
+                        _, prior_slices_md = _aggregate_slice_builds(jdir, idx)
 
                         for attempt in range(cfg["max_slice_retries"] + 1):
                             prompt_parts = [
@@ -253,6 +297,12 @@ def process_job(
                                 "## Full Specification",
                                 spec_md,
                             ]
+                            if prior_slices_md:
+                                prompt_parts.extend(["", "## Previously Completed Slices", prior_slices_md])
+                            if prior_escalation:
+                                prompt_parts.extend(
+                                    ["", "## Prior Escalation Context", prior_escalation, "", "## Latest Issue & Comments", issue_md]
+                                )
                             if retry_feedback:
                                 prompt_parts.extend(["", "## Previous Attempt Failure (Must Fix)", retry_feedback])
 
@@ -301,12 +351,14 @@ def process_job(
                                 tag=f"slice-{slice_num}",
                             )
                             if passed:
+                                _write_json(os.path.join(round_dir, f"slice-{slice_num}-build.json"), build_out)
                                 _write_text(
                                     os.path.join(round_dir, f"slice-{slice_num}-build.md"),
                                     render_build_md(build_out, heading=f"Slice {slice_num}: {sl['title']}"),
                                 )
-                                _write_json(os.path.join(round_dir, "build.json"), build_out)
-                                _write_text(os.path.join(round_dir, "build.md"), render_build_md(build_out))
+                                agg_build, _ = _aggregate_slice_builds(jdir, slice_num)
+                                _write_json(os.path.join(round_dir, "build.json"), agg_build)
+                                _write_text(os.path.join(round_dir, "build.md"), render_build_md(agg_build))
                                 update_job(jobs_dir, job_id, completed_slices=slice_num)
                                 slice_done = True
                                 break
@@ -324,19 +376,32 @@ def process_job(
                                 f"{cfg['max_slice_retries'] + 1} attempts.\n\n{retry_feedback[:1500]}",
                             )
                 else:
-                    # Review-fix or gate-fix round (all slices already implemented)
                     prev_round_dir = os.path.join(jdir, f"round-{max(1, round_num - 1)}")
                     findings_text = _collect_actionable_review_findings(prev_round_dir)
                     prev_checks = _read_text(os.path.join(prev_round_dir, "checks.md"))
-                    prompt = "\n".join(
+                    prev_approve = _read_text(os.path.join(prev_round_dir, "approve.md"))
+                    prompt_parts = [
+                        f"JOB_ID: {job_id}",
+                        f"FIX_ROUND: {round_num}",
+                        f"BRANCH: {branch}",
+                        f"BASE_BRANCH: {base_branch}",
+                        "",
+                        "## Actionable Review Findings to Fix",
+                        findings_text or "(None from reviewers; check escalation/gate context below.)",
+                    ]
+                    if prior_escalation or prev_approve:
+                        prompt_parts.extend(
+                            [
+                                "",
+                                "## Escalation / Approver Context",
+                                prior_escalation or prev_approve,
+                                "",
+                                "## Latest Issue & Human Comments",
+                                issue_md,
+                            ]
+                        )
+                    prompt_parts.extend(
                         [
-                            f"JOB_ID: {job_id}",
-                            f"FIX_ROUND: {round_num}",
-                            f"BRANCH: {branch}",
-                            f"BASE_BRANCH: {base_branch}",
-                            "",
-                            "## Actionable Review Findings to Fix",
-                            findings_text or "(Fix deterministic gate failures below.)",
                             "",
                             "## Previous Gate Output",
                             prev_checks,
@@ -352,7 +417,7 @@ def process_job(
                         "build",
                         "builder",
                         cfg["models"]["builder"],
-                        prompt,
+                        "\n".join(prompt_parts),
                         SCHEMAS["build"],
                         timeout_sec,
                         sandbox=False,
@@ -371,7 +436,8 @@ def process_job(
                     _write_json(os.path.join(round_dir, "build.json"), build_out)
                     _write_text(os.path.join(round_dir, "build.md"), render_build_md(build_out))
 
-                advance_stage(jobs_dir, job_id, "gate")
+                # Preserve last_error until approver completes so approver also sees escalation history if needed
+                advance_stage(jobs_dir, job_id, "gate", preserve_last_error=bool(prior_escalation))
                 continue
 
             if stage == "gate":
@@ -423,7 +489,7 @@ def process_job(
 
                 if not passed:
                     if job["round"] < job["round_limit"]:
-                        advance_stage(jobs_dir, job_id, "build")
+                        advance_stage(jobs_dir, job_id, "build", preserve_last_error=bool(job.get("last_error")))
                         continue
                     return _escalate_to_human(
                         jobs_dir,
@@ -449,7 +515,7 @@ def process_job(
                     pr_number=job.get("pr_number"),
                 )
                 update_job(jobs_dir, job_id, pr_number=pr_num, pr_url=pr_url)
-                advance_stage(jobs_dir, job_id, "review")
+                advance_stage(jobs_dir, job_id, "review", preserve_last_error=bool(job.get("last_error")))
                 continue
 
             if stage == "review":
@@ -468,7 +534,7 @@ def process_job(
                         f"ROUND: {round_num}",
                         f"BASE_BRANCH: {base_branch}",
                         "",
-                        "## Diff Stat (`origin/<base_branch>..HEAD`)",
+                        "## Diff Stat (`origin/<base_branch>...HEAD`)",
                         stat_text or "(empty)",
                         "",
                         "## Specification",
@@ -496,6 +562,7 @@ def process_job(
                         SCHEMAS["review"],
                         timeout_sec,
                         sandbox=True,
+                        clean_worktree=False,
                         log_name=f"r{round_num}-review-{rev_name}",
                     )
                     record_usage(jobs_dir, job_id, u, d)
@@ -515,7 +582,7 @@ def process_job(
                 has_changes = any(r["verdict"] == "CHANGES" for r in results.values())
                 if has_changes:
                     if job["round"] < job["round_limit"]:
-                        advance_stage(jobs_dir, job_id, "build")
+                        advance_stage(jobs_dir, job_id, "build", preserve_last_error=bool(job.get("last_error")))
                         continue
                     unresolved = _collect_actionable_review_findings(round_dir)
                     return _escalate_to_human(
@@ -527,7 +594,7 @@ def process_job(
                         f"Reviewers still requested changes after {job['round']} round(s):\n\n{unresolved}",
                     )
 
-                advance_stage(jobs_dir, job_id, "approve")
+                advance_stage(jobs_dir, job_id, "approve", preserve_last_error=bool(job.get("last_error")))
                 continue
 
             if stage == "approve":
@@ -549,14 +616,21 @@ def process_job(
                     elif fname.startswith("review-") and fname.endswith(".md"):
                         review_blocks.append(_read_text(os.path.join(round_dir, fname)))
 
-                approve_prompt = "\n".join(
+                approve_parts = [
+                    f"JOB_ID: {job_id}",
+                    f"ROUND: {round_num}",
+                    f"BASE_BRANCH: {base_branch}",
+                    "",
+                    "## Diff Stat (`origin/<base_branch>...HEAD`)",
+                    diff_stat(worktree, base_branch),
+                    "",
+                    "## Issue & Human Comments",
+                    issue_md,
+                ]
+                if job.get("last_error"):
+                    approve_parts.extend(["", "## Prior Escalation History", job["last_error"]])
+                approve_parts.extend(
                     [
-                        f"JOB_ID: {job_id}",
-                        f"ROUND: {round_num}",
-                        f"BASE_BRANCH: {base_branch}",
-                        "",
-                        "## Diff Stat",
-                        diff_stat(worktree, base_branch),
                         "",
                         "## Intake",
                         intake_md,
@@ -581,7 +655,7 @@ def process_job(
                     "approve",
                     "approver",
                     cfg["models"]["approver"],
-                    approve_prompt,
+                    "\n".join(approve_parts),
                     SCHEMAS["approve"],
                     timeout_sec,
                     sandbox=True,
@@ -617,57 +691,67 @@ def process_job(
 
                 if job.get("pr_number"):
                     gh_client.mark_pr_ready(int(job["pr_number"]))
-                gh_client.edit_labels(issue_number, remove=[labels["queue"]])
-                gh_client.comment_issue(
-                    issue_number,
-                    f"### PR Ready for Merge (`{job_id}`)\n\n"
-                    f"Pull Request {job.get('pr_url') or ('#' + str(job.get('pr_number')))} passed all deterministic checks "
-                    f"and reviews (`risk={job.get('risk')}`). Marked ready for 1-click merge.",
-                )
-                return advance_stage(jobs_dir, job_id, "ready")
+                ready_job = advance_stage(jobs_dir, job_id, "ready")
+                try:
+                    gh_client.edit_labels(issue_number, remove=[labels["queue"]])
+                    gh_client.comment_issue(
+                        issue_number,
+                        f"### PR Ready for Merge (`{job_id}`)\n\n"
+                        f"Pull Request {job.get('pr_url') or ('#' + str(job.get('pr_number')))} passed all deterministic checks "
+                        f"and reviews (`risk={job.get('risk')}`). Marked ready for 1-click merge.",
+                    )
+                except Exception as exc:
+                    print(f"[{job_id}] warning: post-ready issue update failed: {exc}", file=sys.stderr)
+                return ready_job
 
             if stage == "merging":
                 round_num = job["round"]
-                ok, head_changed, detail = sync_with_base(worktree, base_branch)
-                if not ok:
-                    return _escalate_to_human(
-                        jobs_dir,
-                        job_id,
-                        issue_number,
-                        gh_client,
-                        cfg,
-                        f"Merge conflict while syncing `{branch}` with `origin/{base_branch}`:\n\n```\n{detail[:1000]}\n```",
-                    )
-
-                if head_changed:
-                    passed, sync_checks_md = run_gate(
-                        repo_root,
-                        job_id,
-                        worktree,
-                        round_num,
-                        cfg,
-                        tag="pre-merge",
-                    )
-                    if not passed:
+                with repo_lock(repo_root):
+                    ok, head_changed, detail = sync_with_base(worktree, base_branch)
+                    if not ok:
                         return _escalate_to_human(
                             jobs_dir,
                             job_id,
                             issue_number,
                             gh_client,
                             cfg,
-                            f"Post-sync gate failed after merging `origin/{base_branch}`:\n\n{sync_checks_md[:1200]}",
+                            f"Merge conflict while syncing `{branch}` with `origin/{base_branch}`:\n\n```\n{detail[:1000]}\n```",
                         )
-                    push_branch(worktree, branch)
 
-                pr_num = int(job["pr_number"])
-                gh_client.mark_pr_ready(pr_num)
-                gh_client.merge_pr(pr_num, cfg["merge_method"])
-                gh_client.edit_labels(issue_number, remove=[labels["queue"]])
-                return advance_stage(jobs_dir, job_id, "merged")
+                    if head_changed:
+                        passed, sync_checks_md = run_gate(
+                            repo_root,
+                            job_id,
+                            worktree,
+                            round_num,
+                            cfg,
+                            tag="pre-merge",
+                        )
+                        if not passed:
+                            return _escalate_to_human(
+                                jobs_dir,
+                                job_id,
+                                issue_number,
+                                gh_client,
+                                cfg,
+                                f"Post-sync gate failed after merging `origin/{base_branch}`:\n\n{sync_checks_md[:1200]}",
+                            )
+                        push_branch(worktree, branch)
+
+                    pr_num = int(job["pr_number"])
+                    gh_client.mark_pr_ready(pr_num)
+                    gh_client.merge_pr(pr_num, cfg["merge_method"])
+                    merged_job = advance_stage(jobs_dir, job_id, "merged")
+
+                try:
+                    gh_client.edit_labels(issue_number, remove=[labels["queue"]])
+                except Exception as exc:
+                    print(f"[{job_id}] warning: post-merge label cleanup failed: {exc}", file=sys.stderr)
+                return merged_job
 
             raise RuntimeError(f"Unhandled stage {stage!r} for {job_id}")
 
-    except (AgentExecutionError, subprocess.CalledProcessError, ValueError) as exc:
+    except (AgentExecutionError, subprocess.CalledProcessError, RuntimeError, ValueError) as exc:
         cur = load_job(jobs_dir, job_id)
         if cur["stage"] not in TERMINAL_OR_READY_STAGES and cur["stage"] not in {"needs-info", "needs-human"}:
             return _escalate_to_human(
@@ -694,13 +778,17 @@ def run_factory(repo_root: str, issue_number: int | None = None) -> list[dict]:
     if not issues:
         return []
 
+    def _safe_worker(num: int) -> dict | None:
+        try:
+            return process_job(repo_root, num, config=cfg, gh=gh)
+        except Exception as exc:
+            print(f"[issue-{num}] error before job state could escalate: {exc}", file=sys.stderr)
+            return None
+
     max_workers = min(int(cfg["concurrency"]), len(issues))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [
-            pool.submit(process_job, repo_root, int(item["number"]), cfg, gh)
-            for item in issues
-        ]
-        return [fut.result() for fut in futures]
+        futures = [pool.submit(_safe_worker, int(item["number"])) for item in issues]
+        return [res for fut in futures if (res := fut.result()) is not None]
 
 
 def format_status_table(jobs: list[dict]) -> str:

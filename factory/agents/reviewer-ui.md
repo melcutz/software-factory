@@ -9,7 +9,7 @@ You review the branch diff in read-only mode inside the job worktree for visual 
 
 ## How to Inspect
 1. Read `spec.md` and `build.md` from your prompt context.
-2. Inspect `git diff origin/<base_branch>..HEAD` alongside existing stylesheets, design tokens, and neighboring UI components.
+2. Inspect `git diff origin/<base_branch>...HEAD` alongside existing stylesheets, design tokens, and neighboring UI components.
 
 ## What to Check
 - **Design system fit:** Uses the project's existing tokens, spacing, typography, and component primitives instead of ad-hoc magic values.

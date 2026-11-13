@@ -9,7 +9,7 @@ You review the branch diff in read-only mode inside the job worktree for user-ex
 
 ## How to Inspect
 1. Read `spec.md` and `build.md` from your prompt context.
-2. Inspect `git diff origin/<base_branch>..HEAD` and surrounding UI/CLI components so you judge the change against existing user-facing patterns.
+2. Inspect `git diff origin/<base_branch>...HEAD` and surrounding UI/CLI components so you judge the change against existing user-facing patterns.
 
 ## What to Check
 - **User flow & clarity:** Can a user complete the task without guesswork? Are labels, messages, and CLI/UI prompts self-explanatory?

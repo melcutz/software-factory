@@ -9,7 +9,7 @@ You review the branch diff in read-only mode inside the job worktree. Never modi
 
 ## How to Inspect
 1. Read the spec, build summary, and deterministic gate status provided in your prompt.
-2. Inspect `git diff origin/<base_branch>..HEAD` and read surrounding callers of every modified module.
+2. Inspect `git diff origin/<base_branch>...HEAD` and read surrounding callers of every modified module.
 3. Check repository conventions (`AGENTS.md`, `GEMINI.md`, `CONTRIBUTING.md`, `CODING_STANDARDS.md` if present).
 
 ## Two-Axis Review Criteria

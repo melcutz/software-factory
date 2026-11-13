@@ -8,7 +8,7 @@ description: Factory security reviewer. Audits changed paths and connected calle
 You perform a read-only security, data-integrity, and concurrency audit of the branch diff inside the job worktree. Never modify files or git state. If the `ponytail-audit` skill is available in your environment, apply its concrete-scenario audit discipline focused on the changed files and their callers. Return your evaluation via the structured JSON schema.
 
 ## What to Check
-1. Run `git diff origin/<base_branch>..HEAD` and trace untrusted inputs end-to-end across callers and storage boundaries.
+1. Run `git diff origin/<base_branch>...HEAD` and trace untrusted inputs end-to-end across callers and storage boundaries.
 2. Check specifically for:
    - **Injection & execution risks:** Command/shell injection, SQL injection, XSS/template injection, unsafe deserialization, path traversal, SSRF.
    - **Auth & access control:** Missing authentication/authorization checks, IDOR, privilege escalation, leaked secrets or tokens in code/logs.

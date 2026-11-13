@@ -16,7 +16,7 @@ TRANSITIONS: dict[str, list[str]] = {
     "review": ["approve", "build", "needs-human"],
     "approve": ["merging", "ready", "needs-human"],
     "merging": ["merged", "needs-human"],
-    "needs-human": ["build", "rejected"],
+    "needs-human": ["intake", "spec", "build", "rejected"],
     "ready": ["merged"],
     "merged": [],
     "rejected": [],
@@ -89,6 +89,7 @@ def advance_stage(
     job_id: str,
     next_stage: str,
     last_error: str | None = None,
+    preserve_last_error: bool = False,
 ) -> dict:
     with _job_lock(jobs_dir, job_id):
         job = load_job(jobs_dir, job_id)
@@ -107,18 +108,48 @@ def advance_stage(
                 )
             job["round"] = next_round
 
+        if next_stage == "needs-human":
+            job["escalated_from"] = current
+        elif current == "needs-human":
+            job["escalated_from"] = None
         job["stage"] = next_stage
-        if last_error is not None or next_stage not in {"needs-human", "needs-info"}:
+        if last_error is not None:
             job["last_error"] = last_error
+        elif not preserve_last_error and next_stage not in {"needs-human", "needs-info"}:
+            job["last_error"] = None
         job["updated"] = _now_iso()
         return _atomic_write_job(jobs_dir, job_id, job)
+
+
+def _has_accepted_intake(jdir: str) -> bool:
+    path = os.path.join(jdir, "intake.json")
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f).get("decision") == "ACCEPT"
+    except Exception:
+        return False
+
+
+def _has_valid_plan(jdir: str) -> bool:
+    path = os.path.join(jdir, "plan.json")
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            slices = json.load(f).get("slices")
+            return isinstance(slices, list) and len(slices) >= 1
+    except Exception:
+        return False
 
 
 def create_or_resume_job(jobs_dir: str, issue: dict, max_rounds: int) -> tuple[dict, str]:
     issue_num = int(issue["number"])
     job_id = f"job-{issue_num}"
     with _job_lock(jobs_dir, job_id):
-        path = os.path.join(_job_dir(jobs_dir, job_id), "job.json")
+        jdir = _job_dir(jobs_dir, job_id)
+        path = os.path.join(jdir, "job.json")
         if not os.path.exists(path):
             now = _now_iso()
             job = {
@@ -162,9 +193,20 @@ def create_or_resume_job(jobs_dir: str, issue: dict, max_rounds: int) -> tuple[d
             _atomic_write_job(jobs_dir, job_id, job)
             return advance_stage(jobs_dir, job_id, "intake"), "resume"
         if stage == "needs-human":
+            escalated_from = job.get("escalated_from")
+            has_pipeline_artifacts = any(
+                os.path.exists(os.path.join(jdir, name))
+                for name in ("issue.md", "intake.json", "plan.json", "spec.json")
+            )
+            if escalated_from == "intake" or (has_pipeline_artifacts and not _has_accepted_intake(jdir)):
+                _atomic_write_job(jobs_dir, job_id, job)
+                return advance_stage(jobs_dir, job_id, "intake", preserve_last_error=True), "resume"
+            if escalated_from == "spec" or (has_pipeline_artifacts and not _has_valid_plan(jdir)):
+                _atomic_write_job(jobs_dir, job_id, job)
+                return advance_stage(jobs_dir, job_id, "spec", preserve_last_error=True), "resume"
             job["round_limit"] = max(job.get("round_limit", max_rounds), job.get("round", 0) + 1)
             _atomic_write_job(jobs_dir, job_id, job)
-            return advance_stage(jobs_dir, job_id, "build"), "resume"
+            return advance_stage(jobs_dir, job_id, "build", preserve_last_error=True), "resume"
 
         job["updated"] = _now_iso()
         return _atomic_write_job(jobs_dir, job_id, job), "resume"

@@ -75,6 +75,44 @@ class StateTests(unittest.TestCase):
             self.assertEqual(job["usage"]["total_tokens"], 2000)
             self.assertAlmostEqual(job["usage"]["duration_seconds"], 30.0)
 
+    def test_needs_human_resumes_at_prerequisite_stage_and_preserves_last_error(self):
+        import json, os
+
+        with tempfile.TemporaryDirectory() as d:
+            # 1) Escalated during intake (no intake.json) -> must resume at intake, not build
+            issue1 = {"number": 11, "title": "Intake fail", "url": "u11"}
+            create_or_resume_job(d, issue1, max_rounds=2)
+            advance_stage(d, "job-11", "needs-human", last_error="gh timeout during intake")
+            r1, act1 = create_or_resume_job(d, issue1, max_rounds=2)
+            self.assertEqual((act1, r1["stage"], r1["round"]), ("resume", "intake", 0))
+
+            # 2) Escalated during spec (intake.json exists, no plan.json) -> must resume at spec
+            issue2 = {"number": 12, "title": "Spec fail", "url": "u12"}
+            create_or_resume_job(d, issue2, max_rounds=2)
+            with open(os.path.join(d, "job-12", "intake.json"), "w", encoding="utf-8") as f:
+                json.dump({"decision": "ACCEPT"}, f)
+            advance_stage(d, "job-12", "spec")
+            advance_stage(d, "job-12", "needs-human", last_error="agy timeout during spec")
+            r2, act2 = create_or_resume_job(d, issue2, max_rounds=2)
+            self.assertEqual((act2, r2["stage"], r2["round"]), ("resume", "spec", 0))
+
+            # 3) Escalated post-spec (plan.json exists) -> resumes at build AND preserves last_error
+            issue3 = {"number": 13, "title": "Approve escalate", "url": "u13"}
+            create_or_resume_job(d, issue3, max_rounds=2)
+            with open(os.path.join(d, "job-13", "intake.json"), "w", encoding="utf-8") as f:
+                json.dump({"decision": "ACCEPT"}, f)
+            with open(os.path.join(d, "job-13", "plan.json"), "w", encoding="utf-8") as f:
+                json.dump({"slices": [{"id": "s1"}]}, f)
+            advance_stage(d, "job-13", "spec")
+            advance_stage(d, "job-13", "build")
+            advance_stage(d, "job-13", "gate")
+            advance_stage(d, "job-13", "review")
+            advance_stage(d, "job-13", "approve")
+            advance_stage(d, "job-13", "needs-human", last_error="Should session rotation revoke mobile tokens?")
+            r3, act3 = create_or_resume_job(d, issue3, max_rounds=2)
+            self.assertEqual((act3, r3["stage"], r3["round"]), ("resume", "build", 2))
+            self.assertIn("revoke mobile tokens", r3["last_error"] or "")
+
 
 if __name__ == "__main__":
     unittest.main()

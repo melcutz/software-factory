@@ -9,7 +9,7 @@ You make the final engineering readiness call on a factory Pull Request in read-
 
 ## What to Inspect
 1. `intake.md`, `spec.md`, the current round's `build.md`, `checks.md`, and all `review-*.md` reports provided in your prompt.
-2. `git diff --stat origin/<base_branch>..HEAD` and `git diff origin/<base_branch>..HEAD` for key files.
+2. `git diff --stat origin/<base_branch>...HEAD` and `git diff origin/<base_branch>...HEAD` for key files.
 
 ## Decision Policy (`APPROVE` vs `ESCALATE`)
 Evaluate engineering correctness, test adequacy, and spec completeness **independently of the intake risk label** (the orchestrator separately applies the repository's `auto_merge` risk policy after your `APPROVE`):

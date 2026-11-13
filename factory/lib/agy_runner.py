@@ -16,6 +16,8 @@ You were dispatched as an autonomous headless subagent to execute one specific f
 - Return your result via the structured JSON output schema enforced for this turn.
 """
 
+_SUBPROCESS_TIMEOUT_GRACE_SEC = 30
+
 
 class AgentExecutionError(RuntimeError):
     """Raised when `agy -p` fails or violates stage constraints after retry."""
@@ -39,14 +41,12 @@ def _extract_json_envelope(stdout: str) -> dict:
     text = (stdout or "").strip()
     if not text:
         raise ValueError("Empty stdout from agy")
-    # Fast path: whole stdout is JSON
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
             return parsed
     except json.JSONDecodeError:
         pass
-    # Fallback: scan lines from bottom up for the JSON envelope object
     for line in reversed(text.splitlines()):
         candidate = line.strip()
         if candidate.startswith("{") and candidate.endswith("}"):
@@ -70,6 +70,7 @@ def run_agent(
     schema: dict,
     timeout_sec: int,
     sandbox: bool = True,
+    clean_worktree: bool = True,
     log_name: str = "",
 ) -> tuple[dict, dict, float]:
     """Run one headless `agy -p` turn with JSON Schema validation and 1 retry."""
@@ -98,19 +99,37 @@ def run_agent(
     if sandbox:
         cmd.append("--sandbox")
 
+    initial_sha = head_sha(worktree) if sandbox else ""
     last_err: Exception | None = None
+
     for attempt in (1, 2):
-        before_sha = head_sha(worktree) if sandbox else ""
         t0 = time.monotonic()
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=worktree,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec + 30,
-                check=False,
-            )
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=worktree,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec + _SUBPROCESS_TIMEOUT_GRACE_SEC,
+                    check=False,
+                )
+            finally:
+                if sandbox:
+                    after_sha = head_sha(worktree)
+                    if after_sha != initial_sha:
+                        subprocess.run(
+                            ["git", "-C", worktree, "reset", "--hard", initial_sha],
+                            capture_output=True,
+                            check=False,
+                        )
+                        reset_worktree_clean(worktree)
+                        raise AgentExecutionError(
+                            f"Read-only agent {agent_name} illegally moved HEAD ({initial_sha[:7]} -> {after_sha[:7]})"
+                        )
+                    if clean_worktree and not is_worktree_clean(worktree):
+                        reset_worktree_clean(worktree)
+
             elapsed = round(time.monotonic() - t0, 3)
 
             log_record = {
@@ -130,21 +149,6 @@ def run_agent(
             with open(log_file, "w", encoding="utf-8") as f:
                 json.dump(log_record, f, indent=2)
 
-            if sandbox:
-                after_sha = head_sha(worktree)
-                if after_sha != before_sha:
-                    subprocess.run(
-                        ["git", "-C", worktree, "reset", "--hard", before_sha],
-                        capture_output=True,
-                        check=False,
-                    )
-                    reset_worktree_clean(worktree)
-                    raise AgentExecutionError(
-                        f"Read-only agent {agent_name} illegally moved HEAD ({before_sha[:7]} -> {after_sha[:7]})"
-                    )
-                if not is_worktree_clean(worktree):
-                    reset_worktree_clean(worktree)
-
             if proc.returncode != 0:
                 raise AgentExecutionError(
                     f"agy exited with code {proc.returncode}: {(proc.stderr or proc.stdout or '')[:400]}"
@@ -158,7 +162,6 @@ def run_agent(
             if not isinstance(raw_structured, dict):
                 raise AgentExecutionError("agy envelope missing dict structured_output")
 
-            # Overwrite canonical log with parsed envelope on success
             with open(os.path.join(logs_dir, f"{effective_log}.json"), "w", encoding="utf-8") as f:
                 json.dump(envelope, f, indent=2)
 
@@ -169,7 +172,6 @@ def run_agent(
 
         except Exception as exc:
             last_err = exc
-            # Do not retry intentional security violation on HEAD mutation
             if isinstance(exc, AgentExecutionError) and "illegally moved HEAD" in str(exc):
                 raise
             if attempt == 2:

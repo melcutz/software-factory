@@ -49,6 +49,9 @@ if args[:2] == ["issue", "list"]:
 
 if args[:2] == ["issue", "view"]:
     num = args[2]
+    if num == "99":
+        sys.stderr.write("Simulated GitHub 502 on issue 99\n")
+        sys.exit(1)
     def _view(d):
         iss = d["issues"][num]
         return {
@@ -73,6 +76,11 @@ if args[:2] == ["issue", "comment"]:
 
 if args[:2] == ["issue", "edit"]:
     num = args[2]
+    if os.environ.get("FAIL_POST_MERGE_LABEL_EDIT") == "1" and num == "70":
+        d_now = json.load(open(STATE_FILE))
+        if any(p.get("merged") for p in d_now.get("prs", {}).values()):
+            sys.stderr.write("Transient GitHub 503 during post-merge label removal\n")
+            sys.exit(1)
     add, rem = [], []
     i = 3
     while i < len(args):
@@ -258,6 +266,13 @@ if "# Role: Factory Spec Writer" in prompt:
 
 if "# Role: Factory Builder" in prompt:
     c, _ = bump(f"{job_id}:build")
+    if job_id == "job-10" and "SLICE_INDEX: 2/3" in prompt:
+        # Record whether Slice 1 summary was passed into Slice 2 builder prompt
+        with open(STATE_FILE + f".{job_id}.slice2_prompt", "w") as pf:
+            pf.write(prompt)
+    if job_id == "job-70" and "FIX_ROUND:" in prompt:
+        with open(STATE_FILE + ".job70.fix_prompt", "w") as pf:
+            pf.write(prompt)
     # Simulate mid-slice crash on job-30 when starting slice 2 for the first time
     if job_id == "job-30" and "SLICE_INDEX: 2/2" in prompt and c == 2:
         sys.stderr.write("Simulated transient crash on slice 2\n")
@@ -328,7 +343,18 @@ if "# Role: Factory UI Reviewer" in prompt:
     respond({"verdict": "PASS", "summary": ["UI clean"], "findings": [], "checked": ["layout"]})
 
 if "# Role: Factory Approver" in prompt:
-    bump(f"{job_id}:approve")
+    c, _ = bump(f"{job_id}:approve")
+    if job_id == "job-70":
+        with open(STATE_FILE + f".job70.approve_{c}", "w") as pf:
+            pf.write(prompt)
+        if c == 1:
+            respond({
+                "decision": "ESCALATE",
+                "summary": ["Need maintainer sign-off on cache TTL"],
+                "reasoning": "TTL trade-off affects stale reads.",
+                "merge_danger": "Medium",
+                "question": "Is a 60s cache TTL acceptable for profile reads?",
+            })
     # If job-50 is about to enter merging, simulate a concurrent conflicting push to origin/main!
     if job_id == "job-50":
         main_clone = os.environ["MAIN_CLONE_DIR"]
@@ -508,6 +534,70 @@ class PipelineE2ETests(unittest.TestCase):
 
         ok, checks = run_doctor(self.repo)
         self.assertTrue(ok, checks)
+
+    def test_multi_slice_aggregates_build_md_and_passes_prior_slices(self):
+        self._seed_issue(10, "Complex dashboard auth")
+        job = process_job(self.repo, 10)
+        self.assertEqual(job["stage"], "ready")
+        # Slice 2 prompt must include Slice 1 summary
+        s2_prompt_file = self.agy_state_path + ".job-10.slice2_prompt"
+        self.assertTrue(os.path.exists(s2_prompt_file))
+        with open(s2_prompt_file, encoding="utf-8") as f:
+            s2_prompt = f.read()
+        self.assertIn("Completed build turn 1", s2_prompt)
+        # Round 1 build.md must aggregate all 3 slices, not only the last slice!
+        r1_build_md = os.path.join(self.repo, "factory", "jobs", "job-10", "round-1", "build.md")
+        with open(r1_build_md, encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("work_job-10_1.py", content)
+        self.assertIn("work_job-10_3.py", content)
+        self.assertIn("work_job-10_4.py", content)
+
+    def test_approver_escalate_carries_question_and_human_reply_and_tolerates_post_merge_label_error(self):
+        os.environ["FAIL_POST_MERGE_LABEL_EDIT"] = "1"
+        self._seed_issue(70, "Profile cache")
+        esc = process_job(self.repo, 70)
+        self.assertEqual(esc["stage"], "needs-human")
+
+        # Human answers on GitHub and swaps label back to factory
+        with open(self.gh_state_path, encoding="utf-8") as f:
+            gh_data = json.load(f)
+        gh_data["issues"]["70"]["comments"].append(
+            {"author": {"login": "maintainer"}, "body": "Yes, 60s cache TTL is approved."}
+        )
+        gh_data["issues"]["70"]["labels"] = ["factory"]
+        with open(self.gh_state_path, "w", encoding="utf-8") as f:
+            json.dump(gh_data, f, indent=2)
+
+        merged = process_job(self.repo, 70)
+        # Even though post-merge label removal returned exit 1, PR is already merged so job MUST stay merged!
+        self.assertEqual(merged["stage"], "merged")
+        with open(self.agy_state_path + ".job70.fix_prompt", encoding="utf-8") as f:
+            fix_prompt = f.read()
+        self.assertIn("Is a 60s cache TTL acceptable", fix_prompt)
+        self.assertIn("Yes, 60s cache TTL is approved.", fix_prompt)
+        with open(self.agy_state_path + ".job70.approve_2", encoding="utf-8") as f:
+            app2_prompt = f.read()
+        self.assertIn("Yes, 60s cache TTL is approved.", app2_prompt)
+
+    def test_concurrent_run_factory_isolates_broken_issue_and_merges_siblings_with_remote_advance(self):
+        self._seed_issue(21, "Concurrent fix A")
+        self._seed_issue(22, "Concurrent fix B")
+        self._seed_issue(99, "Broken GitHub 502 issue")
+
+        # Advance origin/main without fetching in self.repo first (triggers concurrent git fetch race if unlocked)
+        other_clone = os.path.join(self.tmp, "other_clone")
+        subprocess.run(["git", "clone", self.origin, other_clone], check=True, capture_output=True)
+        with open(os.path.join(other_clone, "extra.txt"), "w", encoding="utf-8") as f:
+            f.write("upstream commit\n")
+        subprocess.run(["git", "-C", other_clone, "add", "extra.txt"], check=True)
+        subprocess.run(["git", "-C", other_clone, "commit", "-m", "upstream"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", other_clone, "push", "origin", "main"], check=True, capture_output=True)
+
+        results = run_factory(self.repo)
+        by_issue = {j["issue"]: j["stage"] for j in results}
+        self.assertEqual(by_issue[21], "merged")
+        self.assertEqual(by_issue[22], "merged")
 
 
 if __name__ == "__main__":
