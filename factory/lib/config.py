@@ -18,7 +18,7 @@ DEFAULT_MODEL_PRICING: dict[str, dict[str, float]] = {
 }
 
 DEFAULT_CONFIG: dict = {
-    "concurrency": 3,
+    "concurrency": 4,
     "max_rounds": 3,
     "max_slice_retries": 2,
     "agent_timeout_sec": 900,
@@ -37,6 +37,7 @@ DEFAULT_CONFIG: dict = {
         ".github/",
     ],
     "models": {
+        "planner": "gemini-3.8-flash-medium",
         "intake": "gemini-3.8-flash-medium",
         "spec_writer": "gemini-4-argon-high",
         "builder": "gemini-4-argon-high",

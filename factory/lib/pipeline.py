@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import graphlib
 import json
 import os
 import shutil
@@ -18,6 +19,7 @@ from factory.lib.config import (
     split_model_and_effort,
 )
 from factory.lib.gate_runner import run_gate
+from factory.lib.planner import build_dependency_dag
 from factory.lib.git_ops import (
     GitHubClient,
     abort_merge,
@@ -1059,8 +1061,60 @@ def process_job(
         _set_activity(jobs_dir, job_id, None)
 
 
-def run_factory(repo_root: str, issue_number: int | None = None) -> list[dict]:
-    """Process a single issue or drain all eligible queued issues concurrently."""
+def _plan_queue_batch(
+    repo_root: str,
+    factory_dir: str,
+    jobs_dir: str,
+    cfg: dict,
+    issues: list[dict],
+) -> dict[int, set[int]]:
+    """Build an acyclic dependency DAG for a batch of issues using explicit refs + optional LLM planner."""
+    planner_agent_path = os.path.join(factory_dir, "agents", "planner.md")
+
+    def _run_planner(batch: list[dict]) -> dict:
+        if not os.path.isfile(planner_agent_path):
+            return {}
+        planner_model = cfg["models"].get("planner") or cfg["models"]["intake"]
+        timeout_sec = int(cfg["agent_timeout_sec"])
+        lines = ["Plan execution dependencies for the following queued GitHub issues:", ""]
+        for item in batch:
+            lines.append(f"## Issue #{int(item['number'])}: {item.get('title') or ''}")
+            body = (item.get("body") or "").strip()
+            if body:
+                lines.append(body[:2000])
+            lines.append("")
+        plan_dir = os.path.join(jobs_dir, "_planner")
+        os.makedirs(plan_dir, exist_ok=True)
+        try:
+            out, _, _ = run_agent(
+                factory_dir,
+                plan_dir,
+                repo_root,
+                "plan",
+                "planner",
+                planner_model,
+                "\n".join(lines),
+                SCHEMAS["plan"],
+                timeout_sec,
+                sandbox=True,
+                clean_worktree=False,
+                log_name="queue-plan",
+            )
+            return out
+        except Exception as exc:
+            print(f"[factory] warning: queue planner failed, using explicit dependencies only: {exc}", file=sys.stderr)
+            return {}
+
+    deps, _ = build_dependency_dag(issues, planner_fn=_run_planner if len(issues) > 1 else None)
+    return deps
+
+
+def run_factory(
+    repo_root: str,
+    issue_number: int | None = None,
+    issue_numbers: list[int] | None = None,
+) -> list[dict]:
+    """Process specific issue(s) or drain all eligible queued issues using a dependency DAG."""
     repo_root = os.path.abspath(repo_root)
     factory_dir = os.path.join(repo_root, "factory")
     jobs_dir = os.path.join(factory_dir, "jobs")
@@ -1069,10 +1123,16 @@ def run_factory(repo_root: str, issue_number: int | None = None) -> list[dict]:
     cfg = load_config(factory_dir)
     gh = GitHubClient(repo_root)
 
+    explicit_nums: list[int] = []
+    if issue_number is not None:
+        explicit_nums = [int(issue_number)]
+    elif issue_numbers:
+        explicit_nums = [int(n) for n in issue_numbers]
+
     _write_text(pid_path, f"{os.getpid()}\n")
     try:
-        if issue_number is not None:
-            return [process_job(repo_root, int(issue_number), config=cfg, gh=gh)]
+        if len(explicit_nums) == 1:
+            return [process_job(repo_root, explicit_nums[0], config=cfg, gh=gh)]
 
         def _safe_worker(num: int) -> dict | None:
             try:
@@ -1083,47 +1143,83 @@ def run_factory(repo_root: str, issue_number: int | None = None) -> list[dict]:
 
         max_workers = max(1, int(cfg["concurrency"]))
         results: list[dict] = []
-        in_flight: dict[concurrent.futures.Future, int] = {}
-        skip_issues: set[int] = set()
+        seen_issues: set[int] = set()
+        failed_parents: dict[int, str] = {}
 
-        def _fill_slots(pool: concurrent.futures.ThreadPoolExecutor) -> None:
-            if len(in_flight) >= max_workers:
-                return
+        def _next_batch() -> list[dict]:
+            if explicit_nums:
+                if seen_issues:
+                    return []
+                return [gh.fetch_issue(num)[0] for num in explicit_nums]
             try:
-                issues = gh.list_queue_issues(cfg)
+                queued = gh.list_queue_issues(cfg)
             except Exception as exc:
-                if not in_flight:
+                if not seen_issues:
                     raise
                 print(f"[factory] warning: queue refresh failed: {exc}", file=sys.stderr)
-                return
-            active_nums = set(in_flight.values())
-            for item in issues:
-                if len(in_flight) >= max_workers:
-                    break
-                num = int(item["number"])
-                if num in active_nums or num in skip_issues:
-                    continue
-                fut = pool.submit(_safe_worker, num)
-                in_flight[fut] = num
-                active_nums.add(num)
+                return []
+            return [item for item in queued if int(item["number"]) not in seen_issues]
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            _fill_slots(pool)
-            while in_flight:
-                done, _ = concurrent.futures.wait(
-                    in_flight.keys(),
-                    return_when=concurrent.futures.FIRST_COMPLETED,
-                )
-                for fut in done:
-                    num = in_flight.pop(fut)
-                    res = fut.result()
-                    if res is not None:
-                        results.append(res)
-                        if res.get("stage") in TERMINAL_OR_READY_STAGES:
-                            skip_issues.add(num)
-                    else:
-                        skip_issues.add(num)
-                _fill_slots(pool)
+            while True:
+                batch = _next_batch()
+                if not batch:
+                    break
+                for item in batch:
+                    seen_issues.add(int(item["number"]))
+
+                deps = _plan_queue_batch(repo_root, factory_dir, jobs_dir, cfg, batch)
+                sorter = graphlib.TopologicalSorter(deps)
+                sorter.prepare()
+
+                in_flight: dict[concurrent.futures.Future, int] = {}
+                ready_queue: list[int] = []
+
+                while sorter.is_active():
+                    for num in sorter.get_ready():
+                        if num not in ready_queue and num not in in_flight.values():
+                            ready_queue.append(num)
+
+                    while ready_queue and len(in_flight) < max_workers:
+                        num = ready_queue.pop(0)
+                        blocked_by = next((p for p in sorted(deps.get(num, ())) if p in failed_parents), None)
+                        if blocked_by is not None:
+                            reason = failed_parents[blocked_by]
+                            failed_parents[num] = reason
+                            print(f"[job-{num}] skipped: blocked by prerequisite {reason}", file=sys.stderr)
+                            try:
+                                gh.comment_issue(
+                                    num,
+                                    f"### Skipped (`job-{num}`)\n\nBlocked by prerequisite {reason}.",
+                                )
+                            except Exception:
+                                pass
+                            sorter.done(num)
+                            continue
+                        fut = pool.submit(_safe_worker, num)
+                        in_flight[fut] = num
+
+                    if not in_flight:
+                        continue
+
+                    done, _ = concurrent.futures.wait(
+                        in_flight.keys(),
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    for fut in done:
+                        num = in_flight.pop(fut)
+                        res = fut.result()
+                        if res is not None:
+                            results.append(res)
+                            if res.get("stage") != "merged":
+                                failed_parents[num] = f"#{num} (stage={res.get('stage')})"
+                        else:
+                            failed_parents[num] = f"#{num} (worker error)"
+                        sorter.done(num)
+
+                if explicit_nums:
+                    break
+
         return results
     finally:
         try:

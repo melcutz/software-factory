@@ -87,7 +87,7 @@ class ConfigAndSchemaTests(unittest.TestCase):
                 load_config(d)
 
     def test_markdown_renderers_and_schemas_cover_all_stages(self):
-        self.assertEqual(set(SCHEMAS.keys()), {"intake", "spec", "build", "review", "approve"})
+        self.assertEqual(set(SCHEMAS.keys()), {"plan", "intake", "spec", "build", "review", "approve"})
         intake = validate_stage_output(
             "intake",
             {

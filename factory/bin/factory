@@ -26,8 +26,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_run = sub.add_parser("run", help="Drain queued factory issues or process one issue number")
-    p_run.add_argument("issue", nargs="?", type=int, help="Optional GitHub issue number")
+    p_run = sub.add_parser("run", help="Drain queued factory issues or process specific issue number(s)")
+    p_run.add_argument("issues", nargs="*", type=int, help="Optional GitHub issue numbers (default: drain all queued)")
 
     sub.add_parser("queue", help="List open eligible factory-labeled GitHub issues")
 
@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     jobs_dir = os.path.join(FACTORY_DIR, "jobs")
 
     if args.command == "run":
-        jobs = run_factory(REPO_ROOT, issue_number=args.issue)
+        jobs = run_factory(REPO_ROOT, issue_numbers=args.issues or None)
         print(format_status_table(jobs))
         return 0
 

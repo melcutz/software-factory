@@ -4,6 +4,38 @@ from __future__ import annotations
 import copy
 
 SCHEMAS: dict[str, dict] = {
+    "plan": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["edges", "predicted_surfaces", "reasoning"],
+        "properties": {
+            "edges": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["issue", "depends_on"],
+                    "properties": {
+                        "issue": {"type": "integer"},
+                        "depends_on": {"type": "array", "items": {"type": "integer"}},
+                    },
+                },
+            },
+            "predicted_surfaces": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["issue", "paths"],
+                    "properties": {
+                        "issue": {"type": "integer"},
+                        "paths": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+            "reasoning": {"type": "string"},
+        },
+    },
     "intake": {
         "type": "object",
         "additionalProperties": False,
