@@ -243,6 +243,23 @@ class GitAndGateTests(unittest.TestCase):
             cur = subprocess.run(["git", "-C", wt2, "branch", "--show-current"], check=True, capture_output=True, text=True)
             self.assertEqual((branch2, cur.stdout.strip()), ("factory/job-19", "factory/job-19"))
 
+    def test_run_gate_passes_scope_and_base_branch_env_vars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, clone = self._init_origin_and_clone(tmp)
+            checks = os.path.join(clone, "factory", "checks.sh")
+            with open(checks, "w", encoding="utf-8") as f:
+                f.write('#!/usr/bin/env bash\nset -euo pipefail\necho "SCOPE=${FACTORY_GATE_SCOPE} BASE=${FACTORY_BASE_BRANCH}"\n')
+            os.chmod(checks, 0o755)
+            wt, _ = ensure_worktree(clone, "job-25", "main")
+            with open(os.path.join(wt, "feature.py"), "w", encoding="utf-8") as f:
+                f.write("x = 25\n")
+            subprocess.run(["git", "-C", wt, "add", "feature.py"], check=True)
+            subprocess.run(["git", "-C", wt, "commit", "-m", "feat 25"], check=True, capture_output=True)
+            cfg = {"base_branch": "main", "protected_paths": ["factory/"], "gate_timeout_sec": 30}
+            passed, md = run_gate(clone, "job-25", wt, 1, cfg, tag="slice-1", scope="slice")
+            self.assertTrue(passed)
+            self.assertIn("SCOPE=slice BASE=main", md)
+
 
 if __name__ == "__main__":
     unittest.main()

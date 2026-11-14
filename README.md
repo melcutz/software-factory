@@ -40,7 +40,7 @@
    ```bash
    ./factory/bin/factory run        # process queued issues up to configured concurrency
    ./factory/bin/factory run 42     # process or resume a specific issue number
-   ./factory/bin/factory status     # inspect job stages, slice progress, token usage, and PR URLs
+   ./factory/bin/factory status     # inspect job stages, slice progress, token/cost usage, and PR URLs
    ```
 
 See [INSTALL.md](INSTALL.md) for detailed setup instructions.
@@ -60,7 +60,7 @@ GitHub Issue ("factory")
 |---|---|
 | `intake` | Evaluates whether the issue is actionable (`ACCEPT`), underspecified (`NEEDS_INFO`), or out of scope (`REJECT`). `NEEDS_INFO` posts clarifying questions on the issue and swaps the label to `factory:needs-info` until a human replies and re-applies `factory`. |
 | `spec` | Inspects the codebase in read-only sandbox mode and produces `spec.md` alongside `plan.json` containing `1–6` testable vertical slices. |
-| `build` & `gate` | Executes slices sequentially on branch `factory/job-<n>`. Every slice must pass protected-path diff checks and `factory/checks.sh` (with bounded per-slice retries) before the next slice starts. Opens or updates a draft PR once all slices pass. |
+| `build` & `gate` | Executes slices sequentially on branch `factory/job-<n>`. Every slice must pass protected-path diff checks and `factory/checks.sh` (`FACTORY_GATE_SCOPE=slice` on intermediate slices, `FACTORY_GATE_SCOPE=full` on the final slice and stage gate, with bounded retries) before advancing. Opens or updates a draft PR once all slices pass. |
 | `review` | Dispatches specialist reviewers concurrently based on risk tier and affected surfaces. Style-only (`nit`) findings do not block; `must_fix` and `should_fix` findings return to `build` for targeted remediation up to `max_rounds`. |
 | `approve` | Performs final verification. Under the default `"auto_merge": "low"` policy, approved `low`-risk PRs sync with `origin/<base_branch>`, re-run the gate, and merge automatically; `medium`- and `high`-risk PRs are marked ready (`gh pr ready`) with a full verification summary. |
 

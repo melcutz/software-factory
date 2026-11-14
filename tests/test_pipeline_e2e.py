@@ -215,7 +215,7 @@ def respond(obj):
     print(json.dumps({
         "status": "SUCCESS",
         "duration_seconds": 1.0,
-        "usage": {"input_tokens": 100, "output_tokens": 50, "thinking_tokens": 10, "total_tokens": 150},
+        "usage": {"input_tokens": 100_000, "cache_read_tokens": 200_000, "output_tokens": 10_000, "thinking_tokens": 2_000, "total_tokens": 110_000},
         "structured_output": obj,
     }))
     sys.exit(0)
@@ -669,6 +669,47 @@ class PipelineE2ETests(unittest.TestCase):
         resumed_merged = process_job(self.repo, 20)
         self.assertEqual(resumed_merged["stage"], "merged")
         self.assertEqual(resumed_merged["round"], 1)
+
+    def test_multi_slice_runs_slice_scope_on_intermediate_slices_and_logs_telemetry_and_cost(self):
+        import contextlib
+        import io
+
+        scopes_file = os.path.join(self.tmp, "gate_scopes.log")
+        checks_path = os.path.join(self.repo, "factory", "checks.sh")
+        with open(checks_path, "w", encoding="utf-8") as f:
+            f.write(
+                f"#!/usr/bin/env bash\nset -euo pipefail\n"
+                f"echo \"${{FACTORY_GATE_SCOPE:-unset}}\" >> {scopes_file!r}\n"
+                f"test ! -f bad_check.txt\ntest -f ok.txt\n"
+            )
+        os.chmod(checks_path, 0o755)
+        subprocess.run(["git", "-C", self.repo, "commit", "-am", "log gate scope"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", self.repo, "push", "origin", "main"], check=True, capture_output=True)
+
+        self._seed_issue(30, "Two-part feature")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            merged = process_job(self.repo, 30)
+
+        self.assertEqual(merged["stage"], "merged")
+        with open(scopes_file, encoding="utf-8") as f:
+            scopes = [line.strip() for line in f if line.strip()]
+        # Slice 1/2 runs scope=slice; Slice 2/2 runs scope=full and sets verified_gate_sha so stage=gate skips duplicate!
+        self.assertEqual(scopes, ["slice", "full"])
+
+        out = buf.getvalue()
+        self.assertRegex(out, r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[job-30\]")
+        self.assertIn("model=gemini-4-argon effort=high", out)
+        self.assertIn("cache=200,000", out)
+        self.assertIn("cost=$", out)
+        self.assertIn("scope=slice", out)
+        self.assertIn("scope=full", out)
+
+        self.assertGreater(merged["usage"]["cache_read_tokens"], 0)
+        self.assertGreater(merged["usage"]["cost_usd"], 0.0)
+        table = format_status_table([merged])
+        self.assertIn("COST", table)
+        self.assertIn("$", table)
 
 
 if __name__ == "__main__":

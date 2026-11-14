@@ -62,6 +62,7 @@ def run_gate(
     round_num: int,
     config: dict,
     tag: str | None = None,
+    scope: str = "full",
 ) -> tuple[bool, str]:
     """Check protected_paths and execute main checkout's factory/checks.sh inside worktree."""
     factory_dir = os.path.join(repo_root, "factory")
@@ -102,10 +103,16 @@ def run_gate(
 
     checks_script = os.path.join(factory_dir, "checks.sh")
     timeout_sec = int(config.get("gate_timeout_sec", 600))
+    gate_env = {
+        **os.environ,
+        "FACTORY_GATE_SCOPE": scope,
+        "FACTORY_BASE_BRANCH": str(base_branch),
+    }
     try:
         proc = subprocess.run(
             ["bash", checks_script],
             cwd=worktree,
+            env=gate_env,
             capture_output=True,
             text=True,
             timeout=timeout_sec,

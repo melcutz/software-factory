@@ -7,9 +7,16 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime
 
 from factory.lib.agy_runner import AgentExecutionError, run_agent
-from factory.lib.config import load_config, resolve_reviewers
+from factory.lib.config import (
+    estimate_usage_cost_usd,
+    load_config,
+    resolve_reviewers,
+    split_model_and_effort,
+)
 from factory.lib.gate_runner import run_gate
 from factory.lib.git_ops import (
     GitHubClient,
@@ -69,6 +76,58 @@ def _read_json(path: str, default: dict | None = None) -> dict:
         return {} if default is None else default
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _ts() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _fmt_duration(seconds: float) -> str:
+    sec = max(0.0, float(seconds or 0.0))
+    if sec < 60.0:
+        return f"{sec:.1f}s"
+    mins = int(sec // 60)
+    rem = int(round(sec - mins * 60))
+    if rem == 60:
+        mins += 1
+        rem = 0
+    return f"{mins}m{rem:02d}s ({sec:.1f}s)"
+
+
+def _fmt_model_tag(model_spec: str) -> str:
+    base_model, effort = split_model_and_effort(model_spec)
+    return f"model={base_model} effort={effort}"
+
+
+def _record_and_format_step(
+    jobs_dir: str,
+    job_id: str,
+    model_spec: str,
+    usage: dict,
+    duration_sec: float,
+    config: dict,
+) -> str:
+    step_cost = estimate_usage_cost_usd(model_spec, usage, config)
+    updated_job = record_usage(jobs_dir, job_id, usage, duration_sec, cost_usd=step_cost)
+    u = usage or {}
+    in_tok = int(u.get("input_tokens", 0) or 0)
+    cache_tok = int(u.get("cache_read_tokens", 0) or 0)
+    out_tok = int(u.get("output_tokens", 0) or 0)
+    think_tok = int(u.get("thinking_tokens", 0) or 0)
+    tot_tok = int(u.get("total_tokens", 0) or (in_tok + out_tok))
+    parts = [
+        _fmt_model_tag(model_spec),
+        f"dur={_fmt_duration(duration_sec)}",
+        f"tokens={tot_tok:,} (in={in_tok:,} cache={cache_tok:,} out={out_tok:,} think={think_tok:,})",
+    ]
+    if step_cost is not None:
+        total_cost = float((updated_job.get("usage") or {}).get("cost_usd", 0.0) or 0.0)
+        parts.append(f"cost=${step_cost:.4f} total_cost=${total_cost:.4f}")
+    return " ".join(parts)
+
+
+def _log(job_id: str, message: str) -> None:
+    print(f"[{_ts()}] [{job_id}] {message}", flush=True)
 
 
 def _escalate_to_human(
@@ -194,9 +253,11 @@ def process_job(
             if stage in TERMINAL_OR_READY_STAGES or stage in {"needs-info", "needs-human"}:
                 return job
 
-            print(f"[{job_id}] stage={stage} round={job['round']}", flush=True)
+            _log(job_id, f"stage={stage} round={job['round']}")
 
             if stage == "intake":
+                intake_model = cfg["models"]["intake"]
+                _log(job_id, f"intake start ({_fmt_model_tag(intake_model)})")
                 prompt = f"JOB_ID: {job_id}\nBASE_BRANCH: {base_branch}\n\n{issue_md}"
                 intake_out, usage, dur = run_agent(
                     factory_dir,
@@ -204,14 +265,15 @@ def process_job(
                     worktree,
                     "intake",
                     "intake",
-                    cfg["models"]["intake"],
+                    intake_model,
                     prompt,
                     SCHEMAS["intake"],
                     timeout_sec,
                     sandbox=True,
                     log_name="intake",
                 )
-                record_usage(jobs_dir, job_id, usage, dur)
+                metrics_str = _record_and_format_step(jobs_dir, job_id, intake_model, usage, dur, cfg)
+                _log(job_id, f"intake done decision={intake_out['decision']} ({metrics_str})")
                 _write_json(os.path.join(jdir, "intake.json"), intake_out)
                 _write_text(os.path.join(jdir, "intake.md"), render_intake_md(intake_out))
 
@@ -240,6 +302,8 @@ def process_job(
                 continue
 
             if stage == "spec":
+                spec_model = cfg["models"]["spec_writer"]
+                _log(job_id, f"spec start ({_fmt_model_tag(spec_model)})")
                 intake_md = _read_text(os.path.join(jdir, "intake.md"))
                 prompt = (
                     f"JOB_ID: {job_id}\nBASE_BRANCH: {base_branch}\n\n"
@@ -251,14 +315,15 @@ def process_job(
                     worktree,
                     "spec",
                     "spec-writer",
-                    cfg["models"]["spec_writer"],
+                    spec_model,
                     prompt,
                     SCHEMAS["spec"],
                     timeout_sec,
                     sandbox=True,
                     log_name="spec",
                 )
-                record_usage(jobs_dir, job_id, usage, dur)
+                metrics_str = _record_and_format_step(jobs_dir, job_id, spec_model, usage, dur, cfg)
+                _log(job_id, f"spec done slices={len(spec_out['slices'])} ({metrics_str})")
                 _write_json(os.path.join(jdir, "spec.json"), spec_out)
                 _write_json(os.path.join(jdir, "plan.json"), {"slices": spec_out["slices"]})
                 _write_text(os.path.join(jdir, "spec.md"), render_spec_md(spec_out))
@@ -280,6 +345,7 @@ def process_job(
                 slices = plan_data.get("slices", [])
                 total_slices = len(slices)
                 prior_escalation = job.get("last_error") or ""
+                builder_model = cfg["models"]["builder"]
 
                 if job["completed_slices"] < total_slices:
                     for idx in range(job["completed_slices"], total_slices):
@@ -290,9 +356,9 @@ def process_job(
                         _, prior_slices_md = _aggregate_slice_builds(jdir, idx)
 
                         for attempt in range(cfg["max_slice_retries"] + 1):
-                            print(
-                                f"[{job_id}] build slice={slice_num}/{total_slices} attempt={attempt + 1}",
-                                flush=True,
+                            _log(
+                                job_id,
+                                f"build slice={slice_num}/{total_slices} attempt={attempt + 1} start ({_fmt_model_tag(builder_model)})",
                             )
                             prompt_parts = [
                                 f"JOB_ID: {job_id}",
@@ -322,14 +388,18 @@ def process_job(
                                 worktree,
                                 "build",
                                 "builder",
-                                cfg["models"]["builder"],
+                                builder_model,
                                 "\n".join(prompt_parts),
                                 SCHEMAS["build"],
                                 timeout_sec,
                                 sandbox=False,
                                 log_name=f"r{round_num}-slice-{slice_num}-a{attempt + 1}",
                             )
-                            record_usage(jobs_dir, job_id, usage, dur)
+                            metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
+                            _log(
+                                job_id,
+                                f"build slice={slice_num}/{total_slices} attempt={attempt + 1} verdict={build_out['verdict']} ({metrics_str})",
+                            )
 
                             if build_out["verdict"] == "BLOCKED":
                                 return _escalate_to_human(
@@ -352,10 +422,12 @@ def process_job(
                                 retry_feedback = "No commits exist on branch ahead of base branch. Commit your implementation and tests."
                                 continue
 
-                            print(
-                                f"[{job_id}] gate slice={slice_num}/{total_slices} running checks.sh",
-                                flush=True,
+                            gate_scope = "slice" if slice_num < total_slices else "full"
+                            _log(
+                                job_id,
+                                f"gate slice={slice_num}/{total_slices} scope={gate_scope} running checks.sh",
                             )
+                            t_gate = time.monotonic()
                             passed, slice_checks_md = run_gate(
                                 repo_root,
                                 job_id,
@@ -363,10 +435,12 @@ def process_job(
                                 round_num,
                                 cfg,
                                 tag=f"slice-{slice_num}",
+                                scope=gate_scope,
                             )
-                            print(
-                                f"[{job_id}] gate slice={slice_num}/{total_slices} verdict={'PASS' if passed else 'FAIL'}",
-                                flush=True,
+                            gate_dur = time.monotonic() - t_gate
+                            _log(
+                                job_id,
+                                f"gate slice={slice_num}/{total_slices} scope={gate_scope} verdict={'PASS' if passed else 'FAIL'} (dur={_fmt_duration(gate_dur)})",
                             )
                             if passed:
                                 _write_json(os.path.join(round_dir, f"slice-{slice_num}-build.json"), build_out)
@@ -377,12 +451,10 @@ def process_job(
                                 agg_build, _ = _aggregate_slice_builds(jdir, slice_num)
                                 _write_json(os.path.join(round_dir, "build.json"), agg_build)
                                 _write_text(os.path.join(round_dir, "build.md"), render_build_md(agg_build))
-                                update_job(
-                                    jobs_dir,
-                                    job_id,
-                                    completed_slices=slice_num,
-                                    verified_gate_sha=head_sha(worktree),
-                                )
+                                update_fields: dict = {"completed_slices": slice_num}
+                                if gate_scope == "full":
+                                    update_fields["verified_gate_sha"] = head_sha(worktree)
+                                update_job(jobs_dir, job_id, **update_fields)
                                 slice_done = True
                                 break
 
@@ -433,20 +505,22 @@ def process_job(
                             spec_md,
                         ]
                     )
+                    _log(job_id, f"build fix-round={round_num} start ({_fmt_model_tag(builder_model)})")
                     build_out, usage, dur = run_agent(
                         factory_dir,
                         jdir,
                         worktree,
                         "build",
                         "builder",
-                        cfg["models"]["builder"],
+                        builder_model,
                         "\n".join(prompt_parts),
                         SCHEMAS["build"],
                         timeout_sec,
                         sandbox=False,
                         log_name=f"r{round_num}-fix-build",
                     )
-                    record_usage(jobs_dir, job_id, usage, dur)
+                    metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
+                    _log(job_id, f"build fix-round={round_num} verdict={build_out['verdict']} ({metrics_str})")
                     if build_out["verdict"] == "BLOCKED":
                         return _escalate_to_human(
                             jobs_dir,
@@ -467,6 +541,7 @@ def process_job(
                 round_num = job["round"]
                 spec_md = _read_text(os.path.join(jdir, "spec.md"))
                 passed, checks_md = False, ""
+                builder_model = cfg["models"]["builder"]
 
                 for attempt in range(cfg["max_slice_retries"] + 1):
                     if is_worktree_clean(worktree) and commits_ahead(worktree, base_branch) > 0:
@@ -477,15 +552,20 @@ def process_job(
                             and job.get("verified_gate_sha") == cur_sha
                             and existing_checks.startswith("VERDICT: PASS")
                         ):
-                            print(
-                                f"[{job_id}] gate already verified at {cur_sha[:7]} (skipping duplicate checks.sh)",
-                                flush=True,
+                            _log(
+                                job_id,
+                                f"gate already verified at {cur_sha[:7]} (skipping duplicate checks.sh)",
                             )
                             passed, checks_md = True, existing_checks
                             break
-                        print(f"[{job_id}] gate running checks.sh (attempt={attempt + 1})", flush=True)
-                        passed, checks_md = run_gate(repo_root, job_id, worktree, round_num, cfg)
-                        print(f"[{job_id}] gate verdict={'PASS' if passed else 'FAIL'}", flush=True)
+                        _log(job_id, f"gate scope=full running checks.sh (attempt={attempt + 1})")
+                        t_gate = time.monotonic()
+                        passed, checks_md = run_gate(repo_root, job_id, worktree, round_num, cfg, scope="full")
+                        gate_dur = time.monotonic() - t_gate
+                        _log(
+                            job_id,
+                            f"gate scope=full verdict={'PASS' if passed else 'FAIL'} (dur={_fmt_duration(gate_dur)})",
+                        )
                         if passed:
                             update_job(jobs_dir, job_id, verified_gate_sha=head_sha(worktree))
                             break
@@ -503,20 +583,22 @@ def process_job(
                         f"JOB_ID: {job_id}\nROUND: {round_num}\nBRANCH: {branch}\nBASE_BRANCH: {base_branch}\n\n"
                         f"## Gate Failure to Fix\n{checks_md}\n\n## Specification\n{spec_md}"
                     )
+                    _log(job_id, f"gate-fix attempt={attempt + 1} start ({_fmt_model_tag(builder_model)})")
                     fix_out, usage, dur = run_agent(
                         factory_dir,
                         jdir,
                         worktree,
                         "build",
                         "builder",
-                        cfg["models"]["builder"],
+                        builder_model,
                         fix_prompt,
                         SCHEMAS["build"],
                         timeout_sec,
                         sandbox=False,
                         log_name=f"r{round_num}-gate-fix-{attempt + 1}",
                     )
-                    record_usage(jobs_dir, job_id, usage, dur)
+                    metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
+                    _log(job_id, f"gate-fix attempt={attempt + 1} verdict={fix_out['verdict']} ({metrics_str})")
                     if fix_out["verdict"] == "BLOCKED":
                         return _escalate_to_human(
                             jobs_dir,
@@ -591,7 +673,7 @@ def process_job(
                 def _run_single_reviewer(item: tuple[str, str]) -> tuple[str, dict]:
                     rev_name, rev_model = item
                     agent_file = f"reviewer-{rev_name}"
-                    print(f"[{job_id}] review={rev_name} start", flush=True)
+                    _log(job_id, f"review={rev_name} start ({_fmt_model_tag(rev_model)})")
                     out, u, d = run_agent(
                         factory_dir,
                         jdir,
@@ -606,16 +688,13 @@ def process_job(
                         clean_worktree=False,
                         log_name=f"r{round_num}-review-{rev_name}",
                     )
-                    record_usage(jobs_dir, job_id, u, d)
+                    metrics_str = _record_and_format_step(jobs_dir, job_id, rev_model, u, d, cfg)
                     _write_json(os.path.join(round_dir, f"review-{rev_name}.json"), out)
                     _write_text(
                         os.path.join(round_dir, f"review-{rev_name}.md"),
                         render_review_md(rev_name, out),
                     )
-                    print(
-                        f"[{job_id}] review={rev_name} verdict={out['verdict']} ({round(d, 1)}s)",
-                        flush=True,
-                    )
+                    _log(job_id, f"review={rev_name} verdict={out['verdict']} ({metrics_str})")
                     return rev_name, out
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(reviewers))) as pool:
@@ -693,20 +772,23 @@ def process_job(
                         "\n\n".join(review_blocks),
                     ]
                 )
+                approver_model = cfg["models"]["approver"]
+                _log(job_id, f"approve start ({_fmt_model_tag(approver_model)})")
                 approve_out, usage, dur = run_agent(
                     factory_dir,
                     jdir,
                     worktree,
                     "approve",
                     "approver",
-                    cfg["models"]["approver"],
+                    approver_model,
                     "\n".join(approve_parts),
                     SCHEMAS["approve"],
                     timeout_sec,
                     sandbox=True,
                     log_name=f"r{round_num}-approve",
                 )
-                record_usage(jobs_dir, job_id, usage, dur)
+                metrics_str = _record_and_format_step(jobs_dir, job_id, approver_model, usage, dur, cfg)
+                _log(job_id, f"approve decision={approve_out['decision']} ({metrics_str})")
                 _write_json(os.path.join(round_dir, "approve.json"), approve_out)
                 _write_text(os.path.join(round_dir, "approve.md"), render_approve_md(approve_out))
 
@@ -768,6 +850,8 @@ def process_job(
                             )
 
                         if head_changed:
+                            _log(job_id, "gate pre-merge scope=full running checks.sh")
+                            t_gate = time.monotonic()
                             passed, sync_checks_md = run_gate(
                                 repo_root,
                                 job_id,
@@ -775,6 +859,12 @@ def process_job(
                                 round_num,
                                 cfg,
                                 tag="pre-merge",
+                                scope="full",
+                            )
+                            gate_dur = time.monotonic() - t_gate
+                            _log(
+                                job_id,
+                                f"gate pre-merge scope=full verdict={'PASS' if passed else 'FAIL'} (dur={_fmt_duration(gate_dur)})",
                             )
                             if not passed:
                                 return _escalate_to_human(
@@ -844,11 +934,18 @@ def run_factory(repo_root: str, issue_number: int | None = None) -> list[dict]:
 def format_status_table(jobs: list[dict]) -> str:
     if not jobs:
         return "No factory jobs recorded."
-    headers = ("JOB", "STAGE", "ROUND", "SLICES", "RISK", "TOKENS", "PR")
+    headers = ("JOB", "STAGE", "ROUND", "SLICES", "RISK", "TOKENS", "COST", "PR")
     rows = [headers]
     for j in jobs:
         slices = f"{j.get('completed_slices', 0)}/{j.get('total_slices', 0)}"
-        tokens = str((j.get("usage") or {}).get("total_tokens", 0))
+        usage = j.get("usage") or {}
+        tokens = str(usage.get("total_tokens", 0))
+        cost_val = usage.get("cost_usd")
+        cost_str = (
+            f"${float(cost_val):.2f}"
+            if isinstance(cost_val, (int, float)) and not isinstance(cost_val, bool) and cost_val > 0
+            else "-"
+        )
         pr_str = j.get("pr_url") or (f"#{j['pr_number']}" if j.get("pr_number") else "-")
         rows.append(
             (
@@ -858,6 +955,7 @@ def format_status_table(jobs: list[dict]) -> str:
                 slices,
                 str(j.get("risk", "-")),
                 tokens,
+                cost_str,
                 pr_str,
             )
         )

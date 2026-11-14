@@ -172,10 +172,12 @@ def create_or_resume_job(jobs_dir: str, issue: dict, max_rounds: int) -> tuple[d
                 "pr_url": None,
                 "usage": {
                     "input_tokens": 0,
+                    "cache_read_tokens": 0,
                     "output_tokens": 0,
                     "thinking_tokens": 0,
                     "total_tokens": 0,
                     "duration_seconds": 0.0,
+                    "cost_usd": 0.0,
                 },
                 "last_error": None,
                 "created": now,
@@ -218,22 +220,32 @@ def create_or_resume_job(jobs_dir: str, issue: dict, max_rounds: int) -> tuple[d
         return _atomic_write_job(jobs_dir, job_id, job), "resume"
 
 
-def record_usage(jobs_dir: str, job_id: str, usage: dict, duration_seconds: float) -> dict:
+def record_usage(
+    jobs_dir: str,
+    job_id: str,
+    usage: dict,
+    duration_seconds: float,
+    cost_usd: float | None = None,
+) -> dict:
     with _job_lock(jobs_dir, job_id):
         job = load_job(jobs_dir, job_id)
         cur = job.setdefault(
             "usage",
             {
                 "input_tokens": 0,
+                "cache_read_tokens": 0,
                 "output_tokens": 0,
                 "thinking_tokens": 0,
                 "total_tokens": 0,
                 "duration_seconds": 0.0,
+                "cost_usd": 0.0,
             },
         )
-        for key in ("input_tokens", "output_tokens", "thinking_tokens", "total_tokens"):
+        for key in ("input_tokens", "cache_read_tokens", "output_tokens", "thinking_tokens", "total_tokens"):
             cur[key] = int(cur.get(key, 0)) + int((usage or {}).get(key, 0) or 0)
         cur["duration_seconds"] = round(float(cur.get("duration_seconds", 0.0)) + float(duration_seconds or 0.0), 3)
+        if cost_usd is not None:
+            cur["cost_usd"] = round(float(cur.get("cost_usd", 0.0) or 0.0) + float(cost_usd), 6)
         job["updated"] = _now_iso()
         return _atomic_write_job(jobs_dir, job_id, job)
 

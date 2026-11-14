@@ -3,7 +3,12 @@ import os
 import tempfile
 import unittest
 
-from factory.lib.config import load_config, resolve_reviewers
+from factory.lib.config import (
+    estimate_usage_cost_usd,
+    load_config,
+    resolve_reviewers,
+    split_model_and_effort,
+)
 from factory.lib.schemas import (
     SCHEMAS,
     render_approve_md,
@@ -169,6 +174,45 @@ class ConfigAndSchemaTests(unittest.TestCase):
                     "reasoning": "   ",
                 },
             )
+
+    def test_split_model_and_effort_and_estimate_usage_cost(self):
+        self.assertEqual(split_model_and_effort("gemini-4-argon-high"), ("gemini-4-argon", "high"))
+        self.assertEqual(split_model_and_effort("gemini-3.8-flash-medium"), ("gemini-3.8-flash", "medium"))
+        self.assertEqual(split_model_and_effort("custom-model"), ("custom-model", "default"))
+        self.assertEqual(split_model_and_effort(""), ("unknown", "default"))
+
+        cost = estimate_usage_cost_usd(
+            "gemini-4-argon-high",
+            {
+                "input_tokens": 100_000,
+                "cache_read_tokens": 1_000_000,
+                "output_tokens": 10_000,
+                "thinking_tokens": 5_000,
+                "total_tokens": 110_000,
+            },
+        )
+        # 0.1M * 1.25 + 1.0M * 0.3125 + 0.01M * 10.0 = 0.5375 (thinking_tokens not double-counted)
+        self.assertAlmostEqual(cost, 0.5375)
+
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "model_pricing": {
+                            "custom-pro": {"input_per_m": 2.0, "cached_per_m": 0.5, "output_per_m": 8.0}
+                        }
+                    },
+                    f,
+                )
+            cfg = load_config(d)
+            self.assertIn("gemini-4-argon", cfg["model_pricing"])
+            custom_cost = estimate_usage_cost_usd(
+                "custom-pro-high",
+                {"input_tokens": 500_000, "cache_read_tokens": 200_000, "output_tokens": 50_000},
+                cfg,
+            )
+            # 0.5 * 2.0 + 0.2 * 0.5 + 0.05 * 8.0 = 1.0 + 0.1 + 0.4 = 1.5
+            self.assertAlmostEqual(custom_cost, 1.5)
 
 
 if __name__ == "__main__":

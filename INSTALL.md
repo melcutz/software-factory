@@ -44,14 +44,14 @@ chmod +x factory/bin/factory factory/checks.sh
 
 ## 2. Configure for Your Stack
 
-1. **`factory/checks.sh`**: Replace the template test command with your project's deterministic, non-interactive verification suite (e.g. `npm run typecheck && npm test`, `pytest`, `cargo test --all-targets`). It must exit non-zero on any failure and must not rewrite tracked files.
+1. **`factory/checks.sh`**: Replace the template test command with your project's deterministic, non-interactive verification suite (e.g. `npm run typecheck && npm test`, `pytest`, `cargo test --all-targets`). It receives `FACTORY_GATE_SCOPE=slice|full` and `FACTORY_BASE_BRANCH=<branch>` so multi-slice builds can optionally run targeted tests on intermediate slices before running the full suite on the final slice. It must exit non-zero on any failure and must not rewrite tracked files.
 2. **`factory/config.json`**:
    - Set `base_branch` (`"main"`, `"master"`, etc.) and `merge_method` (`"merge"`, `"squash"`, or `"rebase"`).
    - Set `auto_merge`:
      - `"low"` *(default)*: Auto-merge passing `low`-risk PRs; mark passing `medium`/`high`-risk PRs ready (`gh pr ready`) for 1-click human merge.
      - `"all"`: Auto-merge all approved PRs regardless of risk tier.
      - `"none"`: Never auto-merge; stop every approved PR at `ready`.
-   - Adjust `concurrency` (default `3`) and `models` if desired.
+   - Adjust `concurrency` (default `3`), `models`, and optional `model_pricing` overrides if desired.
 3. **`.gitignore`**: Append:
    ```gitignore
    /factory/jobs/*

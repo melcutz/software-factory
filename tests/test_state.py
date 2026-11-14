@@ -128,6 +128,28 @@ class StateTests(unittest.TestCase):
             resumed, action = create_or_resume_job(d, issue, max_rounds=3)
             self.assertEqual((action, resumed["stage"], resumed["round"]), ("resume", "merging", 1))
 
+    def test_record_usage_accumulates_cache_read_tokens_and_cost_usd(self):
+        with tempfile.TemporaryDirectory() as d:
+            job, _ = create_or_resume_job(d, {"number": 88, "title": "Cost", "url": "u"}, max_rounds=2)
+            self.assertEqual(job["usage"]["cache_read_tokens"], 0)
+            self.assertEqual(job["usage"]["cost_usd"], 0.0)
+            record_usage(
+                d,
+                "job-88",
+                {"input_tokens": 100, "cache_read_tokens": 400, "output_tokens": 50, "thinking_tokens": 10, "total_tokens": 150},
+                2.5,
+                cost_usd=0.125,
+            )
+            updated = record_usage(
+                d,
+                "job-88",
+                {"input_tokens": 50, "cache_read_tokens": 600, "output_tokens": 25, "thinking_tokens": 5, "total_tokens": 75},
+                1.5,
+                cost_usd=0.075,
+            )
+            self.assertEqual(updated["usage"]["cache_read_tokens"], 1000)
+            self.assertAlmostEqual(updated["usage"]["cost_usd"], 0.2)
+
 
 if __name__ == "__main__":
     unittest.main()
