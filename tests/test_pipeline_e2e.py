@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from factory.lib.git_ops import is_worktree_clean
-from factory.lib.pipeline import format_status_table, process_job, run_doctor, run_factory
+from factory.lib.pipeline import factory_runner_status, format_status_table, process_job, run_doctor, run_factory
 from factory.lib.state import load_job
 
 
@@ -769,18 +769,71 @@ class PipelineE2ETests(unittest.TestCase):
         ]
         table = format_status_table(jobs)
         lines = table.splitlines()
-        self.assertTrue(lines[0].startswith("Factory: RUNNING (1 active: job-1 pid="))
-        self.assertIn("ACTIVITY", lines[1])
-        self.assertIn("running:slice-2", lines[3])
-        self.assertIn("stale (pre-merge-gate)", lines[4])
-        self.assertNotIn("stale", lines[5])
-        self.assertIn(" - ", lines[5])
+        self.assertIn("ACTIVITY", lines[0])
+        self.assertIn("running:slice-2", lines[2])
+        self.assertIn("stale (pre-merge-gate)", lines[3])
+        self.assertNotIn("stale", lines[4])
+        self.assertIn(" - ", lines[4])
 
-        # Only stale / terminal jobs -> clearly NOT RUNNING
-        stale_table = format_status_table(jobs[1:])
-        self.assertTrue(stale_table.splitlines()[0].startswith("Factory: NOT RUNNING (1 stale)"))
-        self.assertTrue(format_status_table([]).startswith("Factory: NOT RUNNING"))
-        self.assertTrue(format_status_table(jobs[2:]).startswith("Factory: NOT RUNNING\n"))
+        jobs_dir = os.path.join(self.repo, "factory", "jobs")
+        os.makedirs(jobs_dir, exist_ok=True)
+        pid_path = os.path.join(jobs_dir, ".factory.pid")
+
+        # Runner PID alive -> RUNNING (pid=..., active_jobs=...)
+        with open(pid_path, "w", encoding="utf-8") as f:
+            f.write(f"{alive_pid}\n")
+        self.assertEqual(
+            factory_runner_status(jobs_dir, jobs),
+            f"Factory: RUNNING (pid={alive_pid}, active_jobs=2)",
+        )
+
+        # Runner PID dead, but live worker exists -> RUNNING (1 live worker(s))
+        with open(pid_path, "w", encoding="utf-8") as f:
+            f.write(f"{dead_pid}\n")
+        self.assertEqual(
+            factory_runner_status(jobs_dir, jobs),
+            "Factory: RUNNING (1 live worker(s))",
+        )
+
+        # Runner PID dead and only stale active job -> NOT RUNNING (1 unfinished/stale job(s); last run pid=... exited)
+        self.assertEqual(
+            factory_runner_status(jobs_dir, jobs[1:]),
+            f"Factory: NOT RUNNING (1 unfinished/stale job(s); last run pid={dead_pid} exited)",
+        )
+
+        # No active jobs -> NOT RUNNING
+        os.remove(pid_path)
+        self.assertEqual(factory_runner_status(jobs_dir, jobs[2:]), "Factory: NOT RUNNING")
+        self.assertEqual(factory_runner_status(jobs_dir, []), "Factory: NOT RUNNING")
+
+    def test_run_factory_refreshes_queue_on_job_completion(self):
+        self._seed_issue(20, "First queued job")
+        cfg_path = os.path.join(self.repo, "factory", "config.json")
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["concurrency"] = 1
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+
+        from unittest.mock import patch
+
+        calls = []
+
+        def fake_list_queue_issues(_cfg):
+            calls.append(1)
+            if len(calls) == 1:
+                return [{"number": 20, "title": "First queued job", "url": "u20"}]
+            if len(calls) == 2:
+                self._seed_issue(21, "Newly added job")
+                return [{"number": 21, "title": "Newly added job", "url": "u21"}]
+            return []
+
+        with patch("factory.lib.pipeline.GitHubClient.list_queue_issues", side_effect=fake_list_queue_issues):
+            results = run_factory(self.repo)
+
+        self.assertEqual([r["issue"] for r in results], [20, 21])
+        self.assertTrue(all(r["stage"] == "merged" for r in results))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "factory", "jobs", ".factory.pid")))
 
 
 if __name__ == "__main__":

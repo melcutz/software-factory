@@ -142,7 +142,9 @@ def _set_activity(jobs_dir: str, job_id: str, activity: str | None) -> None:
     )
 
 
-def _is_pid_alive(pid: int) -> bool:
+def _is_pid_alive(pid: int | None) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
         return True
@@ -1060,52 +1062,104 @@ def process_job(
 def run_factory(repo_root: str, issue_number: int | None = None) -> list[dict]:
     """Process a single issue or drain all eligible queued issues concurrently."""
     repo_root = os.path.abspath(repo_root)
-    cfg = load_config(os.path.join(repo_root, "factory"))
+    factory_dir = os.path.join(repo_root, "factory")
+    jobs_dir = os.path.join(factory_dir, "jobs")
+    os.makedirs(jobs_dir, exist_ok=True)
+    pid_path = os.path.join(jobs_dir, ".factory.pid")
+    cfg = load_config(factory_dir)
     gh = GitHubClient(repo_root)
 
-    if issue_number is not None:
-        return [process_job(repo_root, int(issue_number), config=cfg, gh=gh)]
+    _write_text(pid_path, f"{os.getpid()}\n")
+    try:
+        if issue_number is not None:
+            return [process_job(repo_root, int(issue_number), config=cfg, gh=gh)]
 
-    issues = gh.list_queue_issues(cfg)
-    if not issues:
-        return []
+        def _safe_worker(num: int) -> dict | None:
+            try:
+                return process_job(repo_root, num, config=cfg, gh=gh)
+            except Exception as exc:
+                print(f"[issue-{num}] error before job state could escalate: {exc}", file=sys.stderr)
+                return None
 
-    def _safe_worker(num: int) -> dict | None:
+        max_workers = max(1, int(cfg["concurrency"]))
+        results: list[dict] = []
+        in_flight: dict[concurrent.futures.Future, int] = {}
+        skip_issues: set[int] = set()
+
+        def _fill_slots(pool: concurrent.futures.ThreadPoolExecutor) -> None:
+            if len(in_flight) >= max_workers:
+                return
+            try:
+                issues = gh.list_queue_issues(cfg)
+            except Exception as exc:
+                if not in_flight:
+                    raise
+                print(f"[factory] warning: queue refresh failed: {exc}", file=sys.stderr)
+                return
+            active_nums = set(in_flight.values())
+            for item in issues:
+                if len(in_flight) >= max_workers:
+                    break
+                num = int(item["number"])
+                if num in active_nums or num in skip_issues:
+                    continue
+                fut = pool.submit(_safe_worker, num)
+                in_flight[fut] = num
+                active_nums.add(num)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            _fill_slots(pool)
+            while in_flight:
+                done, _ = concurrent.futures.wait(
+                    in_flight.keys(),
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for fut in done:
+                    num = in_flight.pop(fut)
+                    res = fut.result()
+                    if res is not None:
+                        results.append(res)
+                        if res.get("stage") in TERMINAL_OR_READY_STAGES:
+                            skip_issues.add(num)
+                    else:
+                        skip_issues.add(num)
+                _fill_slots(pool)
+        return results
+    finally:
         try:
-            return process_job(repo_root, num, config=cfg, gh=gh)
-        except Exception as exc:
-            print(f"[issue-{num}] error before job state could escalate: {exc}", file=sys.stderr)
-            return None
-
-    max_workers = min(int(cfg["concurrency"]), len(issues))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(_safe_worker, int(item["number"])) for item in issues]
-        return [res for fut in futures if (res := fut.result()) is not None]
+            if os.path.isfile(pid_path) and _read_text(pid_path).strip() == str(os.getpid()):
+                os.remove(pid_path)
+        except OSError:
+            pass
 
 
-def _factory_running_banner(jobs: list[dict]) -> str:
-    live = []
-    stale = 0
-    for j in jobs:
-        stage = str(j.get("stage", ""))
-        if stage in TERMINAL_OR_READY_STAGES or stage in {"needs-human", "needs-info"}:
-            continue
-        pid = j.get("pid")
-        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and _is_pid_alive(pid):
-            live.append(f"{j.get('id', '?')} pid={pid}")
-        else:
-            stale += 1
-    if live:
-        return f"Factory: RUNNING ({len(live)} active: {', '.join(live)})"
-    if stale:
-        return f"Factory: NOT RUNNING ({stale} stale)"
+def factory_runner_status(jobs_dir: str, jobs: list[dict] | None = None) -> str:
+    """Return a clear one-line banner stating whether the factory runner is active."""
+    pid_path = os.path.join(jobs_dir, ".factory.pid")
+    raw_pid = _read_text(pid_path).strip() if os.path.isfile(pid_path) else ""
+    runner_pid = int(raw_pid) if raw_pid.isdigit() else None
+    all_jobs = jobs if jobs is not None else []
+    active_jobs = [
+        j
+        for j in all_jobs
+        if j.get("stage") not in TERMINAL_OR_READY_STAGES
+        and j.get("stage") not in {"needs-human", "needs-info"}
+    ]
+    live_workers = sum(1 for j in active_jobs if _is_pid_alive(j.get("pid")))
+
+    if _is_pid_alive(runner_pid):
+        return f"Factory: RUNNING (pid={runner_pid}, active_jobs={len(active_jobs)})"
+    if live_workers > 0:
+        return f"Factory: RUNNING ({live_workers} live worker(s))"
+    if active_jobs:
+        stale_note = f"last run pid={runner_pid} exited" if runner_pid else "no live worker"
+        return f"Factory: NOT RUNNING ({len(active_jobs)} unfinished/stale job(s); {stale_note})"
     return "Factory: NOT RUNNING"
 
 
 def format_status_table(jobs: list[dict]) -> str:
     if not jobs:
-        return "Factory: NOT RUNNING\nNo factory jobs recorded."
-    banner = _factory_running_banner(jobs)
+        return "No factory jobs recorded."
     headers = ("JOB", "STAGE", "ACTIVITY", "ROUND", "SLICES", "RISK", "TOKENS", "COST", "PR")
     rows = [headers]
     for j in jobs:
@@ -1133,7 +1187,7 @@ def format_status_table(jobs: list[dict]) -> str:
             )
         )
     widths = [max(len(r[col]) for r in rows) for col in range(len(headers))]
-    out_lines = [banner]
+    out_lines = []
     for idx, r in enumerate(rows):
         line = "  ".join(r[col].ljust(widths[col]) for col in range(len(headers))).rstrip()
         out_lines.append(line)

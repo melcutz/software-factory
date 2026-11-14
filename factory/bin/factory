@@ -15,7 +15,7 @@ if REPO_ROOT not in sys.path:
 from factory.lib.config import load_config
 from factory.lib.gate_runner import run_gate
 from factory.lib.git_ops import GitHubClient
-from factory.lib.pipeline import format_status_table, run_doctor, run_factory
+from factory.lib.pipeline import factory_runner_status, format_status_table, run_doctor, run_factory
 from factory.lib.state import list_jobs, load_job
 
 
@@ -65,7 +65,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(json.dumps(job, indent=2))
             return 0
-        print(format_status_table(list_jobs(jobs_dir)))
+        jobs = list_jobs(jobs_dir)
+        print(factory_runner_status(jobs_dir, jobs))
+        print(format_status_table(jobs))
         return 0
 
     if args.command == "gate":
