@@ -48,6 +48,9 @@ if args[:2] == ["issue", "list"]:
     sys.exit(0)
 
 if args[:2] == ["issue", "view"]:
+    if "--comments" in args and "--json" in args:
+        sys.stderr.write("specify only one of --comments or --json\n")
+        sys.exit(1)
     num = args[2]
     if num == "99":
         sys.stderr.write("Simulated GitHub 502 on issue 99\n")
@@ -162,7 +165,14 @@ if args[:2] == ["pr", "merge"]:
         assert not d["prs"][num]["draft"], "Cannot merge draft PR!"
         d["prs"][num]["merged"] = True
         d["prs"][num]["state"] = "merged"
-    with_state(_pr_merge)
+        return d["prs"][num]["head"]
+    head_branch = with_state(_pr_merge)
+    if "--delete-branch" in args or "-d" in args:
+        import subprocess
+        del_res = subprocess.run(["git", "branch", "-D", head_branch], capture_output=True, text=True)
+        if del_res.returncode != 0:
+            sys.stderr.write(f"failed to delete local branch {head_branch}: {del_res.stderr}")
+            sys.exit(1)
     sys.exit(0)
 
 raise SystemExit(f"Unhandled gh args: {args}")
@@ -598,6 +608,13 @@ class PipelineE2ETests(unittest.TestCase):
         by_issue = {j["issue"]: j["stage"] for j in results}
         self.assertEqual(by_issue[21], "merged")
         self.assertEqual(by_issue[22], "merged")
+
+    def test_cli_status_missing_job_exits_cleanly_without_traceback(self):
+        cli_path = os.path.abspath(os.path.join("factory", "bin", "factory"))
+        res = subprocess.run([cli_path, "status", "job-9999"], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("job-9999", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
 
 
 if __name__ == "__main__":

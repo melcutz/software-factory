@@ -154,6 +154,22 @@ class ConfigAndSchemaTests(unittest.TestCase):
         self.assertIn("Closes #42", pr_body)
         self.assertIn("Two-way door", pr_body)
 
+    def test_reject_intake_requires_non_empty_reasoning(self):
+        with self.assertRaises(ValueError):
+            validate_stage_output(
+                "intake",
+                {
+                    "decision": "REJECT",
+                    "risk": "low",
+                    "surfaces": [],
+                    "summary": ["Out of scope"],
+                    "scope_in": "",
+                    "scope_out": "",
+                    "questions": [],
+                    "reasoning": "   ",
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -153,6 +153,8 @@ def validate_stage_output(stage: str, payload: dict) -> dict:
         data["surfaces"] = sorted(set(data["surfaces"]))
         if data["decision"] == "NEEDS_INFO" and not [q for q in data["questions"] if str(q).strip()]:
             raise ValueError("NEEDS_INFO intake must provide at least one question")
+        if data["decision"] == "REJECT" and not str(data["reasoning"]).strip():
+            raise ValueError("REJECT intake must include non-empty reasoning")
 
     elif stage == "spec":
         slices = data.get("slices")

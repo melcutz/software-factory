@@ -6,6 +6,7 @@ import unittest
 from factory.lib.agy_runner import (
      SUBAGENT_PREAMBLE,
     AgentExecutionError,
+    _extract_json_envelope,
     load_agent_instructions,
     run_agent,
 )
@@ -166,6 +167,21 @@ print(json.dumps({"status": "SUCCESS", "duration_seconds": 1.0, "usage": {},
                         log_name="r1-approve",
                     )
             self.assertFalse(os.path.exists(os.path.join(wt, "sneaky.txt")))
+
+    def test_extract_multiline_pretty_json_envelope_after_spinner_noise(self):
+        raw = (
+            "⠋ Thinking about architecture...\n"
+            "{\n"
+            '  "status": "SUCCESS",\n'
+            '  "duration_seconds": 1.2,\n'
+            '  "structured_output": {\n'
+            '    "decision": "APPROVE"\n'
+            "  }\n"
+            "}\n"
+        )
+        parsed = _extract_json_envelope(raw)
+        self.assertEqual(parsed["status"], "SUCCESS")
+        self.assertEqual(parsed["structured_output"]["decision"], "APPROVE")
 
 
 if __name__ == "__main__":

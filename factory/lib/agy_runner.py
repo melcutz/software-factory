@@ -47,6 +47,20 @@ def _extract_json_envelope(stdout: str) -> dict:
             return parsed
     except json.JSONDecodeError:
         pass
+    decoder = json.JSONDecoder()
+    pos = len(text)
+    while True:
+        idx = text.rfind("{", 0, pos)
+        if idx < 0:
+            break
+        pos = idx
+        try:
+            parsed, end_idx = decoder.raw_decode(text, idx)
+            if isinstance(parsed, dict) and ("status" in parsed or "structured_output" in parsed):
+                if not text[end_idx:].strip():
+                    return parsed
+        except json.JSONDecodeError:
+            continue
     for line in reversed(text.splitlines()):
         candidate = line.strip()
         if candidate.startswith("{") and candidate.endswith("}"):
@@ -72,6 +86,8 @@ def run_agent(
     sandbox: bool = True,
     clean_worktree: bool = True,
     log_name: str = "",
+    extra_env: dict[str, str] | None = None,
+    protect_head: bool = False,
 ) -> tuple[dict, dict, float]:
     """Run one headless `agy -p` turn with JSON Schema validation and 1 retry."""
     instructions = load_agent_instructions(factory_dir, agent_name)
@@ -99,7 +115,9 @@ def run_agent(
     if sandbox:
         cmd.append("--sandbox")
 
-    initial_sha = head_sha(worktree) if sandbox else ""
+    guard_head = sandbox or protect_head
+    initial_sha = head_sha(worktree) if guard_head else ""
+    proc_env = {**os.environ, **extra_env} if extra_env is not None else None
     last_err: Exception | None = None
 
     for attempt in (1, 2):
@@ -109,13 +127,14 @@ def run_agent(
                 proc = subprocess.run(
                     cmd,
                     cwd=worktree,
+                    env=proc_env,
                     capture_output=True,
                     text=True,
                     timeout=timeout_sec + _SUBPROCESS_TIMEOUT_GRACE_SEC,
                     check=False,
                 )
             finally:
-                if sandbox:
+                if guard_head:
                     after_sha = head_sha(worktree)
                     if after_sha != initial_sha:
                         subprocess.run(

@@ -14,6 +14,7 @@ from factory.lib.gate_runner import run_gate
 from factory.lib.git_ops import (
     GitHubClient,
     commits_ahead,
+    delete_remote_branch,
     diff_stat,
     ensure_worktree,
     is_worktree_clean,
@@ -180,10 +181,11 @@ def process_job(
         return job
 
     try:
-        worktree, branch = ensure_worktree(repo_root, job_id, base_branch)
+        worktree, branch = ensure_worktree(repo_root, job_id, base_branch, branch=job.get("branch"))
 
         while True:
             job = load_job(jobs_dir, job_id)
+            branch = job.get("branch") or f"factory/{job_id}"
             stage = job["stage"]
             if stage in TERMINAL_OR_READY_STAGES or stage in {"needs-info", "needs-human"}:
                 return job
@@ -455,6 +457,7 @@ def process_job(
                             "Worktree has uncommitted changes or zero commits ahead of base branch. "
                             "Commit all changes cleanly."
                         )
+                        _write_text(os.path.join(jdir, f"round-{round_num}", "checks.md"), f"GATE: FAIL\n\n{checks_md}\n")
 
                     if attempt == cfg["max_slice_retries"]:
                         break
@@ -742,6 +745,7 @@ def process_job(
                     gh_client.mark_pr_ready(pr_num)
                     gh_client.merge_pr(pr_num, cfg["merge_method"])
                     merged_job = advance_stage(jobs_dir, job_id, "merged")
+                    delete_remote_branch(repo_root, branch)
 
                 try:
                     gh_client.edit_labels(issue_number, remove=[labels["queue"]])

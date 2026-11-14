@@ -36,9 +36,14 @@ def _run_git(cwd: str, *args: str, check: bool = True) -> subprocess.CompletedPr
     return res
 
 
-def ensure_worktree(repo_root: str, job_id: str, base_branch: str) -> tuple[str, str]:
-    """Ensure .worktrees/<job_id> exists on branch factory/<job_id> without wiping existing commits."""
-    branch = f"factory/{job_id}"
+def ensure_worktree(
+    repo_root: str,
+    job_id: str,
+    base_branch: str,
+    branch: str | None = None,
+) -> tuple[str, str]:
+    """Ensure .worktrees/<job_id> exists on target branch without wiping existing commits."""
+    target_branch = branch or f"factory/{job_id}"
     wt_root = os.path.join(repo_root, ".worktrees")
     wt_path = os.path.join(wt_root, job_id)
 
@@ -47,15 +52,36 @@ def ensure_worktree(repo_root: str, job_id: str, base_branch: str) -> tuple[str,
         _run_git(repo_root, "fetch", "origin", base_branch)
 
         if os.path.exists(os.path.join(wt_path, ".git")):
-            return wt_path, branch
+            cur = _run_git(wt_path, "branch", "--show-current", check=False).stdout.strip()
+            if cur != target_branch:
+                exists = _run_git(
+                    repo_root,
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{target_branch}",
+                    check=False,
+                )
+                if exists.returncode == 0:
+                    _run_git(wt_path, "checkout", target_branch)
+                else:
+                    _run_git(wt_path, "checkout", "-B", target_branch, f"origin/{base_branch}")
+            return wt_path, target_branch
 
         os.makedirs(wt_root, exist_ok=True)
-        branch_exists = _run_git(repo_root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
+        branch_exists = _run_git(
+            repo_root,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{target_branch}",
+            check=False,
+        )
         if branch_exists.returncode == 0:
-            _run_git(repo_root, "worktree", "add", wt_path, branch)
+            _run_git(repo_root, "worktree", "add", wt_path, target_branch)
         else:
-            _run_git(repo_root, "worktree", "add", "-b", branch, wt_path, f"origin/{base_branch}")
-        return wt_path, branch
+            _run_git(repo_root, "worktree", "add", "-b", target_branch, wt_path, f"origin/{base_branch}")
+        return wt_path, target_branch
 
 
 def is_worktree_clean(worktree: str) -> bool:
@@ -103,6 +129,10 @@ def sync_with_base(worktree: str, base_branch: str) -> tuple[bool, bool, str]:
 
 def push_branch(worktree: str, branch: str) -> None:
     _run_git(worktree, "push", "-u", "origin", branch)
+
+
+def delete_remote_branch(repo_root: str, branch: str) -> None:
+    _run_git(repo_root, "push", "origin", "--delete", branch, check=False)
 
 
 def _escape_untrusted(text: str | None) -> str:
@@ -199,7 +229,6 @@ class GitHubClient:
                 "issue",
                 "view",
                 str(issue_number),
-                "--comments",
                 "--json",
                 "number,title,body,url,comments,labels,state",
             ],
@@ -282,4 +311,4 @@ class GitHubClient:
 
     def merge_pr(self, pr_number: int, merge_method: str) -> None:
         flag = f"--{merge_method}"
-        self._runner(["pr", "merge", str(pr_number), flag, "--delete-branch"], self.repo_root)
+        self._runner(["pr", "merge", str(pr_number), flag], self.repo_root)

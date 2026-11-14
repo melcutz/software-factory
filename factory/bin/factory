@@ -58,7 +58,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "status":
         if args.job_id:
-            job = load_job(jobs_dir, args.job_id)
+            try:
+                job = load_job(jobs_dir, args.job_id)
+            except FileNotFoundError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
             print(json.dumps(job, indent=2))
             return 0
         print(format_status_table(list_jobs(jobs_dir)))

@@ -200,6 +200,49 @@ class GitAndGateTests(unittest.TestCase):
             finally:
                 os.environ["PATH"] = old_path
 
+    def test_fetch_issue_omits_mutually_exclusive_comments_flag_and_merge_omits_delete_branch(self):
+        import json
+
+        seen_args: list[list[str]] = []
+
+        def fake_runner(args: list[str], cwd: str) -> str:
+            seen_args.append(args)
+            if args[:2] == ["issue", "view"]:
+                return json.dumps(
+                    {
+                        "number": 516,
+                        "title": "Test issue",
+                        "body": "Body text",
+                        "url": "https://example.test/issues/516",
+                        "comments": [{"author": {"login": "alice"}, "body": "First comment"}],
+                        "labels": [],
+                        "state": "OPEN",
+                    }
+                )
+            return ""
+
+        gh = GitHubClient("/tmp/repo", runner=fake_runner)
+        issue, md = gh.fetch_issue(516)
+        self.assertNotIn("--comments", seen_args[0])
+        self.assertIn("--json", seen_args[0])
+        self.assertIn("comments", seen_args[0][seen_args[0].index("--json") + 1].split(","))
+        self.assertEqual(issue["number"], 516)
+        self.assertIn("First comment", md)
+
+        gh.merge_pr(104, "squash")
+        self.assertEqual(seen_args[1], ["pr", "merge", "104", "--squash"])
+        self.assertNotIn("--delete-branch", seen_args[1])
+
+    def test_ensure_worktree_recovers_detached_head_back_to_job_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, clone = self._init_origin_and_clone(tmp)
+            wt, branch = ensure_worktree(clone, "job-19", "main")
+            self.assertEqual(branch, "factory/job-19")
+            subprocess.run(["git", "-C", wt, "checkout", "--detach", "HEAD"], check=True, capture_output=True)
+            wt2, branch2 = ensure_worktree(clone, "job-19", "main")
+            cur = subprocess.run(["git", "-C", wt2, "branch", "--show-current"], check=True, capture_output=True, text=True)
+            self.assertEqual((branch2, cur.stdout.strip()), ("factory/job-19", "factory/job-19"))
+
 
 if __name__ == "__main__":
     unittest.main()
