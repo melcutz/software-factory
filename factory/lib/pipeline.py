@@ -20,12 +20,15 @@ from factory.lib.config import (
 from factory.lib.gate_runner import run_gate
 from factory.lib.git_ops import (
     GitHubClient,
+    abort_merge,
     commits_ahead,
+    conflicted_files,
     delete_remote_branch,
     diff_stat,
     ensure_worktree,
     head_sha,
     is_worktree_clean,
+    merge_in_progress,
     push_branch,
     repo_lock,
     reset_worktree_clean,
@@ -212,6 +215,124 @@ def _aggregate_slice_builds(jdir: str, total_completed: int) -> tuple[dict, str]
         "notes": "\n".join(notes_list),
     }
     return agg, "\n\n".join(slice_mds)
+
+
+def _sync_pr_with_base(
+    repo_root: str,
+    factory_dir: str,
+    jobs_dir: str,
+    jdir: str,
+    job_id: str,
+    worktree: str,
+    branch: str,
+    base_branch: str,
+    round_num: int,
+    cfg: dict,
+) -> tuple[bool, str]:
+    """Sync branch with origin/<base_branch>, using builder to resolve conflicts before pre-merge gate."""
+    ok, head_changed, detail = sync_with_base(worktree, base_branch, abort_on_conflict=False)
+    if not ok:
+        if not merge_in_progress(worktree):
+            abort_merge(worktree)
+            return (
+                False,
+                f"Merge conflict while syncing `{branch}` with `origin/{base_branch}`:\n\n```\n{detail[:1000]}\n```",
+            )
+
+        before_resolve = head_sha(worktree)
+        conflicts = conflicted_files(worktree)
+        spec_md = _read_text(os.path.join(jdir, "spec.md"))
+        builder_model = cfg["models"]["builder"]
+        timeout_sec = int(cfg["agent_timeout_sec"])
+        conflict_list = "\n".join(f"- {path}" for path in conflicts) or "(see git status)"
+        conflict_prompt = (
+            f"JOB_ID: {job_id}\nROUND: {round_num}\nBRANCH: {branch}\nBASE_BRANCH: {base_branch}\n\n"
+            f"A `git merge --no-edit origin/{base_branch}` is currently in progress in this worktree "
+            f"and hit merge conflicts in:\n{conflict_list}\n\n"
+            f"## Git Output\n```\n{detail[:1500]}\n```\n\n"
+            "## Instructions\n"
+            f"1. Inspect the conflicted files and resolve all conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) "
+            f"preserving both `origin/{base_branch}`'s changes and this branch's intended behavior.\n"
+            "2. Do NOT run `git merge --abort` or `git push`.\n"
+            "3. Run targeted tests and fast linters on the affected files, stage the resolved files (`git add`), "
+            "and complete the merge commit (`git commit --no-edit`), leaving `git status --porcelain` clean.\n"
+            "4. Return `verdict: \"BLOCKED\"` with a concrete `blocked_reason` if the conflict cannot be safely resolved.\n"
+        )
+        if spec_md:
+            conflict_prompt += f"\n## Specification\n{spec_md}"
+
+        _log(job_id, f"merge-conflict resolve start files={len(conflicts)} ({_fmt_model_tag(builder_model)})")
+        try:
+            resolve_out, usage, dur = run_agent(
+                factory_dir,
+                jdir,
+                worktree,
+                "build",
+                "builder",
+                builder_model,
+                conflict_prompt,
+                SCHEMAS["build"],
+                timeout_sec,
+                sandbox=False,
+                log_name=f"r{round_num}-merge-conflict",
+            )
+        except Exception as exc:
+            abort_merge(worktree)
+            return (
+                False,
+                f"Merge conflict resolution failed while syncing `{branch}` with `origin/{base_branch}`: {exc}",
+            )
+
+        metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
+        _log(job_id, f"merge-conflict resolve verdict={resolve_out['verdict']} ({metrics_str})")
+
+        if resolve_out["verdict"] == "BLOCKED":
+            abort_merge(worktree)
+            return (
+                False,
+                f"Merge conflict while syncing `{branch}` with `origin/{base_branch}` "
+                f"(builder blocked: {resolve_out['blocked_reason']}):\n\n```\n{detail[:800]}\n```",
+            )
+
+        if (
+            merge_in_progress(worktree)
+            or conflicted_files(worktree)
+            or not is_worktree_clean(worktree)
+            or head_sha(worktree) == before_resolve
+        ):
+            abort_merge(worktree)
+            return (
+                False,
+                f"Merge conflict resolution for `{branch}` with `origin/{base_branch}` "
+                "did not complete a clean merge commit.",
+            )
+        head_changed = True
+
+    if head_changed:
+        _log(job_id, "gate pre-merge scope=full running checks.sh")
+        t_gate = time.monotonic()
+        passed, sync_checks_md = run_gate(
+            repo_root,
+            job_id,
+            worktree,
+            round_num,
+            cfg,
+            tag="pre-merge",
+            scope="full",
+        )
+        gate_dur = time.monotonic() - t_gate
+        _log(
+            job_id,
+            f"gate pre-merge scope=full verdict={'PASS' if passed else 'FAIL'} (dur={_fmt_duration(gate_dur)})",
+        )
+        if not passed:
+            return (
+                False,
+                f"Post-sync gate failed after merging `origin/{base_branch}`:\n\n{sync_checks_md[:1200]}",
+            )
+        push_branch(worktree, branch)
+
+    return True, ""
 
 
 def process_job(
@@ -837,46 +958,27 @@ def process_job(
                 with repo_lock(repo_root):
                     already_merged_sha = gh_client.get_pr_merge_commit(pr_num)
                     if not already_merged_sha:
-                        ok, head_changed, detail = sync_with_base(worktree, base_branch)
-                        if not ok:
+                        sync_ok, sync_err = _sync_pr_with_base(
+                            repo_root,
+                            factory_dir,
+                            jobs_dir,
+                            jdir,
+                            job_id,
+                            worktree,
+                            branch,
+                            base_branch,
+                            round_num,
+                            cfg,
+                        )
+                        if not sync_ok:
                             return _escalate_to_human(
                                 jobs_dir,
                                 job_id,
                                 issue_number,
                                 gh_client,
                                 cfg,
-                                f"Merge conflict while syncing `{branch}` with `origin/{base_branch}`:\n\n```\n{detail[:1000]}\n```",
-                                resume_stage="build",
+                                sync_err,
                             )
-
-                        if head_changed:
-                            _log(job_id, "gate pre-merge scope=full running checks.sh")
-                            t_gate = time.monotonic()
-                            passed, sync_checks_md = run_gate(
-                                repo_root,
-                                job_id,
-                                worktree,
-                                round_num,
-                                cfg,
-                                tag="pre-merge",
-                                scope="full",
-                            )
-                            gate_dur = time.monotonic() - t_gate
-                            _log(
-                                job_id,
-                                f"gate pre-merge scope=full verdict={'PASS' if passed else 'FAIL'} (dur={_fmt_duration(gate_dur)})",
-                            )
-                            if not passed:
-                                return _escalate_to_human(
-                                    jobs_dir,
-                                    job_id,
-                                    issue_number,
-                                    gh_client,
-                                    cfg,
-                                    f"Post-sync gate failed after merging `origin/{base_branch}`:\n\n{sync_checks_md[:1200]}",
-                                    resume_stage="build",
-                                )
-                            push_branch(worktree, branch)
 
                         gh_client.mark_pr_ready(pr_num)
                         gh_client.merge_pr(pr_num, cfg["merge_method"])

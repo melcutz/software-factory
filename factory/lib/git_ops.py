@@ -113,14 +113,37 @@ def diff_stat(worktree: str, base_branch: str) -> str:
     return _run_git(worktree, "diff", "--stat", f"origin/{base_branch}...HEAD").stdout.strip()
 
 
-def sync_with_base(worktree: str, base_branch: str) -> tuple[bool, bool, str]:
-    """Fetch origin/<base_branch> and merge cleanly; abort leaving worktree clean on conflict."""
+def merge_in_progress(worktree: str) -> bool:
+    """Return True if a git merge is currently in progress in worktree."""
+    res = _run_git(worktree, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False)
+    return res.returncode == 0
+
+
+def conflicted_files(worktree: str) -> list[str]:
+    """List unmerged (conflicted) paths in worktree using NUL-delimited output."""
+    res = _run_git(worktree, "diff", "--name-only", "--diff-filter=U", "-z", check=False)
+    return [entry for entry in res.stdout.split("\0") if entry]
+
+
+def abort_merge(worktree: str) -> None:
+    """Abort any in-progress merge and restore a clean worktree."""
+    _run_git(worktree, "merge", "--abort", check=False)
+    reset_worktree_clean(worktree)
+
+
+def sync_with_base(
+    worktree: str,
+    base_branch: str,
+    *,
+    abort_on_conflict: bool = True,
+) -> tuple[bool, bool, str]:
+    """Fetch origin/<base_branch> and merge cleanly; optionally keep conflict state for resolution."""
     before = head_sha(worktree)
     _run_git(worktree, "fetch", "origin", base_branch)
     res = _run_git(worktree, "merge", "--no-edit", f"origin/{base_branch}", check=False)
     if res.returncode != 0:
-        _run_git(worktree, "merge", "--abort", check=False)
-        reset_worktree_clean(worktree)
+        if abort_on_conflict:
+            abort_merge(worktree)
         detail = (res.stderr or res.stdout or "Merge conflict").strip()
         return False, False, detail
     after = head_sha(worktree)

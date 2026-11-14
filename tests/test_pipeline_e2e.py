@@ -312,6 +312,15 @@ if "# Role: Factory Builder" in prompt:
         os.remove("bad_check.txt")
 
     if job_id == "job-50":
+        if "git merge --no-edit" in prompt:
+            respond({
+                "verdict": "BLOCKED",
+                "summary": [],
+                "changes": [],
+                "tests_added": [],
+                "blocked_reason": "Conflicting edit in ok.txt requires human decision",
+                "notes": "",
+            })
         # Modify ok.txt so we can trigger a merge conflict with origin/main during merging!
         open("ok.txt", "w").write("branch-edit-50\n")
         subprocess.run(["git", "add", "ok.txt"], check=True)
