@@ -716,9 +716,71 @@ class PipelineE2ETests(unittest.TestCase):
 
         self.assertGreater(merged["usage"]["cache_read_tokens"], 0)
         self.assertGreater(merged["usage"]["cost_usd"], 0.0)
+        self.assertIsNone(merged.get("activity"))
+        self.assertIsNone(merged.get("pid"))
         table = format_status_table([merged])
         self.assertIn("COST", table)
+        self.assertIn("ACTIVITY", table)
         self.assertIn("$", table)
+
+    def test_status_table_activity_and_pid_liveness(self):
+        alive_pid = os.getpid()
+        dead_pid = 999_999_999
+        jobs = [
+            {
+                "id": "job-1",
+                "stage": "build",
+                "activity": "running:slice-2",
+                "pid": alive_pid,
+                "round": 1,
+                "round_limit": 3,
+                "completed_slices": 1,
+                "total_slices": 3,
+                "risk": "low",
+                "usage": {"total_tokens": 100, "cost_usd": 0.12},
+                "pr_number": 1,
+            },
+            {
+                "id": "job-2",
+                "stage": "merging",
+                "activity": "running:pre-merge-gate",
+                "pid": dead_pid,
+                "round": 1,
+                "round_limit": 3,
+                "completed_slices": 1,
+                "total_slices": 1,
+                "risk": "low",
+                "usage": {"total_tokens": 50, "cost_usd": 0.0},
+                "pr_number": 2,
+            },
+            {
+                "id": "job-3",
+                "stage": "needs-human",
+                "activity": "running:approve",
+                "pid": dead_pid,
+                "round": 1,
+                "round_limit": 3,
+                "completed_slices": 1,
+                "total_slices": 1,
+                "risk": "medium",
+                "usage": {"total_tokens": 25, "cost_usd": 0.0},
+                "pr_number": 3,
+            },
+        ]
+        table = format_status_table(jobs)
+        lines = table.splitlines()
+        self.assertTrue(lines[0].startswith("Factory: RUNNING (1 active: job-1 pid="))
+        self.assertIn("ACTIVITY", lines[1])
+        self.assertIn("running:slice-2", lines[3])
+        self.assertIn("stale (pre-merge-gate)", lines[4])
+        self.assertNotIn("stale", lines[5])
+        self.assertIn(" - ", lines[5])
+
+        # Only stale / terminal jobs -> clearly NOT RUNNING
+        stale_table = format_status_table(jobs[1:])
+        self.assertTrue(stale_table.splitlines()[0].startswith("Factory: NOT RUNNING (1 stale)"))
+        self.assertTrue(format_status_table([]).startswith("Factory: NOT RUNNING"))
+        self.assertTrue(format_status_table(jobs[2:]).startswith("Factory: NOT RUNNING\n"))
 
 
 if __name__ == "__main__":

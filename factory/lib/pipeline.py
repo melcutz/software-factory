@@ -133,6 +133,41 @@ def _log(job_id: str, message: str) -> None:
     print(f"[{_ts()}] [{job_id}] {message}", flush=True)
 
 
+def _set_activity(jobs_dir: str, job_id: str, activity: str | None) -> None:
+    update_job(
+        jobs_dir,
+        job_id,
+        activity=activity,
+        pid=os.getpid() if activity is not None else None,
+    )
+
+
+def _is_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _format_activity(job: dict) -> str:
+    stage = str(job.get("stage", ""))
+    if stage in TERMINAL_OR_READY_STAGES or stage in {"needs-human", "needs-info"}:
+        return "-"
+    activity = job.get("activity")
+    pid = job.get("pid")
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and _is_pid_alive(pid):
+        return str(activity or "running")
+    if activity:
+        label = str(activity).split(":", 1)[-1]
+        return f"stale ({label})"
+    return "stale"
+
+
 def _escalate_to_human(
     jobs_dir: str,
     job_id: str,
@@ -261,6 +296,7 @@ def _sync_pr_with_base(
         if spec_md:
             conflict_prompt += f"\n## Specification\n{spec_md}"
 
+        _set_activity(jobs_dir, job_id, "running:conflict-resolve")
         _log(job_id, f"merge-conflict resolve start files={len(conflicts)} ({_fmt_model_tag(builder_model)})")
         try:
             resolve_out, usage, dur = run_agent(
@@ -309,6 +345,7 @@ def _sync_pr_with_base(
         head_changed = True
 
     if head_changed:
+        _set_activity(jobs_dir, job_id, "running:pre-merge-gate")
         _log(job_id, "gate pre-merge scope=full running checks.sh")
         t_gate = time.monotonic()
         passed, sync_checks_md = run_gate(
@@ -378,6 +415,7 @@ def process_job(
 
             if stage == "intake":
                 intake_model = cfg["models"]["intake"]
+                _set_activity(jobs_dir, job_id, "running:intake")
                 _log(job_id, f"intake start ({_fmt_model_tag(intake_model)})")
                 prompt = f"JOB_ID: {job_id}\nBASE_BRANCH: {base_branch}\n\n{issue_md}"
                 intake_out, usage, dur = run_agent(
@@ -424,6 +462,7 @@ def process_job(
 
             if stage == "spec":
                 spec_model = cfg["models"]["spec_writer"]
+                _set_activity(jobs_dir, job_id, "running:spec")
                 _log(job_id, f"spec start ({_fmt_model_tag(spec_model)})")
                 intake_md = _read_text(os.path.join(jdir, "intake.md"))
                 prompt = (
@@ -477,6 +516,7 @@ def process_job(
                         _, prior_slices_md = _aggregate_slice_builds(jdir, idx)
 
                         for attempt in range(cfg["max_slice_retries"] + 1):
+                            _set_activity(jobs_dir, job_id, f"running:slice-{slice_num}")
                             _log(
                                 job_id,
                                 f"build slice={slice_num}/{total_slices} attempt={attempt + 1} start ({_fmt_model_tag(builder_model)})",
@@ -544,6 +584,7 @@ def process_job(
                                 continue
 
                             gate_scope = "slice" if slice_num < total_slices else "full"
+                            _set_activity(jobs_dir, job_id, f"running:slice-{slice_num}-gate")
                             _log(
                                 job_id,
                                 f"gate slice={slice_num}/{total_slices} scope={gate_scope} running checks.sh",
@@ -626,6 +667,7 @@ def process_job(
                             spec_md,
                         ]
                     )
+                    _set_activity(jobs_dir, job_id, f"running:fix-round-{round_num}")
                     _log(job_id, f"build fix-round={round_num} start ({_fmt_model_tag(builder_model)})")
                     build_out, usage, dur = run_agent(
                         factory_dir,
@@ -679,6 +721,7 @@ def process_job(
                             )
                             passed, checks_md = True, existing_checks
                             break
+                        _set_activity(jobs_dir, job_id, f"running:gate-{attempt + 1}")
                         _log(job_id, f"gate scope=full running checks.sh (attempt={attempt + 1})")
                         t_gate = time.monotonic()
                         passed, checks_md = run_gate(repo_root, job_id, worktree, round_num, cfg, scope="full")
@@ -704,6 +747,7 @@ def process_job(
                         f"JOB_ID: {job_id}\nROUND: {round_num}\nBRANCH: {branch}\nBASE_BRANCH: {base_branch}\n\n"
                         f"## Gate Failure to Fix\n{checks_md}\n\n## Specification\n{spec_md}"
                     )
+                    _set_activity(jobs_dir, job_id, f"running:gate-fix-{attempt + 1}")
                     _log(job_id, f"gate-fix attempt={attempt + 1} start ({_fmt_model_tag(builder_model)})")
                     fix_out, usage, dur = run_agent(
                         factory_dir,
@@ -818,6 +862,7 @@ def process_job(
                     _log(job_id, f"review={rev_name} verdict={out['verdict']} ({metrics_str})")
                     return rev_name, out
 
+                _set_activity(jobs_dir, job_id, "running:review")
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(reviewers))) as pool:
                     results = dict(pool.map(_run_single_reviewer, reviewers.items()))
 
@@ -894,6 +939,7 @@ def process_job(
                     ]
                 )
                 approver_model = cfg["models"]["approver"]
+                _set_activity(jobs_dir, job_id, "running:approve")
                 _log(job_id, f"approve start ({_fmt_model_tag(approver_model)})")
                 approve_out, usage, dur = run_agent(
                     factory_dir,
@@ -955,7 +1001,9 @@ def process_job(
             if stage == "merging":
                 round_num = job["round"]
                 pr_num = int(job["pr_number"])
+                _set_activity(jobs_dir, job_id, "waiting:repo_lock")
                 with repo_lock(repo_root):
+                    _set_activity(jobs_dir, job_id, "running:merging")
                     already_merged_sha = gh_client.get_pr_merge_commit(pr_num)
                     if not already_merged_sha:
                         sync_ok, sync_err = _sync_pr_with_base(
@@ -1005,6 +1053,8 @@ def process_job(
                 f"Pipeline error during `{cur['stage']}`: {exc}",
             )
         raise
+    finally:
+        _set_activity(jobs_dir, job_id, None)
 
 
 def run_factory(repo_root: str, issue_number: int | None = None) -> list[dict]:
@@ -1033,10 +1083,30 @@ def run_factory(repo_root: str, issue_number: int | None = None) -> list[dict]:
         return [res for fut in futures if (res := fut.result()) is not None]
 
 
+def _factory_running_banner(jobs: list[dict]) -> str:
+    live = []
+    stale = 0
+    for j in jobs:
+        stage = str(j.get("stage", ""))
+        if stage in TERMINAL_OR_READY_STAGES or stage in {"needs-human", "needs-info"}:
+            continue
+        pid = j.get("pid")
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and _is_pid_alive(pid):
+            live.append(f"{j.get('id', '?')} pid={pid}")
+        else:
+            stale += 1
+    if live:
+        return f"Factory: RUNNING ({len(live)} active: {', '.join(live)})"
+    if stale:
+        return f"Factory: NOT RUNNING ({stale} stale)"
+    return "Factory: NOT RUNNING"
+
+
 def format_status_table(jobs: list[dict]) -> str:
     if not jobs:
-        return "No factory jobs recorded."
-    headers = ("JOB", "STAGE", "ROUND", "SLICES", "RISK", "TOKENS", "COST", "PR")
+        return "Factory: NOT RUNNING\nNo factory jobs recorded."
+    banner = _factory_running_banner(jobs)
+    headers = ("JOB", "STAGE", "ACTIVITY", "ROUND", "SLICES", "RISK", "TOKENS", "COST", "PR")
     rows = [headers]
     for j in jobs:
         slices = f"{j.get('completed_slices', 0)}/{j.get('total_slices', 0)}"
@@ -1053,6 +1123,7 @@ def format_status_table(jobs: list[dict]) -> str:
             (
                 str(j.get("id", "")),
                 str(j.get("stage", "")),
+                _format_activity(j),
                 f"{j.get('round', 0)}/{j.get('round_limit', 0)}",
                 slices,
                 str(j.get("risk", "-")),
@@ -1062,7 +1133,7 @@ def format_status_table(jobs: list[dict]) -> str:
             )
         )
     widths = [max(len(r[col]) for r in rows) for col in range(len(headers))]
-    out_lines = []
+    out_lines = [banner]
     for idx, r in enumerate(rows):
         line = "  ".join(r[col].ljust(widths[col]) for col in range(len(headers))).rstrip()
         out_lines.append(line)

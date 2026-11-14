@@ -116,6 +116,9 @@ def advance_stage(
         elif current == "needs-human":
             job["escalated_from"] = None
         job["stage"] = next_stage
+        if next_stage in TERMINAL_OR_READY_STAGES or next_stage in {"needs-info", "needs-human"}:
+            job["activity"] = None
+            job["pid"] = None
         if last_error is not None:
             job["last_error"] = last_error
         elif not preserve_last_error and next_stage not in {"needs-human", "needs-info"}:
@@ -170,6 +173,8 @@ def create_or_resume_job(jobs_dir: str, issue: dict, max_rounds: int) -> tuple[d
                 "completed_slices": 0,
                 "pr_number": None,
                 "pr_url": None,
+                "activity": None,
+                "pid": None,
                 "usage": {
                     "input_tokens": 0,
                     "cache_read_tokens": 0,
