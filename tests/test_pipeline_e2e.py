@@ -139,7 +139,15 @@ if args[:2] == ["pr", "view"]:
                 return p
         raise KeyError(ref)
     p = with_state(_pr_view)
-    print(json.dumps({"number": p["number"], "url": p["url"]}))
+    fields = args[args.index("--json") + 1].split(",") if "--json" in args else ["number", "url"]
+    resp = {}
+    if "number" in fields:
+        resp["number"] = p["number"]
+    if "url" in fields:
+        resp["url"] = p["url"]
+    if "mergeCommit" in fields:
+        resp["mergeCommit"] = {"oid": "deadbeef1234"} if p.get("merged") else None
+    print(json.dumps(resp))
     sys.exit(0)
 
 if args[:2] == ["pr", "edit"]:
@@ -163,6 +171,7 @@ if args[:2] == ["pr", "merge"]:
     num = args[2]
     def _pr_merge(d):
         assert not d["prs"][num]["draft"], "Cannot merge draft PR!"
+        assert not d["prs"][num].get("merged"), "PR already merged!"
         d["prs"][num]["merged"] = True
         d["prs"][num]["state"] = "merged"
         return d["prs"][num]["head"]
@@ -615,6 +624,51 @@ class PipelineE2ETests(unittest.TestCase):
         self.assertEqual(res.returncode, 1)
         self.assertIn("job-9999", res.stderr)
         self.assertNotIn("Traceback", res.stderr)
+
+    def test_gate_deduplicates_verified_slice_sha_and_merging_is_idempotent_when_already_merged(self):
+        counter_file = os.path.join(self.tmp, "checks_runs.count")
+        checks_path = os.path.join(self.repo, "factory", "checks.sh")
+        with open(checks_path, "w", encoding="utf-8") as f:
+            f.write(
+                f"#!/usr/bin/env bash\nset -euo pipefail\n"
+                f"n=$(cat {counter_file!r} 2>/dev/null || echo 0)\n"
+                f"echo $((n + 1)) > {counter_file!r}\n"
+                f"test ! -f bad_check.txt\ntest -f ok.txt\n"
+            )
+        os.chmod(checks_path, 0o755)
+        subprocess.run(["git", "-C", self.repo, "commit", "-am", "instrument checks"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", self.repo, "push", "origin", "main"], check=True, capture_output=True)
+
+        self._seed_issue(20, "Small typo fix")
+        merged = process_job(self.repo, 20)
+        self.assertEqual(merged["stage"], "merged")
+        with open(counter_file, encoding="utf-8") as f:
+            runs = int(f.read().strip())
+        # 1 slice -> checks.sh runs once in slice-1 gate and is skipped in stage=='gate' because HEAD is unchanged!
+        self.assertEqual(runs, 1)
+
+        # Simulate crash in `merging` AFTER PR was already merged on GitHub -> resume must finish cleanly without calling `pr merge` twice!
+        from factory.lib.state import advance_stage, update_job
+
+        jobs_dir = os.path.join(self.repo, "factory", "jobs")
+        job20_path = os.path.join(jobs_dir, "job-20", "job.json")
+        with open(job20_path, encoding="utf-8") as f:
+            j20 = json.load(f)
+        j20["stage"] = "needs-human"
+        j20["escalated_from"] = "merging"
+        j20["last_error"] = "gh crashed right after merge"
+        with open(job20_path, "w", encoding="utf-8") as f:
+            json.dump(j20, f, indent=2)
+
+        with open(self.gh_state_path, encoding="utf-8") as f:
+            gh_data = json.load(f)
+        gh_data["issues"]["20"]["labels"] = ["factory"]
+        with open(self.gh_state_path, "w", encoding="utf-8") as f:
+            json.dump(gh_data, f, indent=2)
+
+        resumed_merged = process_job(self.repo, 20)
+        self.assertEqual(resumed_merged["stage"], "merged")
+        self.assertEqual(resumed_merged["round"], 1)
 
 
 if __name__ == "__main__":

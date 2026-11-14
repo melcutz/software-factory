@@ -113,6 +113,21 @@ class StateTests(unittest.TestCase):
             self.assertEqual((act3, r3["stage"], r3["round"]), ("resume", "build", 2))
             self.assertIn("revoke mobile tokens", r3["last_error"] or "")
 
+    def test_merging_escalation_with_pr_resumes_at_merging_without_burning_round(self):
+        with tempfile.TemporaryDirectory() as d:
+            issue = {"number": 516, "title": "Delete tenant", "url": "https://x/516"}
+            create_or_resume_job(d, issue, max_rounds=3)
+            advance_stage(d, "job-516", "spec")
+            advance_stage(d, "job-516", "build")
+            advance_stage(d, "job-516", "gate")
+            advance_stage(d, "job-516", "review")
+            advance_stage(d, "job-516", "approve")
+            advance_stage(d, "job-516", "merging")
+            update_job(d, "job-516", pr_number=539)
+            advance_stage(d, "job-516", "needs-human", last_error="Transient gh error after merge")
+            resumed, action = create_or_resume_job(d, issue, max_rounds=3)
+            self.assertEqual((action, resumed["stage"], resumed["round"]), ("resume", "merging", 1))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,7 +16,7 @@ TRANSITIONS: dict[str, list[str]] = {
     "review": ["approve", "build", "needs-human"],
     "approve": ["merging", "ready", "needs-human"],
     "merging": ["merged", "needs-human"],
-    "needs-human": ["intake", "spec", "build", "rejected"],
+    "needs-human": ["intake", "spec", "build", "merging", "rejected"],
     "ready": ["merged"],
     "merged": [],
     "rejected": [],
@@ -90,6 +90,7 @@ def advance_stage(
     next_stage: str,
     last_error: str | None = None,
     preserve_last_error: bool = False,
+    expand_round_by: int = 0,
 ) -> dict:
     with _job_lock(jobs_dir, job_id):
         job = load_job(jobs_dir, job_id)
@@ -100,6 +101,8 @@ def advance_stage(
 
         next_round = job.get("round", 0)
         if current != "build" and next_stage == "build":
+            if expand_round_by > 0:
+                job["round_limit"] = max(job.get("round_limit", 3), next_round + int(expand_round_by))
             next_round += 1
             round_limit = job.get("round_limit", 3)
             if next_round > round_limit:
@@ -204,6 +207,9 @@ def create_or_resume_job(jobs_dir: str, issue: dict, max_rounds: int) -> tuple[d
             if escalated_from == "spec" or (has_pipeline_artifacts and not _has_valid_plan(jdir)):
                 _atomic_write_job(jobs_dir, job_id, job)
                 return advance_stage(jobs_dir, job_id, "spec", preserve_last_error=True), "resume"
+            if escalated_from == "merging" and job.get("pr_number"):
+                _atomic_write_job(jobs_dir, job_id, job)
+                return advance_stage(jobs_dir, job_id, "merging", preserve_last_error=True), "resume"
             job["round_limit"] = max(job.get("round_limit", max_rounds), job.get("round", 0) + 1)
             _atomic_write_job(jobs_dir, job_id, job)
             return advance_stage(jobs_dir, job_id, "build", preserve_last_error=True), "resume"

@@ -17,6 +17,7 @@ from factory.lib.git_ops import (
     delete_remote_branch,
     diff_stat,
     ensure_worktree,
+    head_sha,
     is_worktree_clean,
     push_branch,
     repo_lock,
@@ -77,9 +78,12 @@ def _escalate_to_human(
     gh: GitHubClient,
     config: dict,
     reason: str,
+    resume_stage: str | None = None,
 ) -> dict:
     labels = config["labels"]
     job = advance_stage(jobs_dir, job_id, "needs-human", last_error=reason)
+    if resume_stage:
+        job = update_job(jobs_dir, job_id, escalated_from=resume_stage)
     try:
         gh.edit_labels(issue_number, add=[labels["needs_human"]], remove=[labels["queue"]])
         pr_note = f"\nPR: {job['pr_url']}" if job.get("pr_url") else ""
@@ -286,6 +290,10 @@ def process_job(
                         _, prior_slices_md = _aggregate_slice_builds(jdir, idx)
 
                         for attempt in range(cfg["max_slice_retries"] + 1):
+                            print(
+                                f"[{job_id}] build slice={slice_num}/{total_slices} attempt={attempt + 1}",
+                                flush=True,
+                            )
                             prompt_parts = [
                                 f"JOB_ID: {job_id}",
                                 f"ROUND: {round_num}",
@@ -344,6 +352,10 @@ def process_job(
                                 retry_feedback = "No commits exist on branch ahead of base branch. Commit your implementation and tests."
                                 continue
 
+                            print(
+                                f"[{job_id}] gate slice={slice_num}/{total_slices} running checks.sh",
+                                flush=True,
+                            )
                             passed, slice_checks_md = run_gate(
                                 repo_root,
                                 job_id,
@@ -351,6 +363,10 @@ def process_job(
                                 round_num,
                                 cfg,
                                 tag=f"slice-{slice_num}",
+                            )
+                            print(
+                                f"[{job_id}] gate slice={slice_num}/{total_slices} verdict={'PASS' if passed else 'FAIL'}",
+                                flush=True,
                             )
                             if passed:
                                 _write_json(os.path.join(round_dir, f"slice-{slice_num}-build.json"), build_out)
@@ -361,7 +377,12 @@ def process_job(
                                 agg_build, _ = _aggregate_slice_builds(jdir, slice_num)
                                 _write_json(os.path.join(round_dir, "build.json"), agg_build)
                                 _write_text(os.path.join(round_dir, "build.md"), render_build_md(agg_build))
-                                update_job(jobs_dir, job_id, completed_slices=slice_num)
+                                update_job(
+                                    jobs_dir,
+                                    job_id,
+                                    completed_slices=slice_num,
+                                    verified_gate_sha=head_sha(worktree),
+                                )
                                 slice_done = True
                                 break
 
@@ -449,15 +470,31 @@ def process_job(
 
                 for attempt in range(cfg["max_slice_retries"] + 1):
                     if is_worktree_clean(worktree) and commits_ahead(worktree, base_branch) > 0:
+                        cur_sha = head_sha(worktree)
+                        existing_checks = _read_text(os.path.join(jdir, f"round-{round_num}", "checks.md"))
+                        if (
+                            attempt == 0
+                            and job.get("verified_gate_sha") == cur_sha
+                            and existing_checks.startswith("VERDICT: PASS")
+                        ):
+                            print(
+                                f"[{job_id}] gate already verified at {cur_sha[:7]} (skipping duplicate checks.sh)",
+                                flush=True,
+                            )
+                            passed, checks_md = True, existing_checks
+                            break
+                        print(f"[{job_id}] gate running checks.sh (attempt={attempt + 1})", flush=True)
                         passed, checks_md = run_gate(repo_root, job_id, worktree, round_num, cfg)
+                        print(f"[{job_id}] gate verdict={'PASS' if passed else 'FAIL'}", flush=True)
                         if passed:
+                            update_job(jobs_dir, job_id, verified_gate_sha=head_sha(worktree))
                             break
                     else:
                         checks_md = (
                             "Worktree has uncommitted changes or zero commits ahead of base branch. "
                             "Commit all changes cleanly."
                         )
-                        _write_text(os.path.join(jdir, f"round-{round_num}", "checks.md"), f"GATE: FAIL\n\n{checks_md}\n")
+                        _write_text(os.path.join(jdir, f"round-{round_num}", "checks.md"), f"VERDICT: FAIL\n\n{checks_md}\n")
 
                     if attempt == cfg["max_slice_retries"]:
                         break
@@ -554,6 +591,7 @@ def process_job(
                 def _run_single_reviewer(item: tuple[str, str]) -> tuple[str, dict]:
                     rev_name, rev_model = item
                     agent_file = f"reviewer-{rev_name}"
+                    print(f"[{job_id}] review={rev_name} start", flush=True)
                     out, u, d = run_agent(
                         factory_dir,
                         jdir,
@@ -573,6 +611,10 @@ def process_job(
                     _write_text(
                         os.path.join(round_dir, f"review-{rev_name}.md"),
                         render_review_md(rev_name, out),
+                    )
+                    print(
+                        f"[{job_id}] review={rev_name} verdict={out['verdict']} ({round(d, 1)}s)",
+                        flush=True,
                     )
                     return rev_name, out
 
@@ -709,41 +751,45 @@ def process_job(
 
             if stage == "merging":
                 round_num = job["round"]
+                pr_num = int(job["pr_number"])
                 with repo_lock(repo_root):
-                    ok, head_changed, detail = sync_with_base(worktree, base_branch)
-                    if not ok:
-                        return _escalate_to_human(
-                            jobs_dir,
-                            job_id,
-                            issue_number,
-                            gh_client,
-                            cfg,
-                            f"Merge conflict while syncing `{branch}` with `origin/{base_branch}`:\n\n```\n{detail[:1000]}\n```",
-                        )
-
-                    if head_changed:
-                        passed, sync_checks_md = run_gate(
-                            repo_root,
-                            job_id,
-                            worktree,
-                            round_num,
-                            cfg,
-                            tag="pre-merge",
-                        )
-                        if not passed:
+                    already_merged_sha = gh_client.get_pr_merge_commit(pr_num)
+                    if not already_merged_sha:
+                        ok, head_changed, detail = sync_with_base(worktree, base_branch)
+                        if not ok:
                             return _escalate_to_human(
                                 jobs_dir,
                                 job_id,
                                 issue_number,
                                 gh_client,
                                 cfg,
-                                f"Post-sync gate failed after merging `origin/{base_branch}`:\n\n{sync_checks_md[:1200]}",
+                                f"Merge conflict while syncing `{branch}` with `origin/{base_branch}`:\n\n```\n{detail[:1000]}\n```",
+                                resume_stage="build",
                             )
-                        push_branch(worktree, branch)
 
-                    pr_num = int(job["pr_number"])
-                    gh_client.mark_pr_ready(pr_num)
-                    gh_client.merge_pr(pr_num, cfg["merge_method"])
+                        if head_changed:
+                            passed, sync_checks_md = run_gate(
+                                repo_root,
+                                job_id,
+                                worktree,
+                                round_num,
+                                cfg,
+                                tag="pre-merge",
+                            )
+                            if not passed:
+                                return _escalate_to_human(
+                                    jobs_dir,
+                                    job_id,
+                                    issue_number,
+                                    gh_client,
+                                    cfg,
+                                    f"Post-sync gate failed after merging `origin/{base_branch}`:\n\n{sync_checks_md[:1200]}",
+                                    resume_stage="build",
+                                )
+                            push_branch(worktree, branch)
+
+                        gh_client.mark_pr_ready(pr_num)
+                        gh_client.merge_pr(pr_num, cfg["merge_method"])
                     merged_job = advance_stage(jobs_dir, job_id, "merged")
                     delete_remote_branch(repo_root, branch)
 

@@ -259,6 +259,12 @@ class GitHubClient:
     def close_issue(self, issue_number: int) -> None:
         self._runner(["issue", "close", str(issue_number)], self.repo_root)
 
+    def get_pr_merge_commit(self, pr_number: int) -> str:
+        raw = self._runner(["pr", "view", str(pr_number), "--json", "mergeCommit"], self.repo_root)
+        parsed = json.loads(raw or "{}")
+        mc = parsed.get("mergeCommit") or {}
+        return str(mc.get("oid") or "").strip()
+
     def ensure_draft_pr(
         self,
         worktree: str,
