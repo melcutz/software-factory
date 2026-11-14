@@ -4,7 +4,7 @@
 
 - Git repository with `origin` on GitHub and `gh auth status` authenticated with push access.
 - `agy --version` installed and authenticated on `PATH`.
-- `python3 --version` 3.10+ (standard library only; zero `pip` packages and no `herdr` required).
+- `python3 --version` 3.10+ (standard library only; zero `pip` packages required).
 
 ## 1. Copy Into Target Repository
 

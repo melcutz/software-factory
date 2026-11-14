@@ -5,7 +5,7 @@ description: Run the autonomous software factory on GitHub issues. Use when the 
 
 # Autonomous Software Factory (`agy`)
 
-You operate the repository's autonomous software factory (`factory/bin/factory`). The deterministic Python runner manages git worktrees, `agy -p --output-format json --json-schema` worker invocations, vertical TDD slice execution, parallel reviews, and GitHub Pull Requests—no terminal multiplexer (`herdr`) required.
+You operate the repository's autonomous software factory (`factory/bin/factory`). The deterministic Python runner manages git worktrees, `agy -p --output-format json --json-schema` worker invocations, vertical TDD slice execution, parallel reviews, and GitHub Pull Requests.
 
 ## Commands
 

@@ -1,82 +1,164 @@
-# Autonomous Software Factory for Google Antigravity (`agy`)
+# software-factory-agy
 
-An installable, zero-dependency software factory that turns GitHub issues—from small bugfixes to **complex, multi-file features**—into tested, multi-axis-reviewed Pull Requests using **Google Antigravity (`agy`)**.
+`software-factory-agy` is a self-contained issue-to-PR pipeline built on Google Antigravity (`agy`) and the Python 3.10+ standard library. Given a labeled GitHub issue, the runner triages scope and risk, decomposes the work into ordered vertical slices, implements and gates each slice in an isolated git worktree, runs parallel specialist reviews, and either auto-merges or stages the pull request according to configured risk policy.
 
-Label an issue `factory` and run `/factory run` (inside `agy`) or `./factory/bin/factory run` (headless from any terminal, SSH session, or cron job).
+## Requirements
 
-## How It Works
+- **Python 3.10+** (standard library only; no third-party packages)
+- **Git** with a GitHub `origin` remote
+- **GitHub CLI (`gh`)** authenticated with repository push and PR permissions
+- **Antigravity CLI (`agy`)** installed and authenticated on `PATH`
+
+## Quickstart
+
+1. Copy `factory/` and `.agents/skills/factory/` into the root of your repository and ensure the entrypoints are executable:
+
+   ```bash
+   chmod +x factory/bin/factory factory/checks.sh
+   ```
+
+2. Update `factory/checks.sh` to run your repository's non-interactive verification suite (tests, typechecks, linters), and add runtime directories to `.gitignore`:
+
+   ```gitignore
+   /factory/jobs/*
+   !/factory/jobs/.gitkeep
+   /.worktrees/
+   ```
+
+3. Create the workflow labels on GitHub and run preflight checks:
+
+   ```bash
+   gh label create "factory" --color "0E8A16" --description "Queued for autonomous software factory" --force
+   gh label create "factory:needs-info" --color "FBCA04" --description "Waiting for issue clarification" --force
+   gh label create "factory:needs-human" --color "D93F0B" --description "Escalated for human review" --force
+
+   ./factory/bin/factory doctor
+   ```
+
+4. Apply the `factory` label to a GitHub issue and run the queue from your terminal, CI/cron environment, or inside `agy` via `/factory run`:
+
+   ```bash
+   ./factory/bin/factory run        # process queued issues up to configured concurrency
+   ./factory/bin/factory run 42     # process or resume a specific issue number
+   ./factory/bin/factory status     # inspect job stages, slice progress, token usage, and PR URLs
+   ```
+
+See [INSTALL.md](INSTALL.md) for detailed setup instructions.
+
+## Pipeline Lifecycle
 
 ```text
-GitHub Issue (`factory` label)
-  │
-  ▼
-intake (sandboxed JSON) ──► ACCEPT / NEEDS_INFO / REJECT + risk + surfaces (ui, security)
-  │
-  ▼
-spec-writer (sandboxed JSON) ──► spec.md + 1..6 ordered vertical TDD slices (plan.json)
-  │
-  ▼
-builder + gate loop (in isolated .worktrees/job-<N> on branch factory/job-<N>)
-  ├─ Builds each vertical slice with Red-Green-Refactor TDD at public seams
-  ├─ Runs protected_paths diff check + main checkout's factory/checks.sh after every slice
-  └─ Self-heals slice gate failures before moving to the next slice
-  │
-  ▼
-parallel reviewers (sandboxed ThreadPoolExecutor)
-  ├─ reviewer-code (Standards + Spec fidelity)
-  ├─ reviewer-security (routed for security surface; applies ponytail-audit checks)
-  └─ reviewer-ux + reviewer-ui (routed for UI surface)
-  │  (nit-only reviews pass automatically; actionable findings loop back to builder up to max_rounds)
-  ▼
-approver (sandboxed JSON)
-  ├─ Low risk (or auto_merge="all"): syncs base branch, re-runs gate, auto-merges PR
-  └─ Medium/High risk (default auto_merge="low"): marks PR ready (`gh pr ready`) with full evidence for 1-click merge
+GitHub Issue ("factory")
+  -> intake        Triage scope, classify risk (low | medium | high) and surfaces (ui, security)
+  -> spec          Produce technical specification and 1-6 ordered vertical slices
+  -> build & gate  Implement each slice in .worktrees/job-<n> and verify via factory/checks.sh
+  -> review        Run routed read-only reviewers in parallel (code, security, ux, ui)
+  -> approve       Verify spec compliance, gate history, and merge readiness
 ```
 
-## Key Design Highlights
+| Stage | Behavior |
+|---|---|
+| `intake` | Evaluates whether the issue is actionable (`ACCEPT`), underspecified (`NEEDS_INFO`), or out of scope (`REJECT`). `NEEDS_INFO` posts clarifying questions on the issue and swaps the label to `factory:needs-info` until a human replies and re-applies `factory`. |
+| `spec` | Inspects the codebase in read-only sandbox mode and produces `spec.md` alongside `plan.json` containing `1–6` testable vertical slices. |
+| `build` & `gate` | Executes slices sequentially on branch `factory/job-<n>`. Every slice must pass protected-path diff checks and `factory/checks.sh` (with bounded per-slice retries) before the next slice starts. Opens or updates a draft PR once all slices pass. |
+| `review` | Dispatches specialist reviewers concurrently based on risk tier and affected surfaces. Style-only (`nit`) findings do not block; `must_fix` and `should_fix` findings return to `build` for targeted remediation up to `max_rounds`. |
+| `approve` | Performs final verification. Under the default `"auto_merge": "low"` policy, approved `low`-risk PRs sync with `origin/<base_branch>`, re-run the gate, and merge automatically; `medium`- and `high`-risk PRs are marked ready (`gh pr ready`) with a full verification summary. |
 
-- **Built for complex features:** Instead of trying to one-shot large features in a single prompt, `spec-writer` decomposes complex issues into 2–6 vertical TDD slices verified individually by `factory/checks.sh` before full-branch review.
-- **Deterministic Python orchestrator (`factory/bin/factory`):** Zero third-party Python packages and **no `herdr` dependency**. State transitions, atomic `job.json` updates, resume-after-crash, git worktrees, and `gh` PR mutations live in tested Python code rather than fragile chat loops.
-- **Hard safety & trust boundaries:**
-  - Issue descriptions and comments are isolated inside escaped `<untrusted_issue_data>` blocks.
-  - Non-builder stages (`intake`, `spec-writer`, `reviewers`, `approver`) run with `agy -p --sandbox --output-format json --json-schema`, verified clean against git `HEAD`.
-  - `gate` enforces a hardcoded protected-path floor (`factory/`, `.agents/`, plus configured paths like `.github/`) using `--no-renames` diff checks so branches cannot weaken their own test gates.
-  - Only the Python runner pushes branches or invokes `gh pr`.
-- **Crash-safe & resumable:** Re-running `factory run` resumes interrupted jobs at their exact stage and last completed vertical slice, and automatically resumes `factory:needs-info` / `factory:needs-human` issues once you reply and re-apply the `factory` label.
+If a job exhausts its retry budget, encounters a merge conflict, or triggers an `ESCALATE` decision, the runner transitions the job to `needs-human`, posts context on the issue, and swaps the label to `factory:needs-human`. Re-applying `factory` after replying resumes execution with one additional remediation round.
 
-## Model Routing (`factory/config.json`)
+## Safety and Isolation
 
-| Role | Default Model | Notes |
+- **Worktree isolation:** All code changes occur inside `.worktrees/job-<n>` on dedicated `factory/job-<n>` branches; the main working tree is never modified during job execution.
+- **Sandboxed read-only stages:** `intake`, `spec-writer`, all reviewers, and `approver` execute with `agy --sandbox` and strict JSON Schema validation (`--output-format json --json-schema`). Any unexpected working-tree dirtying or `HEAD` movement is rolled back and treated as an execution failure.
+- **Immutable verification gate:** Before executing tests, `gate` checks `git diff -z --name-only --no-renames origin/<base_branch>...HEAD` and rejects changes to `factory/`, `.agents/`, and any configured `protected_paths`. `factory/checks.sh` is always invoked from the main checkout so a job branch cannot alter its own test gate.
+- **Untrusted issue containment:** Issue titles, bodies, and comments are escaped and wrapped in `<untrusted_issue_data>` tags prior to prompt construction. Agents never run `git push` or `gh pr`; all remote git and GitHub mutations are performed deterministically by the Python runner.
+- **Atomic state and crash recovery:** Per-job state in `factory/jobs/job-<n>/job.json` is updated via atomic temp-file replacement under per-job locks. Re-running `factory run` after an interruption resumes from the current stage and last completed slice.
+
+## CLI and Skill Reference
+
+| CLI Command | `agy` Skill | Description |
 |---|---|---|
-| `intake` | `gemini-3.8-flash-medium` | Fast triage, risk & surface classification |
-| `spec_writer` | `gemini-4-argon-high` | Architecture, domain check & vertical slice planning |
-| `builder` | `gemini-4-argon-high` | Slice-by-slice TDD & review-fix implementation |
-| `code_low` | `gemini-3.6-flash-low` | Code review for low-risk changes |
-| `code_medium` | `gemini-3.8-flash-low` | Code review for medium-risk changes |
-| `code_high` | `gemini-3.8-flash-medium` | Code review for high-risk changes |
-| `security` | `gemini-4-argon-high` | Security, data-loss & concurrency audit (`ponytail-audit`) |
-| `ux` / `ui` | `gemini-3.8-flash-medium` / `gemini-3.6-flash-low` | UX flows, accessibility & visual fit |
-| `approver` | `gemini-4-argon-high` | Final readiness check & merge-danger summary |
+| `./factory/bin/factory run [n]` | `/factory run [n]` | Drain open `factory`-labeled issues or process issue `#n` |
+| `./factory/bin/factory queue` | `/factory queue` | List open eligible issues in the queue |
+| `./factory/bin/factory status [job-id]` | `/factory status [job-id]` | Display job summary table or full JSON state for `<job-id>` |
+| `./factory/bin/factory gate <job-id>` | — | Run protected-path and `factory/checks.sh` verification on a worktree |
+| `./factory/bin/factory doctor` | `/factory doctor` | Validate Python, `git`, `gh`, `agy`, `config.json`, `checks.sh`, and `.gitignore` |
+| — | `/factory research <topic>` | Run interactive primary-source research into `docs/research/` |
+| — | `/factory improve [area]` | Generate an interactive architecture review for module boundaries |
 
-## CLI & `/factory` Skill Commands
+## Configuration
 
-| Command | CLI Equivalent | Purpose |
-|---|---|---|
-| `/factory run [n]` | `./factory/bin/factory run [n]` | Drain queue or run/resume issue `#n` |
-| `/factory status [job-id]` | `./factory/bin/factory status [job-id]` | View live job stages, slice progress, tokens & PR URLs |
-| `/factory queue` | `./factory/bin/factory queue` | List open eligible `factory` issues |
-| `/factory doctor` | `./factory/bin/factory doctor` | Check git, `gh`, `agy`, config, `checks.sh` & `.gitignore` |
-| `/factory research <topic>` | *(interactive in `agy`)* | Primary-source research saved to `docs/research/` |
-| `/factory improve [area]` | *(interactive in `agy`)* | Visual HTML architecture review for module deepening |
+`factory/config.json` controls concurrency, retry budgets, merge behavior, protected paths, and per-role model selection:
 
-## Install & Test
+```json
+{
+  "concurrency": 3,
+  "max_rounds": 3,
+  "max_slice_retries": 2,
+  "agent_timeout_sec": 900,
+  "gate_timeout_sec": 600,
+  "base_branch": "main",
+  "merge_method": "merge",
+  "auto_merge": "low",
+  "labels": {
+    "queue": "factory",
+    "needs_info": "factory:needs-info",
+    "needs_human": "factory:needs-human"
+  },
+  "protected_paths": [
+    "factory/",
+    ".agents/",
+    ".github/"
+  ],
+  "models": {
+    "intake": "gemini-3.8-flash-medium",
+    "spec_writer": "gemini-4-argon-high",
+    "builder": "gemini-4-argon-high",
+    "approver": "gemini-4-argon-high",
+    "code_low": "gemini-3.6-flash-low",
+    "code_medium": "gemini-3.8-flash-low",
+    "code_high": "gemini-3.8-flash-medium",
+    "security": "gemini-4-argon-high",
+    "ux": "gemini-3.8-flash-medium",
+    "ui": "gemini-3.6-flash-low"
+  }
+}
+```
 
-See [INSTALL.md](INSTALL.md) to install into any GitHub repository. To run this repository's unit and end-to-end test suite:
+### Merge Policies (`auto_merge`)
+
+- `"low"` *(default)*: Auto-merge approved `low`-risk PRs after base-branch sync and gate re-verification; mark `medium`- and `high`-risk PRs ready for human merge.
+- `"all"`: Auto-merge all approved PRs regardless of risk classification.
+- `"none"`: Never auto-merge; leave all approved PRs in ready-for-review state.
+
+## Repository Layout
+
+```text
+.agents/skills/factory/SKILL.md   Antigravity slash-command skill definition
+factory/
+  bin/factory                     CLI entrypoint
+  config.json                     Runtime and model routing configuration
+  checks.sh                       Repository verification gate script
+  agents/                         Role instructions for intake, spec, build, review, and approval
+  lib/
+    agy_runner.py                 Headless agy invocation, JSON validation, and sandbox checks
+    config.py                     Configuration loader and reviewer routing rules
+    gate_runner.py                Protected-path diff verification and checks.sh runner
+    git_ops.py                    Worktree management, base-branch sync, and gh CLI client
+    pipeline.py                   End-to-end state orchestration, concurrency pool, and doctor checks
+    schemas.py                    Stage JSON schemas and Markdown artifact renderers
+    state.py                      Thread-safe atomic job.json state machine and resume logic
+tests/                            Unit and end-to-end pipeline test suite
+```
+
+## Development
+
+Run the full unit and end-to-end test suite:
 
 ```bash
 bash factory/checks.sh
 ```
 
-## Credits & License
+## License
 
-Inspired by [ZazenCodes' Software Factory V2](https://github.com/zazencodes/zazencodes-season-3/tree/main/src/software-factory-claude-code-v2) and engineering workflows from [mattpocock/skills](https://github.com/mattpocock/skills). Licensed under the [MIT License](LICENSE).
+Released under the [MIT License](LICENSE).
