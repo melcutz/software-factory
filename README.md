@@ -1,5 +1,7 @@
 # software-factory-agy
 
+[![Sponsor this project](https://img.shields.io/badge/Sponsor-this%20project-ea4aaa?logo=githubsponsors&logoColor=white)](https://buy.stripe.com/eVq6oI94c1SL5ne37i4Vy01)
+
 `software-factory-agy` is a self-contained issue-to-PR pipeline built on Google Antigravity (`agy`) and the Python 3.10+ standard library. Given a labeled GitHub issue, the runner triages scope and risk, decomposes the work into ordered vertical slices, implements and gates each slice in an isolated git worktree, runs parallel specialist reviews, and either auto-merges or stages the pull request according to configured risk policy.
 
 ## Requirements
