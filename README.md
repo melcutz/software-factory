@@ -2,51 +2,94 @@
 
 [![Sponsor this project](https://img.shields.io/badge/Sponsor-this%20project-ea4aaa?logo=githubsponsors&logoColor=white)](https://buy.stripe.com/eVq6oI94c1SL5ne37i4Vy01)
 
-`software-factory-agy` is a self-contained issue-to-PR pipeline built on Google Antigravity (`agy`) and the Python 3.10+ standard library. Given a labeled GitHub issue, the runner triages scope and risk, decomposes the work into ordered vertical slices, implements and gates each slice in an isolated git worktree, runs parallel specialist reviews, and either auto-merges or stages the pull request according to configured risk policy.
+`software-factory-agy` (`v0.2.0`) is a self-contained, zero-central-server autonomous issue-to-PR software factory built on Google Antigravity (`agy`) and the Python 3.10+ standard library.
+
+Given labeled GitHub issues, it triages scope and risk, builds a dependency DAG, writes a technical spec with ordered vertical slices, implements and gates each slice in an isolated git worktree, runs parallel specialist reviews, and auto-merges or stages PRs—either on a single machine (`factory run`) or across a **durable multi-machine fleet** (`factory worker --all`) coordinated through Git refs (`refs/factory/*`) and [`herdr-core` (`hc`) + `herdr-app`](https://herdr.dev/).
+
+*(Looking for the simpler `v0.1.0` single-machine baseline? Check out the [`v0.1.0` release](https://github.com/melcutz/software-factory-agy/releases/tag/v0.1.0).)*
+
+---
+
+## Key Features
+
+- **Central Multi-Repo CLI (`factory`):** Install once (`pip install -e .`) and drive any repository with `--repo <path>` or all registered repositories via `--all` (`~/.config/factory/repos.json`).
+- **End-to-End Autonomous Pipeline:** `plan` (DAG) → `intake` → `spec` (1–6 vertical slices) → `build & gate` → `review` (parallel code, security, UX, UI) → `approve` → `merging` → optional `staging_qa` deploy train.
+- **Zero-Central-Server Multi-Machine Coordination (`refs/factory/*`):** Atomic `--force-with-lease` Compare-And-Swap job leases, worker heartbeats (`360s` TTL + `60s` skew buffer), slice-level crash checkpoints, distributed staging locks, and shared DAG caching—no coordinator daemon or database required.
+- **`herdr-core` (`hc`) & `herdr-app` Visibility:** Workers emit native **OSC 7501** status sequences (`working`, `idle`, `done`, `blocked`) and spawn job workers via `hc run --bg`, surfacing all local and remote jobs live in `herdr-app`'s Agents sidebar with one-click **peek** and `needs-human` rescue shells. Works cleanly in plain terminals too when `$HC_TERMINAL_ID` is unset.
+- **Global Kill Switch & Polite Pause:** `factory halt` / `factory resume` stops the entire fleet cleanly at the last completed slice without burning retries or escalating to `needs-human`; `factory pause` / `factory unpause` controls claims on a single machine.
+- **Homelab-Polite Resource & Quota Governor:** Probes host CPU load and free RAM (`~/.config/factory/host.json`) before claiming or between slices, spreads batches evenly across idle machines, and turns LLM `429` / `RESOURCE_EXHAUSTED` errors into shared fleet-wide cooldowns (`refs/factory/quota`).
+
+---
 
 ## Requirements
 
-- **Python 3.10+** (standard library only; no third-party packages)
+- **Python 3.10+** (standard library only; zero third-party runtime packages)
 - **Git** with a GitHub `origin` remote
-- **GitHub CLI (`gh`)** authenticated with repository push and PR permissions
+- **GitHub CLI (`gh`)** authenticated (`gh auth status`) with push and PR permissions
 - **Antigravity CLI (`agy`)** installed and authenticated on `PATH`
+- **Optional (for multi-machine desktop/SSH visibility):** [`herdr-app` / `herdr-core` (`hc`)](https://herdr.dev/) on Linux, macOS, or Windows/WSL2
 
-## Quickstart
+---
 
-1. Copy `factory/` and `.agents/skills/factory/` into the root of your repository and ensure the entrypoints are executable:
+## Quickstart (5 Minutes)
 
-   ```bash
-   chmod +x factory/bin/factory factory/checks.sh
-   ```
+### 1. Install the `factory` CLI
 
-2. Update `factory/checks.sh` to run your repository's non-interactive verification suite (tests, typechecks, linters), and add runtime directories to `.gitignore`:
+```bash
+git clone https://github.com/melcutz/software-factory-agy.git
+cd software-factory-agy
+pip install -e .
+```
 
+### 2. Prepare a Target Repository
+
+In each repository you want the factory to work on:
+
+1. Create `factory/config.json` (see [Configuration](#configuration)) and `factory/checks.sh` (your non-interactive test/lint/typecheck suite; `chmod +x factory/checks.sh`).
+2. Add runtime paths to `.gitignore`:
    ```gitignore
    /factory/jobs/*
    !/factory/jobs/.gitkeep
    /.worktrees/
    ```
-
-3. Create the workflow labels on GitHub and run preflight checks:
-
+3. Create GitHub labels and verify prerequisites:
    ```bash
    gh label create "factory" --color "0E8A16" --description "Queued for autonomous software factory" --force
    gh label create "factory:needs-info" --color "FBCA04" --description "Waiting for issue clarification" --force
    gh label create "factory:needs-human" --color "D93F0B" --description "Escalated for human review" --force
 
-   ./factory/bin/factory doctor
+   factory doctor --repo /path/to/your-repo
    ```
 
-4. Apply the `factory` label to GitHub issues (and optionally create a `"Factory"` GitHub Project board for live Kanban column sync):
+### 3. Run Single-Machine or Multi-Machine
 
-   ```bash
-   ./factory/bin/factory init-board # optional: create a "Factory" GitHub ProjectV2 board
-   ./factory/bin/factory run        # process queued issues up to configured concurrency (DAG-scheduled)
-   ./factory/bin/factory run 42 43  # process or resume specific issue number(s)
-   ./factory/bin/factory status     # inspect runner liveness, activity/PID, slices, cost, and PR URLs
-   ```
+**Single-machine (one-shot drain):**
+```bash
+factory run --repo /path/to/your-repo        # drain queued issues
+factory run --repo /path/to/your-repo 42 43  # run specific issues
+factory status --repo /path/to/your-repo     # check progress, machine, cost, PRs
+```
 
-See [INSTALL.md](INSTALL.md) for detailed setup instructions and [docs/lessons-learned.md](docs/lessons-learned.md) for architecture notes and engineering lessons.
+**Multi-machine durable fleet (with `herdr-core` / `herdr-app`):**
+```bash
+# Register your target repos once in ~/.config/factory/repos.json:
+# ["~/work/repo-a", "~/work/repo-b"]
+
+# Start a durable worker inside hc / herdr-app on each machine:
+hc run --bg --name factory-worker -- factory worker --all
+
+# Or wake all machines registered in `hc machine ls` from one laptop:
+factory fleet wake
+
+# Inspect fleet status or halt/resume everything at once:
+factory status --all
+factory halt --reason "maintenance"
+factory resume
+```
+
+See [INSTALL.md](INSTALL.md) for the complete step-by-step setup guide (including `~/.config/factory/host.json`, `hc machine` setup, and staging QA hooks).
+
+---
 
 ## Pipeline Lifecycle
 
@@ -55,54 +98,39 @@ GitHub Issue ("factory")
   -> plan          Build dependency DAG (Depends on #N + predicted surfaces) across queued issues
   -> intake        Triage scope, classify risk (low | medium | high) and surfaces (ui, security)
   -> spec          Produce technical specification and 1-6 ordered vertical slices
-  -> build & gate  Implement each slice in .worktrees/job-<n> and verify via factory/checks.sh
+  -> build & gate  Implement each slice in .worktrees/job-<n>, verify via factory/checks.sh, checkpoint to Git
   -> review        Run routed read-only reviewers in parallel (code, security, ux, ui)
   -> approve       Verify spec compliance, gate history, and merge readiness (fast-path or approver)
   -> merging       Sync with base (agent-assisted conflict resolution), pre-merge gate, and merge
+  -> staging_qa    (Optional) Batched deploy train + staging verification with automatic rollback
 ```
 
-| Stage | Behavior |
+If a job exhausts its retry budget or hits `BLOCKED`, it transitions to `needs-human`, comments on the issue, swaps the label to `factory:needs-human`, emits OSC 7501 `state=blocked:kind=question` (surfacing in `herdr-app`), and leaves an interactive rescue shell in `.worktrees/job-<n>`. Re-applying `factory` after replying resumes from the saved checkpoint.
+
+---
+
+## CLI Reference
+
+| Command | Description |
 |---|---|
-| `plan` | When running multiple issues, combines explicit markers (`Depends on #N`, `Blocked by #N`, `After #N`) with `planner` surface predictions into an acyclic `graphlib.TopologicalSorter` DAG. Dependent issues wait until parents merge and are skipped automatically if a parent halts. |
-| `intake` | Evaluates whether the issue is actionable (`ACCEPT`), underspecified (`NEEDS_INFO`), or out of scope (`REJECT`). `NEEDS_INFO` posts clarifying questions on the issue and swaps the label to `factory:needs-info` until a human replies and re-applies `factory`. |
-| `spec` | Inspects the codebase in read-only sandbox mode and produces `spec.md` alongside `plan.json` containing `1–6` testable vertical slices. |
-| `build` & `gate` | Executes slices sequentially on branch `factory/job-<n>`. Runs `auto_polish` (if configured) and verifies protected-path diffs + `factory/checks.sh` (`FACTORY_GATE_SCOPE=slice` on intermediate slices, `FACTORY_GATE_SCOPE=full` on the final slice and stage gate, skipping duplicate full runs via `verified_gate_sha`). Opens or updates a draft PR once all slices pass. |
-| `review` | Dispatches specialist reviewers concurrently based on risk tier and affected surfaces. Style-only (`nit`) findings do not block; `must_fix` and `should_fix` findings return to `build` for targeted remediation up to `max_rounds`. |
-| `approve` & `merging` | Performs final verification (with fast-path approval for clean `low`-risk PRs, or full `approver` review for `medium`/`high`-risk PRs). Under `"auto_merge": "low"`, approved `low`-risk PRs sync with `origin/<base_branch>` (invoking `builder` to resolve merge conflicts if needed), run the `pre-merge` gate, and merge automatically; `medium`- and `high`-risk PRs are marked ready (`gh pr ready`). |
+| `factory run [n ...]` | Drain open `factory`-labeled issues or process specific issue number(s) |
+| `factory worker [--once]` | Run continuous competing-consumer worker loop (`--repo` or `--all`) |
+| `factory queue` | List open eligible issues in the queue |
+| `factory status [job-id]` | Show fleet banner, active machines, job table (`MACHINE`, slices, cost, PR), or JSON for `<job-id>` |
+| `factory halt [--reason TEXT] [--force]` | Globally halt all fleet workers and checkpoint active jobs cleanly |
+| `factory resume` | Clear global halt and allow workers to resume |
+| `factory pause [--drain]` | Pause new job claims on the current machine |
+| `factory unpause` | Resume job claims on the current machine |
+| `factory fleet {status,wake,pause,unpause} [machine]` | Discover and control peer machines via `hc machine ls` / `hc run --on` |
+| `factory init-board` | Create a generic `"Factory"` GitHub ProjectV2 board (`Status` + `Priority`) |
+| `factory gate <job-id>` | Run protected-path and `factory/checks.sh` verification on a worktree |
+| `factory doctor` | Validate Python, `git`, `gh`, `agy`, `config.json`, `checks.sh`, and `.gitignore` |
 
-If a job exhausts its retry budget, fails conflict resolution, or triggers an `ESCALATE` decision, the runner transitions the job to `needs-human`, posts context on the issue, and swaps the label to `factory:needs-human`. Re-applying `factory` after replying resumes execution (from `merging` if escalation happened during merge, otherwise with one additional remediation round).
-
-## Observability and GitHub Project Board Sync
-
-- **Live runner & worker status (`./factory/bin/factory status`)**: Tracks `factory/jobs/.factory.pid` and per-job `activity` + `pid` (`waiting:repo_lock`, `running:slice-2`, `running:pre-merge-gate`, etc.), verifying OS PID liveness (`os.kill(pid, 0)`) to print a `Factory: RUNNING` / `Factory: NOT RUNNING` banner and flag crashed workers as `stale (<step>)`.
-- **Token & cost telemetry**: Logs timestamps, `model`/`effort`, duration, token breakdown (`in`/`cache`/`out`/`think`), and step/cumulative `$` cost.
-- **Idle watchdog & process-group reaping**: Runs headless `agy` turns in isolated `setsid` sessions with an idle watchdog that unlatches when backgrounded children exit and reaps child process groups cleanly.
-- **GitHub ProjectV2 sync**: If a `"Factory"` GitHub Project exists in the runner's account (created via `./factory/bin/factory init-board`), the factory automatically adds processed issues and moves them across `Ready` → `Building` → `Review` → `Done` / `Needs Human` / `Skipped`.
-
-## Safety and Isolation
-
-- **Worktree isolation:** All code changes occur inside `.worktrees/job-<n>` on dedicated `factory/job-<n>` branches; the main working tree is never modified during job execution.
-- **Sandboxed read-only stages:** `intake`, `spec-writer`, all reviewers, and `approver` execute with `agy --sandbox` and strict JSON Schema validation (`--output-format json --json-schema`). Any unexpected working-tree dirtying or `HEAD` movement is rolled back and treated as an execution failure.
-- **Immutable verification gate:** Before executing tests, `gate` checks `git diff -z --name-only --no-renames origin/<base_branch>...HEAD` and rejects changes to `factory/`, `.agents/`, and any configured `protected_paths`. `factory/checks.sh` is always invoked from the main checkout so a job branch cannot alter its own test gate.
-- **Untrusted issue containment:** Issue titles, bodies, and comments are escaped and wrapped in `<untrusted_issue_data>` tags prior to prompt construction. Agents never run `git push` or `gh pr`; all remote git and GitHub mutations are performed deterministically by the Python runner.
-- **Atomic state and crash recovery:** Per-job state in `factory/jobs/job-<n>/job.json` is updated via atomic temp-file replacement under per-job locks. Re-running `factory run` after an interruption resumes from the current stage and last completed slice.
-
-## CLI and Skill Reference
-
-| CLI Command | `agy` Skill | Description |
-|---|---|---|
-| `./factory/bin/factory run [n ...]` | `/factory run [n ...]` | Drain open `factory`-labeled issues or process specific issue number(s) |
-| `./factory/bin/factory queue` | `/factory queue` | List open eligible issues in the queue |
-| `./factory/bin/factory status [job-id]` | `/factory status [job-id]` | Display runner liveness, job status table (activity, slices, cost, PR), or full JSON state for `<job-id>` |
-| `./factory/bin/factory init-board` | — | Create a generic `"Factory"` GitHub ProjectV2 board (`Status` + `Priority` fields) |
-| `./factory/bin/factory gate <job-id>` | — | Run protected-path and `factory/checks.sh` verification on a worktree |
-| `./factory/bin/factory doctor` | `/factory doctor` | Validate Python, `git`, `gh`, `agy`, `config.json`, `checks.sh`, and `.gitignore` |
-| — | `/factory research <topic>` | Run interactive primary-source research into `docs/research/` |
-| — | `/factory improve [area]` | Generate an interactive architecture review for module boundaries |
+---
 
 ## Configuration
 
-`factory/config.json` controls concurrency, retry budgets, merge behavior, protected paths, and per-role model selection:
+`factory/config.json` in each target repository controls concurrency, retry budgets, merge behavior (`"auto_merge": "low" | "all" | "none"`), protected paths, and per-role model selection:
 
 ```json
 {
@@ -119,11 +147,7 @@ If a job exhausts its retry budget, fails conflict resolution, or triggers an `E
     "needs_info": "factory:needs-info",
     "needs_human": "factory:needs-human"
   },
-  "protected_paths": [
-    "factory/",
-    ".agents/",
-    ".github/"
-  ],
+  "protected_paths": ["factory/", ".agents/", ".github/"],
   "models": {
     "planner": "gemini-3.8-flash-medium",
     "intake": "gemini-3.8-flash-medium",
@@ -140,40 +164,43 @@ If a job exhausts its retry budget, fails conflict resolution, or triggers an `E
 }
 ```
 
-### Merge Policies (`auto_merge`)
-
-- `"low"` *(default)*: Auto-merge approved `low`-risk PRs after base-branch sync and gate re-verification; mark `medium`- and `high`-risk PRs ready for human merge.
-- `"all"`: Auto-merge all approved PRs regardless of risk classification.
-- `"none"`: Never auto-merge; leave all approved PRs in ready-for-review state.
+---
 
 ## Repository Layout
 
 ```text
 .agents/skills/factory/SKILL.md   Antigravity slash-command skill definition
 factory/
-  bin/factory                     CLI entrypoint
-  config.json                     Runtime and model routing configuration
-  checks.sh                       Repository verification gate script
-  agents/                         Role instructions for planner, intake, spec, build, review, and approval
+  cli.py                          Central CLI entrypoint (`factory`)
+  bin/factory                     Repo-local wrapper script
+  config.json                     Default runtime and model routing configuration
+  checks.sh                       Verification gate script
+  agents/                         Role prompts (planner, intake, spec-writer, builder, reviewers, approver)
   lib/
-    agy_runner.py                 Headless agy invocation, idle watchdog, setsid reaping, and sandbox checks
-    config.py                     Configuration loader, model pricing, and reviewer routing rules
-    gate_runner.py                Protected-path diff verification, auto-polish, and checks.sh runner
-    git_ops.py                    Worktree management, base-branch sync, conflict helpers, and gh CLI client
-    pipeline.py                   End-to-end state orchestration, DAG pool, activity tracking, and doctor checks
-    planner.py                    Queue dependency DAG builder and cycle-breaking fallback
-    project_board.py              Generic "Factory" GitHub ProjectV2 creation and stage-to-column sync
-    schemas.py                    Stage JSON schemas and Markdown artifact renderers
-    state.py                      Thread-safe atomic job.json state machine and resume logic
-tests/                            Unit and end-to-end pipeline test suite
+    agy_runner.py                 Headless agy runner, idle watchdog, setsid reaping, 429 QuotaExhaustedError
+    config.py                     Configuration loader, model pricing, reviewer routing
+    fleet.py                      Fleet discovery & control via `hc machine ls` / `hc run --on`
+    gate_runner.py                Protected-path diff verification, auto-polish, checks.sh runner
+    git_ops.py                    Worktree management, base-branch sync, gh CLI client
+    git_state.py                  Git-native refs/factory/* CAS leases, checkpoints, locks, control, quota
+    governor.py                   Cross-platform CPU/RAM admission checks & shared quota cooldown helpers
+    herdr_bridge.py               herdr-core (hc) background child terminals & OSC 7501 status protocol
+    pipeline.py                   End-to-end stage orchestration, staging train, halt/resume
+    planner.py                    Dependency DAG builder and cycle-breaking fallback
+    project_board.py              GitHub ProjectV2 board creation and stage-to-column sync
+    schemas.py                    Stage JSON schemas and Markdown renderers
+    staging_qa.py                 Staging QA deploy train coordinator
+    state.py                      Thread-safe atomic job.json state machine
+    worker.py                     Continuous spread-first worker loop & _exec-job runner
+tests/                            Unit and end-to-end pytest suite
 ```
 
 ## Development
 
-Run the full unit and end-to-end test suite:
+Run the full test suite:
 
 ```bash
-bash factory/checks.sh
+pytest
 ```
 
 ## License
