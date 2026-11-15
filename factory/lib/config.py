@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+from urllib.parse import urlparse
 
 VALID_MERGE_METHODS = {"merge", "squash", "rebase"}
 VALID_AUTO_MERGE = {"low", "all", "none"}
@@ -46,6 +47,7 @@ DEFAULT_CONFIG: dict = {
         "spec_writer": "gemini-4-argon-high",
         "builder": "gemini-4-argon-high",
         "approver": "gemini-4-argon-high",
+        "qa": "gemini-4-argon-high",
         "code_low": "gemini-3.6-flash-low",
         "code_medium": "gemini-3.8-flash-low",
         "code_high": "gemini-3.8-flash-medium",
@@ -54,6 +56,18 @@ DEFAULT_CONFIG: dict = {
         "ui": "gemini-3.6-flash-low",
     },
     "model_pricing": copy.deepcopy(DEFAULT_MODEL_PRICING),
+    "staging_qa": {
+        "enabled": False,
+        "max_batch_size": 4,
+        "coalesce_window_sec": 15,
+        "max_qa_rounds": 3,
+        "deploy_timeout_sec": 900,
+        "qa_timeout_sec": 1200,
+        "base_url": "",
+        "ops_base_url": "",
+        "forbidden_prod_hosts": [],
+        "env_files": [],
+    },
 }
 
 
@@ -104,6 +118,17 @@ def estimate_usage_cost_usd(
     return round(cost, 6)
 
 
+def _validate_non_prod_url(url: str, field_name: str, forbidden_hosts: set[str]) -> None:
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError(f"{field_name} must be a non-empty URL string")
+    parsed = urlparse(url.strip())
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host:
+        raise ValueError(f"{field_name} must be an https URL, got {url!r}")
+    if host in forbidden_hosts:
+        raise ValueError(f"Refusing production URL in {field_name}: {url!r}")
+
+
 def load_config(factory_dir: str) -> dict:
     """Load and validate factory/config.json merged with DEFAULT_CONFIG."""
     cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -114,7 +139,7 @@ def load_config(factory_dir: str) -> dict:
         if not isinstance(raw, dict):
             raise ValueError("config.json root must be a JSON object")
         for key, value in raw.items():
-            if key in {"labels", "models", "model_pricing"} and isinstance(value, dict):
+            if key in {"labels", "models", "model_pricing", "staging_qa"} and isinstance(value, dict):
                 cfg[key].update(value)
             else:
                 cfg[key] = value
@@ -142,6 +167,32 @@ def load_config(factory_dir: str) -> dict:
         raise ValueError("base_branch must be a non-empty string")
     if not isinstance(cfg.get("protected_paths"), list):
         raise ValueError("protected_paths must be a list of path patterns")
+
+    sqa = cfg.get("staging_qa")
+    if not isinstance(sqa, dict):
+        raise ValueError("staging_qa must be a JSON object")
+    if not isinstance(sqa.get("enabled"), bool):
+        raise ValueError("staging_qa.enabled must be a boolean")
+    for int_key in ("max_batch_size", "max_qa_rounds", "deploy_timeout_sec", "qa_timeout_sec"):
+        val = sqa.get(int_key)
+        if not isinstance(val, int) or isinstance(val, bool) or val < 1:
+            raise ValueError(f"staging_qa.{int_key} must be a positive integer, got {val!r}")
+    coalesce_sec = sqa.get("coalesce_window_sec")
+    if not isinstance(coalesce_sec, int) or isinstance(coalesce_sec, bool) or coalesce_sec < 0:
+        raise ValueError(f"staging_qa.coalesce_window_sec must be an integer >= 0, got {coalesce_sec!r}")
+    forbidden_hosts = {
+        str(h).strip().lower()
+        for h in (sqa.get("forbidden_prod_hosts") or [])
+        if str(h).strip()
+    }
+    if sqa["enabled"]:
+        _validate_non_prod_url(sqa.get("base_url", ""), "staging_qa.base_url", forbidden_hosts)
+        if sqa.get("ops_base_url"):
+            _validate_non_prod_url(
+                sqa.get("ops_base_url", ""), "staging_qa.ops_base_url", forbidden_hosts
+            )
+    if not isinstance(sqa.get("env_files"), list) or any(not isinstance(p, str) for p in sqa["env_files"]):
+        raise ValueError("staging_qa.env_files must be a list of file paths")
 
     return cfg
 

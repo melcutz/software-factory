@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import graphlib
+import inspect
 import json
 import os
 import shutil
@@ -49,8 +50,30 @@ from factory.lib.schemas import (
     render_build_md,
     render_intake_md,
     render_pr_body,
+    render_qa_failure_md,
+    render_qa_md,
     render_review_md,
     render_spec_md,
+)
+from factory.lib.staging_qa import (
+    StagingTrainCoordinator,
+    TrainOutcome,
+    TrainTicket,
+    build_deploy_env,
+    build_qa_agent_env,
+    deploy_to_staging,
+    ensure_staging_deploy_worktree,
+    ensure_staging_qa_accounts,
+    load_staging_secrets,
+    plan_staging_deploy,
+    prepare_qa_fix_branch,
+    prepare_requeue_branch,
+    redact_secrets,
+    revert_commit_on_base,
+    rollback_staging,
+    snapshot_staging_versions,
+    staging_lock,
+    try_revert_commits_on_base,
 )
 from factory.lib.state import (
     TERMINAL_OR_READY_STAGES,
@@ -479,11 +502,1016 @@ def _sync_pr_with_base(
     return True, ""
 
 
+def _call_deploy_to_staging(
+    deploy_wt: str,
+    deploy_env: dict[str, str],
+    timeout_sec: int,
+    extra_args: list[str],
+    *,
+    repo_root: str | None = None,
+    staging_cfg: dict | None = None,
+) -> tuple[bool, str]:
+    sig = inspect.signature(deploy_to_staging)
+    kwargs: dict = {}
+    if "extra_args" in sig.parameters:
+        kwargs["extra_args"] = extra_args
+    if "repo_root" in sig.parameters:
+        kwargs["repo_root"] = repo_root
+    if "staging_cfg" in sig.parameters:
+        kwargs["staging_cfg"] = staging_cfg
+    if kwargs:
+        return deploy_to_staging(deploy_wt, deploy_env, timeout_sec, **kwargs)
+    return deploy_to_staging(deploy_wt, deploy_env, timeout_sec)
+
+
+def _compute_train_changed_files(
+    deploy_wt: str,
+    train_base_sha: str,
+    train_head_sha: str,
+    merged_tickets: list[TrainTicket],
+) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+
+    def _add(paths: list[str]) -> None:
+        for p in paths:
+            if p and p not in seen:
+                seen.add(p)
+                ordered.append(p)
+
+    if train_base_sha:
+        res = _run_git(
+            deploy_wt,
+            "diff",
+            "-z",
+            "--name-only",
+            f"{train_base_sha}..{train_head_sha}",
+            check=False,
+        )
+        if res.returncode == 0:
+            _add([p for p in res.stdout.split("\0") if p])
+
+    for t in merged_tickets:
+        if not t.merged_sha:
+            continue
+        res = _run_git(
+            deploy_wt,
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            "-m",
+            "--first-parent",
+            t.merged_sha,
+            check=False,
+        )
+        if res.returncode == 0:
+            _add([p for p in res.stdout.split("\0") if p])
+
+    return ordered
+
+
+def _mark_ticket_merged(
+    jobs_dir: str,
+    gh_client: GitHubClient,
+    labels: dict,
+    secrets: dict[str, str],
+    ticket: TrainTicket,
+    qa_attempt: int,
+    qa_limit: int,
+    *,
+    qa_out: dict | None = None,
+    note: str = "",
+) -> None:
+    qa_fail_file = os.path.join(ticket.jdir, "qa-failure.md")
+    if os.path.isfile(qa_fail_file):
+        os.remove(qa_fail_file)
+    merged_job = advance_stage(jobs_dir, ticket.job_id, "merged")
+    try:
+        gh_client.edit_labels(ticket.issue_number, remove=[labels["queue"]])
+        if qa_out is not None:
+            gh_client.comment_issue(
+                ticket.issue_number,
+                f"### Staging QA Passed (`{ticket.job_id}`, QA round {qa_attempt}/{qa_limit})\n\n"
+                f"{redact_secrets(render_qa_md(qa_out), secrets)}",
+            )
+        elif note:
+            gh_client.comment_issue(
+                ticket.issue_number,
+                f"### Merged (`{ticket.job_id}`)\n\n{note}",
+            )
+    except Exception as exc:
+        print(
+            f"[{ticket.job_id}] warning: post-QA issue update failed: {exc}",
+            file=sys.stderr,
+        )
+    ticket.outcome = TrainOutcome(action="return", job=merged_job)
+    ticket.done_event.set()
+
+
+def _handle_qa_failure_for_ticket(
+    repo_root: str,
+    jobs_dir: str,
+    base_branch: str,
+    cfg: dict,
+    gh_client: GitHubClient,
+    secrets: dict[str, str],
+    ticket: TrainTicket,
+    qa_attempt: int,
+    qa_limit: int,
+    qa_dir: str,
+    failure_reason: str,
+    qa_out: dict | None,
+    revert_sha: str,
+    rb_healthy: bool,
+    rb_log: str,
+) -> None:
+    t_job = load_job(jobs_dir, ticket.job_id)
+    _write_text(
+        os.path.join(qa_dir, "rollback.log"),
+        redact_secrets(rb_log, secrets),
+    )
+    try:
+        gh_client.reopen_issue(ticket.issue_number)
+    except Exception as exc:
+        print(
+            f"[{ticket.job_id}] warning: reopen_issue failed: {exc}",
+            file=sys.stderr,
+        )
+
+    failure_md = redact_secrets(
+        render_qa_failure_md(qa_attempt, qa_limit, failure_reason, qa_out),
+        secrets,
+    )
+    _write_text(os.path.join(qa_dir, "failure.md"), failure_md)
+    _write_text(os.path.join(ticket.jdir, "qa-failure.md"), failure_md)
+
+    prior_prs = list(t_job.get("prior_prs") or [])
+    if t_job.get("pr_number"):
+        prior_prs.append(
+            {
+                "pr_number": t_job["pr_number"],
+                "pr_url": t_job.get("pr_url"),
+                "merged_sha": ticket.merged_sha,
+                "revert_sha": revert_sha,
+                "qa_round": qa_attempt,
+            }
+        )
+
+    if not rb_healthy:
+        update_job(
+            jobs_dir,
+            ticket.job_id,
+            qa_round=qa_attempt,
+            pr_number=None,
+            pr_url=None,
+            pre_merge_main_sha="",
+            merged_commit_sha="",
+            solo_staging_qa=False,
+            prior_prs=prior_prs,
+        )
+        esc_job = _escalate_to_human(
+            jobs_dir,
+            ticket.job_id,
+            ticket.issue_number,
+            gh_client,
+            cfg,
+            f"CRITICAL: Staging QA failed AND post-rollback health check failed on QA round "
+            f"{qa_attempt}/{qa_limit}.\n\n{failure_md}\n\n"
+            f"Rollback log:\n```\n{redact_secrets(rb_log, secrets)}\n```",
+        )
+        ticket.outcome = TrainOutcome(action="return", job=esc_job)
+        ticket.done_event.set()
+        return
+
+    if qa_attempt >= qa_limit:
+        update_job(
+            jobs_dir,
+            ticket.job_id,
+            qa_round=qa_attempt,
+            pr_number=None,
+            pr_url=None,
+            pre_merge_main_sha="",
+            merged_commit_sha="",
+            solo_staging_qa=False,
+            prior_prs=prior_prs,
+        )
+        esc_job = _escalate_to_human(
+            jobs_dir,
+            ticket.job_id,
+            ticket.issue_number,
+            gh_client,
+            cfg,
+            f"Staging QA failed {qa_attempt}/{qa_limit} rounds. "
+            f"Reverted `{ticket.merged_sha[:7]}` on `{base_branch}` (`{revert_sha[:7]}`) and rolled back "
+            f"staging cleanly.\n\n{failure_md}",
+        )
+        ticket.outcome = TrainOutcome(action="return", job=esc_job)
+        ticket.done_event.set()
+        return
+
+    new_branch = prepare_qa_fix_branch(
+        repo_root,
+        ticket.worktree,
+        ticket.job_id,
+        qa_attempt + 1,
+        base_branch,
+        revert_sha,
+        pre_train_head_sha=ticket.pre_train_head_sha,
+    )
+    update_job(
+        jobs_dir,
+        ticket.job_id,
+        qa_round=qa_attempt,
+        branch=new_branch,
+        pr_number=None,
+        pr_url=None,
+        pre_merge_main_sha="",
+        merged_commit_sha="",
+        solo_staging_qa=False,
+        prior_prs=prior_prs,
+    )
+    try:
+        gh_client.comment_issue(
+            ticket.issue_number,
+            f"### Staging QA Rollback (`{ticket.job_id}`, QA round {qa_attempt}/{qa_limit})\n\n"
+            f"Reverted `{ticket.merged_sha[:7]}` on `{base_branch}` (`{revert_sha[:7]}`) and rolled back "
+            f"staging. Retrying fix on `{new_branch}`.\n\n{failure_md[:2000]}",
+        )
+    except Exception as exc:
+        print(
+            f"[{ticket.job_id}] warning: post-rollback comment failed: {exc}",
+            file=sys.stderr,
+        )
+
+    advance_stage(
+        jobs_dir,
+        ticket.job_id,
+        "build",
+        preserve_last_error=bool(t_job.get("last_error")),
+        expand_round_by=int(cfg["max_rounds"]),
+    )
+    ticket.outcome = TrainOutcome(action="continue")
+    ticket.done_event.set()
+
+
+def _requeue_innocent_ticket(
+    repo_root: str,
+    jobs_dir: str,
+    base_branch: str,
+    cfg: dict,
+    gh_client: GitHubClient,
+    secrets: dict[str, str],
+    ticket: TrainTicket,
+    revert_sha: str,
+    rb_healthy: bool,
+    rb_log: str,
+    *,
+    solo_staging_qa: bool = False,
+) -> None:
+    try:
+        gh_client.reopen_issue(ticket.issue_number)
+    except Exception as exc:
+        print(
+            f"[{ticket.job_id}] warning: reopen_issue on innocent requeue failed: {exc}",
+            file=sys.stderr,
+        )
+
+    if not rb_healthy:
+        esc_job = _escalate_to_human(
+            jobs_dir,
+            ticket.job_id,
+            ticket.issue_number,
+            gh_client,
+            cfg,
+            "Staging QA passed for this PR, but a sibling PR in the coalesced staging train "
+            "failed and post-rollback health check failed.\n\n"
+            f"Rollback log:\n```\n{redact_secrets(rb_log, secrets)}\n```",
+        )
+        ticket.outcome = TrainOutcome(action="return", job=esc_job)
+        ticket.done_event.set()
+        return
+
+    p_job = load_job(jobs_dir, ticket.job_id)
+    prior_prs = list(p_job.get("prior_prs") or [])
+    requeue_num = sum(1 for item in prior_prs if item.get("requeued")) + 1
+    new_branch = prepare_requeue_branch(
+        repo_root,
+        ticket.worktree,
+        ticket.job_id,
+        requeue_num,
+        base_branch,
+        revert_sha,
+        pre_train_head_sha=ticket.pre_train_head_sha,
+    )
+    push_branch(ticket.worktree, new_branch)
+    intake_data = _read_json(os.path.join(ticket.jdir, "intake.json"))
+    spec_data = _read_json(os.path.join(ticket.jdir, "spec.json"))
+    pr_title = p_job["issue_title"] or f"Fix #{ticket.issue_number}"
+    pr_body = render_pr_body(p_job, intake_data, spec_data)
+    new_pr_num, new_pr_url = gh_client.ensure_draft_pr(
+        ticket.worktree,
+        new_branch,
+        base_branch,
+        pr_title,
+        pr_body,
+        pr_number=None,
+    )
+    gh_client.update_pr(new_pr_num, pr_title, pr_body)
+    if p_job.get("pr_number"):
+        prior_prs.append(
+            {
+                "pr_number": p_job["pr_number"],
+                "pr_url": p_job.get("pr_url"),
+                "merged_sha": ticket.merged_sha,
+                "revert_sha": revert_sha,
+                "qa_round": int(p_job.get("qa_round", 0)),
+                "requeued": True,
+            }
+        )
+    update_job(
+        jobs_dir,
+        ticket.job_id,
+        branch=new_branch,
+        pr_number=new_pr_num,
+        pr_url=new_pr_url,
+        pre_merge_main_sha="",
+        merged_commit_sha="",
+        needs_pre_merge_gate=True,
+        verified_gate_sha="",
+        solo_staging_qa=solo_staging_qa,
+        prior_prs=prior_prs,
+    )
+    advance_stage(
+        jobs_dir,
+        ticket.job_id,
+        "merging",
+        preserve_last_error=bool(p_job.get("last_error")),
+    )
+    mode_tag = " (solo=true)" if solo_staging_qa else ""
+    _log(
+        ticket.job_id,
+        f"requeued innocent PR onto {new_branch} (#{new_pr_num}) at stage=merging{mode_tag}",
+    )
+    ticket.outcome = TrainOutcome(action="continue")
+    ticket.done_event.set()
+
+
+def _safe_finalize_train_ticket(
+    jobs_dir: str,
+    gh_client: GitHubClient,
+    cfg: dict,
+    ticket: TrainTicket,
+    fn,
+) -> None:
+    try:
+        fn()
+    except Exception as exc:
+        if os.path.isdir(ticket.worktree):
+            abort_merge(ticket.worktree)
+        esc_job = _escalate_to_human(
+            jobs_dir,
+            ticket.job_id,
+            ticket.issue_number,
+            gh_client,
+            cfg,
+            f"Failed to restore PR branch after staging train revert ({type(exc).__name__}): {exc}",
+        )
+        ticket.outcome = TrainOutcome(action="return", job=esc_job)
+        ticket.done_event.set()
+
+
+def _execute_staging_train_batch(
+    batch: list[TrainTicket],
+    *,
+    repo_root: str,
+    factory_dir: str,
+    jobs_dir: str,
+    cfg: dict,
+    gh_client: GitHubClient,
+) -> None:
+    staging_cfg = cfg.get("staging_qa") or {}
+    labels = cfg["labels"]
+    base_branch = cfg["base_branch"]
+    max_qa_rounds = int(staging_cfg.get("max_qa_rounds", 3))
+
+    for t in batch:
+        _set_activity(jobs_dir, t.job_id, "waiting:staging_lock")
+
+    with staging_lock(jobs_dir):
+        secrets = load_staging_secrets(staging_cfg.get("env_files") or [], repo_root=repo_root)
+        merged_tickets: list[TrainTicket] = []
+        train_base_sha = ""
+
+        already_merged: list[TrainTicket] = []
+        to_merge: list[tuple[TrainTicket, dict]] = []
+
+        for t in batch:
+            t_job = load_job(jobs_dir, t.job_id)
+            t_stage = t_job["stage"]
+            if os.path.isdir(t.worktree):
+                t.pre_train_head_sha = head_sha(t.worktree)
+
+            if t_stage == "staging_qa":
+                t.pre_merge_sha = str(t_job.get("pre_merge_main_sha") or "")
+                t.merged_sha = str(t_job.get("merged_commit_sha") or "")
+                if t_job.get("solo_staging_qa"):
+                    update_job(jobs_dir, t.job_id, solo_staging_qa=False)
+                already_merged.append(t)
+            elif t_stage == "merging":
+                pr_num = int(t_job["pr_number"])
+                existing_sha = gh_client.get_pr_merge_commit(pr_num)
+                if existing_sha:
+                    pre_m = str(t_job.get("pre_merge_main_sha") or "")
+                    update_job(
+                        jobs_dir,
+                        t.job_id,
+                        pre_merge_main_sha=pre_m,
+                        merged_commit_sha=existing_sha,
+                        solo_staging_qa=False,
+                    )
+                    t_job = advance_stage(
+                        jobs_dir,
+                        t.job_id,
+                        "staging_qa",
+                        preserve_last_error=bool(t_job.get("last_error")),
+                    )
+                    _log(
+                        t.job_id,
+                        f"stage=staging_qa qa_round={t_job.get('qa_round', 0) + 1}/{t_job.get('qa_round_limit', max_qa_rounds)}",
+                    )
+                    t.pre_merge_sha = pre_m
+                    t.merged_sha = existing_sha
+                    already_merged.append(t)
+                else:
+                    to_merge.append((t, t_job))
+            else:
+                t.outcome = TrainOutcome(action="return", job=t_job)
+                t.done_event.set()
+
+        if already_merged:
+            with repo_lock(repo_root):
+                _run_git(repo_root, "fetch", "origin", base_branch)
+                if len(already_merged) > 1:
+                    rev_out = _run_git(
+                        repo_root,
+                        "rev-list",
+                        "--first-parent",
+                        "--reverse",
+                        f"origin/{base_branch}",
+                        check=False,
+                    ).stdout
+                    fp_index = {
+                        sha: idx
+                        for idx, sha in enumerate(rev_out.splitlines())
+                        if sha.strip()
+                    }
+                    already_merged.sort(
+                        key=lambda item: fp_index.get(item.merged_sha, 10**9)
+                    )
+                earliest = already_merged[0]
+                if earliest.pre_merge_sha:
+                    train_base_sha = earliest.pre_merge_sha
+                elif earliest.merged_sha:
+                    p_res = _run_git(
+                        repo_root,
+                        "rev-parse",
+                        f"{earliest.merged_sha}^1",
+                        check=False,
+                    )
+                    if p_res.returncode == 0:
+                        train_base_sha = p_res.stdout.strip()
+            merged_tickets.extend(already_merged)
+
+        for t, t_job in to_merge:
+            round_num = int(t_job["round"])
+            pr_num = int(t_job["pr_number"])
+            _set_activity(jobs_dir, t.job_id, "waiting:repo_lock")
+            with repo_lock(repo_root):
+                _set_activity(jobs_dir, t.job_id, "running:merging")
+                sync_ok, sync_err = _sync_pr_with_base(
+                    repo_root,
+                    factory_dir,
+                    jobs_dir,
+                    t.jdir,
+                    t.job_id,
+                    t.worktree,
+                    t.branch,
+                    base_branch,
+                    round_num,
+                    cfg,
+                )
+                if not sync_ok:
+                    esc_job = _escalate_to_human(
+                        jobs_dir,
+                        t.job_id,
+                        t.issue_number,
+                        gh_client,
+                        cfg,
+                        sync_err,
+                    )
+                    t.outcome = TrainOutcome(action="return", job=esc_job)
+                    t.done_event.set()
+                    continue
+
+                _run_git(repo_root, "fetch", "origin", base_branch)
+                pre_merge_sha = _run_git(
+                    repo_root, "rev-parse", f"origin/{base_branch}"
+                ).stdout.strip()
+                if not train_base_sha:
+                    train_base_sha = pre_merge_sha
+                gh_client.mark_pr_ready(pr_num)
+                gh_client.merge_pr(pr_num, cfg["merge_method"])
+                merged_sha = gh_client.get_pr_merge_commit(pr_num)
+                _run_git(repo_root, "fetch", "origin", base_branch)
+                if not merged_sha:
+                    merged_sha = _run_git(
+                        repo_root, "rev-parse", f"origin/{base_branch}"
+                    ).stdout.strip()
+                update_job(
+                    jobs_dir,
+                    t.job_id,
+                    pre_merge_main_sha=pre_merge_sha,
+                    merged_commit_sha=merged_sha,
+                    solo_staging_qa=False,
+                )
+                t_job = advance_stage(
+                    jobs_dir,
+                    t.job_id,
+                    "staging_qa",
+                    preserve_last_error=bool(t_job.get("last_error")),
+                )
+                _log(
+                    t.job_id,
+                    f"stage=staging_qa qa_round={t_job.get('qa_round', 0) + 1}/{t_job.get('qa_round_limit', max_qa_rounds)}",
+                )
+                t.pre_merge_sha = pre_merge_sha
+                t.merged_sha = merged_sha
+                merged_tickets.append(t)
+
+        if not merged_tickets:
+            return
+
+        deploy_wt, train_head_sha = ensure_staging_deploy_worktree(repo_root, base_branch)
+        for t in merged_tickets:
+            if not t.merged_sha:
+                t.merged_sha = train_head_sha
+                update_job(jobs_dir, t.job_id, merged_commit_sha=t.merged_sha)
+
+        changed_files = _compute_train_changed_files(
+            deploy_wt, train_base_sha, train_head_sha, merged_tickets
+        )
+        deploy_plan = plan_staging_deploy(changed_files, repo_root=repo_root)
+
+        meta: dict[str, tuple[int, int, str]] = {}
+        for t in merged_tickets:
+            t_job = load_job(jobs_dir, t.job_id)
+            qa_attempt = int(t_job.get("qa_round", 0)) + 1
+            qa_limit = int(t_job.get("qa_round_limit") or max_qa_rounds)
+            qa_dir = os.path.join(t.jdir, f"qa-{qa_attempt}")
+            os.makedirs(qa_dir, exist_ok=True)
+            meta[t.job_id] = (qa_attempt, qa_limit, qa_dir)
+
+        if deploy_plan.skip_non_runtime:
+            for t in merged_tickets:
+                qa_attempt, qa_limit, qa_dir = meta[t.job_id]
+                _write_text(
+                    os.path.join(qa_dir, "deploy.log"),
+                    "Skipped staging deploy and browser QA: non-runtime changes only.\n",
+                )
+                _log(t.job_id, "staging_qa skipped (non-runtime changes only)")
+                _mark_ticket_merged(
+                    jobs_dir,
+                    gh_client,
+                    labels,
+                    secrets,
+                    t,
+                    qa_attempt,
+                    qa_limit,
+                    note="Skipped staging deploy and browser QA because diff touched non-runtime files only.",
+                )
+            return
+
+        deploy_env = build_deploy_env(secrets, staging_cfg, repo_root=repo_root)
+        qa_env = build_qa_agent_env(secrets, staging_cfg, repo_root=repo_root)
+        base_url = staging_cfg.get("base_url", "")
+        ops_url = staging_cfg.get("ops_base_url", "")
+        deploy_timeout_sec = int(staging_cfg.get("deploy_timeout_sec", 900))
+        qa_timeout_sec = int(staging_cfg.get("qa_timeout_sec", 1200))
+
+        snapshot = snapshot_staging_versions(deploy_wt, deploy_env, repo_root=repo_root)
+
+        flags_label = " ".join(deploy_plan.extra_args) or "(full)"
+        for t in merged_tickets:
+            _set_activity(jobs_dir, t.job_id, "running:deploy")
+            _log(
+                t.job_id,
+                f"staging_qa deploy=start sha={t.merged_sha[:7]} train_size={len(merged_tickets)} flags={flags_label}",
+            )
+
+        t_dep = time.monotonic()
+        try:
+            deploy_ok, deploy_log = _call_deploy_to_staging(
+                deploy_wt,
+                deploy_env,
+                deploy_timeout_sec,
+                deploy_plan.extra_args,
+                repo_root=repo_root,
+                staging_cfg=staging_cfg,
+            )
+        except Exception as exc:
+            deploy_ok = False
+            deploy_log = f"{type(exc).__name__}: {exc}"
+        dep_dur = time.monotonic() - t_dep
+
+        redacted_deploy_log = redact_secrets(deploy_log, secrets)
+        for t in merged_tickets:
+            _, _, qa_dir = meta[t.job_id]
+            _log(
+                t.job_id,
+                f"staging_qa deploy={'OK' if deploy_ok else 'FAIL'} (dur={_fmt_duration(dep_dur)})",
+            )
+            _write_text(os.path.join(qa_dir, "deploy.log"), redacted_deploy_log)
+
+        passed_tickets: list[TrainTicket] = []
+        failed_tickets: list[TrainTicket] = []
+        qa_results: dict[str, tuple[dict | None, str]] = {}
+        shared_infra_failure = False
+
+        if not deploy_ok:
+            shared_infra_failure = True
+            dep_reason = (
+                "Staging deploy or post-deploy E2E smoke failed:\n\n```\n"
+                f"{redacted_deploy_log[-1500:]}\n```"
+            )
+            for t in merged_tickets:
+                failed_tickets.append(t)
+                qa_results[t.job_id] = (None, dep_reason)
+        else:
+            seed_err = ""
+            try:
+                ensure_staging_qa_accounts(deploy_wt, deploy_env, repo_root=repo_root)
+            except Exception as exc:
+                seed_err = (
+                    f"Staging QA account seed failed ({type(exc).__name__}): "
+                    f"{redact_secrets(str(exc), secrets)}"
+                )
+
+            if seed_err:
+                shared_infra_failure = True
+                for t in merged_tickets:
+                    failed_tickets.append(t)
+                    qa_results[t.job_id] = (None, seed_err)
+            else:
+                qa_model = cfg["models"]["qa"]
+
+                def _run_ticket_qa(t: TrainTicket) -> tuple[str, bool, dict | None, str]:
+                    qa_attempt, qa_limit, qa_dir = meta[t.job_id]
+                    qa_out: dict | None = None
+                    try:
+                        _set_activity(jobs_dir, t.job_id, f"running:browser-qa-r{qa_attempt}")
+                        _log(
+                            t.job_id,
+                            f"staging_qa browser_qa=start round={qa_attempt}/{qa_limit} ({_fmt_model_tag(qa_model)})",
+                        )
+                        spec_md = _read_text(os.path.join(t.jdir, "spec.md"))
+                        merged_stat = _run_git(
+                            deploy_wt, "show", "--stat", t.merged_sha, check=False
+                        ).stdout.strip()
+                        qa_prompt = "\n".join(
+                            [
+                                f"JOB_ID: {t.job_id}",
+                                f"ISSUE_NUMBER: {t.issue_number}",
+                                f"QA_ROUND: {qa_attempt}/{qa_limit}",
+                                f"REPO_ROOT: {repo_root}",
+                                f"QA_ARTIFACTS_DIR: {qa_dir}",
+                                f"MERGED_COMMIT_SHA: {t.merged_sha}",
+                                f"STAGING_BASE_URL: {base_url}",
+                                f"STAGING_OPS_BASE_URL: {ops_url}",
+                                "",
+                                "## Merged Commit Stat",
+                                merged_stat or "(none)",
+                                "",
+                                "## Specification",
+                                spec_md,
+                                "",
+                                "## Issue",
+                                t.issue_md,
+                            ]
+                        )
+                        qa_out, usage, dur = run_agent(
+                            factory_dir,
+                            t.jdir,
+                            deploy_wt,
+                            "qa",
+                            "qa",
+                            qa_model,
+                            qa_prompt,
+                            SCHEMAS["qa"],
+                            qa_timeout_sec,
+                            sandbox=False,
+                            clean_worktree=False,
+                            log_name=f"qa-{qa_attempt}",
+                            extra_env=qa_env,
+                            protect_head=True,
+                        )
+                        metrics_str = _record_and_format_step(
+                            jobs_dir, t.job_id, qa_model, usage, dur, cfg
+                        )
+                        _log(
+                            t.job_id,
+                            f"staging_qa browser_qa=done verdict={qa_out['verdict']} ({metrics_str})",
+                        )
+                        _write_json(os.path.join(qa_dir, "qa.json"), qa_out)
+                        _write_text(
+                            os.path.join(qa_dir, "qa.md"),
+                            redact_secrets(render_qa_md(qa_out), secrets),
+                        )
+                        if qa_out["verdict"] == "PASS":
+                            return t.job_id, True, qa_out, ""
+                        return (
+                            t.job_id,
+                            False,
+                            qa_out,
+                            "Staging QA found user-facing regressions or "
+                            "broken acceptance criteria in staging.",
+                        )
+                    except Exception as exc:
+                        return (
+                            t.job_id,
+                            False,
+                            qa_out,
+                            f"Staging QA step failed ({type(exc).__name__}): "
+                            f"{redact_secrets(str(exc), secrets)}",
+                        )
+                    finally:
+                        for suffix in ("", "-retry"):
+                            log_p = os.path.join(t.jdir, "logs", f"qa-{qa_attempt}{suffix}.json")
+                            if os.path.isfile(log_p):
+                                _write_text(log_p, redact_secrets(_read_text(log_p), secrets))
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max(1, len(merged_tickets))
+                ) as qa_pool:
+                    per_ticket = dict(
+                        (jid, (ok, qout, reason))
+                        for jid, ok, qout, reason in qa_pool.map(_run_ticket_qa, merged_tickets)
+                    )
+
+                if not is_worktree_clean(deploy_wt):
+                    reset_worktree_clean(deploy_wt)
+
+                for t in merged_tickets:
+                    ok, qout, reason = per_ticket[t.job_id]
+                    qa_results[t.job_id] = (qout, reason)
+                    if ok:
+                        passed_tickets.append(t)
+                    else:
+                        failed_tickets.append(t)
+
+        if not failed_tickets:
+            for t in passed_tickets:
+                qa_attempt, qa_limit, _ = meta[t.job_id]
+                qout, _ = qa_results[t.job_id]
+                _mark_ticket_merged(
+                    jobs_dir,
+                    gh_client,
+                    labels,
+                    secrets,
+                    t,
+                    qa_attempt,
+                    qa_limit,
+                    qa_out=qout,
+                )
+            return
+
+        if not passed_tickets:
+            rev_shas = [t.merged_sha for t in reversed(merged_tickets)]
+            ok_rev, revert_map, _ = try_revert_commits_on_base(deploy_wt, base_branch, rev_shas)
+            if not ok_rev:
+                revert_map = {
+                    t.merged_sha: revert_commit_on_base(deploy_wt, base_branch, t.merged_sha)
+                    for t in reversed(merged_tickets)
+                }
+            rb_healthy, rb_log = rollback_staging(
+                deploy_wt,
+                deploy_env,
+                snapshot,
+                repo_root=repo_root,
+            )
+            if shared_infra_failure and len(merged_tickets) > 1:
+                for t in merged_tickets:
+                    _safe_finalize_train_ticket(
+                        jobs_dir,
+                        gh_client,
+                        cfg,
+                        t,
+                        lambda tk=t: _requeue_innocent_ticket(
+                            repo_root,
+                            jobs_dir,
+                            base_branch,
+                            cfg,
+                            gh_client,
+                            secrets,
+                            tk,
+                            revert_map[tk.merged_sha],
+                            rb_healthy,
+                            rb_log,
+                            solo_staging_qa=True,
+                        ),
+                    )
+                return
+
+            for t in failed_tickets:
+                qa_attempt, qa_limit, qa_dir = meta[t.job_id]
+                qout, reason = qa_results[t.job_id]
+                _safe_finalize_train_ticket(
+                    jobs_dir,
+                    gh_client,
+                    cfg,
+                    t,
+                    lambda tk=t, qa_a=qa_attempt, qa_l=qa_limit, qd=qa_dir, qo=qout, rsn=reason: _handle_qa_failure_for_ticket(
+                        repo_root,
+                        jobs_dir,
+                        base_branch,
+                        cfg,
+                        gh_client,
+                        secrets,
+                        tk,
+                        qa_a,
+                        qa_l,
+                        qd,
+                        rsn,
+                        qo,
+                        revert_map[tk.merged_sha],
+                        rb_healthy,
+                        rb_log,
+                    ),
+                )
+            return
+
+        culprit_shas = [t.merged_sha for t in reversed(failed_tickets)]
+        surgical_ok, culprit_revert_map, conflict_detail = try_revert_commits_on_base(
+            deploy_wt,
+            base_branch,
+            culprit_shas,
+        )
+        full_revert_map: dict[str, str] = {}
+
+        if surgical_ok:
+            rem_changed = _compute_train_changed_files(
+                deploy_wt,
+                train_base_sha,
+                head_sha(deploy_wt),
+                passed_tickets,
+            )
+            rem_plan = plan_staging_deploy(rem_changed, repo_root=repo_root)
+            if rem_plan.skip_non_runtime:
+                redeploy_ok = True
+                redeploy_log = "Remaining passing PRs are non-runtime only."
+            else:
+                redeploy_ok, redeploy_log = _call_deploy_to_staging(
+                    deploy_wt,
+                    deploy_env,
+                    deploy_timeout_sec,
+                    rem_plan.extra_args,
+                    repo_root=repo_root,
+                    staging_cfg=staging_cfg,
+                )
+            if redeploy_ok:
+                for t_p in passed_tickets:
+                    qa_attempt, qa_limit, _ = meta[t_p.job_id]
+                    qout, _ = qa_results[t_p.job_id]
+                    _mark_ticket_merged(
+                        jobs_dir,
+                        gh_client,
+                        labels,
+                        secrets,
+                        t_p,
+                        qa_attempt,
+                        qa_limit,
+                        qa_out=qout,
+                    )
+                rb_note = (
+                    "Surgically reverted culprit commit(s) and re-deployed passing PR(s).\n"
+                    f"{redeploy_log}"
+                )
+                for t_f in failed_tickets:
+                    qa_attempt, qa_limit, qa_dir = meta[t_f.job_id]
+                    qout, reason = qa_results[t_f.job_id]
+                    _safe_finalize_train_ticket(
+                        jobs_dir,
+                        gh_client,
+                        cfg,
+                        t_f,
+                        lambda tk=t_f, qa_a=qa_attempt, qa_l=qa_limit, qd=qa_dir, qo=qout, rsn=reason: _handle_qa_failure_for_ticket(
+                            repo_root,
+                            jobs_dir,
+                            base_branch,
+                            cfg,
+                            gh_client,
+                            secrets,
+                            tk,
+                            qa_a,
+                            qa_l,
+                            qd,
+                            rsn,
+                            qo,
+                            culprit_revert_map[tk.merged_sha],
+                            True,
+                            rb_note,
+                        ),
+                    )
+                return
+
+            ok_rem, innocent_revert_map, _ = try_revert_commits_on_base(
+                deploy_wt,
+                base_branch,
+                [t.merged_sha for t in reversed(passed_tickets)],
+            )
+            if not ok_rem:
+                innocent_revert_map = {
+                    t.merged_sha: revert_commit_on_base(deploy_wt, base_branch, t.merged_sha)
+                    for t in reversed(passed_tickets)
+                }
+            full_revert_map = {**culprit_revert_map, **innocent_revert_map}
+        else:
+            first_line = conflict_detail.splitlines()[0] if conflict_detail else "conflict"
+            _log(
+                failed_tickets[0].job_id,
+                f"surgical revert conflicted ({first_line}); reverting full train",
+            )
+            ok_all, full_revert_map, _ = try_revert_commits_on_base(
+                deploy_wt,
+                base_branch,
+                [t.merged_sha for t in reversed(merged_tickets)],
+            )
+            if not ok_all:
+                full_revert_map = {
+                    t.merged_sha: revert_commit_on_base(deploy_wt, base_branch, t.merged_sha)
+                    for t in reversed(merged_tickets)
+                }
+
+        rb_healthy, rb_log = rollback_staging(
+            deploy_wt,
+            deploy_env,
+            snapshot,
+            repo_root=repo_root,
+        )
+        for t_f in failed_tickets:
+            qa_attempt, qa_limit, qa_dir = meta[t_f.job_id]
+            qout, reason = qa_results[t_f.job_id]
+            _safe_finalize_train_ticket(
+                jobs_dir,
+                gh_client,
+                cfg,
+                t_f,
+                lambda tk=t_f, qa_a=qa_attempt, qa_l=qa_limit, qd=qa_dir, qo=qout, rsn=reason: _handle_qa_failure_for_ticket(
+                    repo_root,
+                    jobs_dir,
+                    base_branch,
+                    cfg,
+                    gh_client,
+                    secrets,
+                    tk,
+                    qa_a,
+                    qa_l,
+                    qd,
+                    rsn,
+                    qo,
+                    full_revert_map[tk.merged_sha],
+                    rb_healthy,
+                    rb_log,
+                ),
+            )
+        for t_p in passed_tickets:
+            _safe_finalize_train_ticket(
+                jobs_dir,
+                gh_client,
+                cfg,
+                t_p,
+                lambda tk=t_p: _requeue_innocent_ticket(
+                    repo_root,
+                    jobs_dir,
+                    base_branch,
+                    cfg,
+                    gh_client,
+                    secrets,
+                    tk,
+                    full_revert_map[tk.merged_sha],
+                    rb_healthy,
+                    rb_log,
+                ),
+            )
+
+
 def process_job(
     repo_root: str,
     issue_number: int,
     config: dict | None = None,
     gh: GitHubClient | None = None,
+    train_coordinator: StagingTrainCoordinator | None = None,
     board: ProjectBoardSync | None = None,
 ) -> dict:
     """Drive one GitHub issue from its current/resumed stage until paused or completed."""
@@ -496,9 +1524,16 @@ def process_job(
     labels = cfg["labels"]
     base_branch = cfg["base_branch"]
     timeout_sec = int(cfg["agent_timeout_sec"])
+    staging_cfg = cfg.get("staging_qa") or {}
+    max_qa_rounds = int(staging_cfg.get("max_qa_rounds", 3))
 
     issue_data, issue_md = gh_client.fetch_issue(issue_number)
-    job, action = create_or_resume_job(jobs_dir, issue_data, max_rounds=cfg["max_rounds"])
+    job, action = create_or_resume_job(
+        jobs_dir,
+        issue_data,
+        max_rounds=cfg["max_rounds"],
+        max_qa_rounds=max_qa_rounds,
+    )
     job_id = job["id"]
     issue_url = job.get("issue_url") or issue_data.get("url", "")
     jdir = os.path.join(jobs_dir, job_id)
@@ -615,6 +1650,7 @@ def process_job(
                 round_dir = os.path.join(jdir, f"round-{round_num}")
                 os.makedirs(round_dir, exist_ok=True)
                 spec_md = _read_text(os.path.join(jdir, "spec.md"))
+                qa_failure_md = _read_text(os.path.join(jdir, "qa-failure.md"))
                 plan_data = _read_json(os.path.join(jdir, "plan.json"), {"slices": []})
                 slices = plan_data.get("slices", [])
                 total_slices = len(slices)
@@ -660,6 +1696,8 @@ def process_job(
                                 prompt_parts.extend(
                                     ["", "## Prior Escalation Context", prior_escalation, "", "## Latest Issue & Comments", issue_md]
                                 )
+                            if qa_failure_md:
+                                prompt_parts.extend(["", "## Staging QA Failure (Must Fix)", qa_failure_md])
                             if retry_feedback:
                                 prompt_parts.extend(["", "## Previous Attempt Failure (Must Fix)", retry_feedback])
 
@@ -1033,7 +2071,8 @@ def process_job(
                     elif fname.startswith("review-") and fname.endswith(".md"):
                         review_blocks.append(_read_text(os.path.join(round_dir, fname)))
 
-                if should_auto_approve_clean(cfg, job, checks_md, reviews_dict):
+                qa_failure_md = _read_text(os.path.join(jdir, "qa-failure.md"))
+                if should_auto_approve_clean(cfg, job, checks_md, reviews_dict, qa_failure_md):
                     approve_out = build_auto_approve_payload()
                     _log(job_id, "approve decision=APPROVE (auto-approved clean round-1 fast-path)")
                 else:
@@ -1129,46 +2168,78 @@ def process_job(
                     print(f"[{job_id}] warning: post-ready issue update failed: {exc}", file=sys.stderr)
                 return ready_job
 
-            if stage == "merging":
-                round_num = job["round"]
-                pr_num = int(job["pr_number"])
-                _set_activity(jobs_dir, job_id, "waiting:repo_lock")
-                with repo_lock(repo_root):
-                    _set_activity(jobs_dir, job_id, "running:merging")
-                    already_merged_sha = gh_client.get_pr_merge_commit(pr_num)
-                    if not already_merged_sha:
-                        sync_ok, sync_err = _sync_pr_with_base(
-                            repo_root,
-                            factory_dir,
-                            jobs_dir,
-                            jdir,
-                            job_id,
-                            worktree,
-                            branch,
-                            base_branch,
-                            round_num,
-                            cfg,
-                        )
-                        if not sync_ok:
-                            return _escalate_to_human(
+            if stage in {"merging", "staging_qa"}:
+                sqa_enabled = bool(staging_cfg.get("enabled"))
+                if stage == "merging" and not sqa_enabled:
+                    round_num = job["round"]
+                    pr_num = int(job["pr_number"])
+                    _set_activity(jobs_dir, job_id, "waiting:repo_lock")
+                    with repo_lock(repo_root):
+                        _set_activity(jobs_dir, job_id, "running:merging")
+                        already_merged_sha = gh_client.get_pr_merge_commit(pr_num)
+                        if not already_merged_sha:
+                            sync_ok, sync_err = _sync_pr_with_base(
+                                repo_root,
+                                factory_dir,
                                 jobs_dir,
+                                jdir,
                                 job_id,
-                                issue_number,
-                                gh_client,
+                                worktree,
+                                branch,
+                                base_branch,
+                                round_num,
                                 cfg,
-                                sync_err,
                             )
+                            if not sync_ok:
+                                return _escalate_to_human(
+                                    jobs_dir,
+                                    job_id,
+                                    issue_number,
+                                    gh_client,
+                                    cfg,
+                                    sync_err,
+                                )
 
-                        gh_client.mark_pr_ready(pr_num)
-                        gh_client.merge_pr(pr_num, cfg["merge_method"])
-                    merged_job = advance_stage(jobs_dir, job_id, "merged")
-                    delete_remote_branch(repo_root, branch)
+                            gh_client.mark_pr_ready(pr_num)
+                            gh_client.merge_pr(pr_num, cfg["merge_method"])
+                        merged_job = advance_stage(jobs_dir, job_id, "merged")
+                        delete_remote_branch(repo_root, branch)
 
-                try:
-                    gh_client.edit_labels(issue_number, remove=[labels["queue"]])
-                except Exception as exc:
-                    print(f"[{job_id}] warning: post-merge label cleanup failed: {exc}", file=sys.stderr)
-                return merged_job
+                    try:
+                        gh_client.edit_labels(issue_number, remove=[labels["queue"]])
+                    except Exception as exc:
+                        print(f"[{job_id}] warning: post-merge label cleanup failed: {exc}", file=sys.stderr)
+                    return merged_job
+
+                active_coord = train_coordinator or StagingTrainCoordinator(
+                    max_batch_size=1,
+                    coalesce_window_sec=0.0,
+                )
+                ticket = TrainTicket(
+                    job_id=job_id,
+                    issue_number=issue_number,
+                    jdir=jdir,
+                    worktree=worktree,
+                    branch=branch,
+                    issue_md=issue_md,
+                    initial_stage=stage,
+                    solo=bool(job.get("solo_staging_qa")),
+                )
+                outcome = active_coord.run_ticket(
+                    ticket,
+                    lambda batch: _execute_staging_train_batch(
+                        batch,
+                        repo_root=repo_root,
+                        factory_dir=factory_dir,
+                        jobs_dir=jobs_dir,
+                        cfg=cfg,
+                        gh_client=gh_client,
+                    ),
+                )
+                if outcome.action == "continue":
+                    continue
+                assert outcome.job is not None
+                return outcome.job
 
             raise RuntimeError(f"Unhandled stage {stage!r} for {job_id}")
 
@@ -1274,8 +2345,45 @@ def run_factory(
         if len(explicit_nums) == 1:
             return [process_job(repo_root, explicit_nums[0], config=cfg, gh=gh, board=board)]
 
+        sqa_cfg = cfg.get("staging_qa") or {}
+        train_coord: StagingTrainCoordinator | None = None
+        if bool(sqa_cfg.get("enabled")):
+
+            def _has_near_merge_peers(queued_ids: set[str]) -> bool:
+                for existing in list_jobs(jobs_dir):
+                    if existing.get("id") in queued_ids:
+                        continue
+                    if not _is_pid_alive(existing.get("pid")):
+                        continue
+                    if existing.get("stage") in {
+                        "review",
+                        "approve",
+                        "merging",
+                        "staging_qa",
+                    }:
+                        return True
+                return False
+
+            train_coord = StagingTrainCoordinator(
+                max_batch_size=int(sqa_cfg.get("max_batch_size", 4)),
+                coalesce_window_sec=float(sqa_cfg.get("coalesce_window_sec", 15)),
+                has_near_merge_peers=_has_near_merge_peers,
+            )
+
         def _safe_worker(num: int) -> dict | None:
             try:
+                if (
+                    train_coord is not None
+                    and "train_coordinator" in inspect.signature(process_job).parameters
+                ):
+                    return process_job(
+                        repo_root,
+                        num,
+                        config=cfg,
+                        gh=gh,
+                        train_coordinator=train_coord,
+                        board=board,
+                    )
                 return process_job(repo_root, num, config=cfg, gh=gh, board=board)
             except Exception as exc:
                 print(f"[issue-{num}] error before job state could escalate: {exc}", file=sys.stderr)
@@ -1310,6 +2418,7 @@ def run_factory(
 
                 order_deps, hard_deps = _plan_queue_batch(repo_root, factory_dir, jobs_dir, cfg, batch)
                 max_rounds = int(cfg.get("max_rounds", 3))
+                max_qa_rounds = int((cfg.get("staging_qa") or {}).get("max_qa_rounds", 3))
                 runner_pid = os.getpid()
                 for item in batch:
                     item_num = int(item["number"])
@@ -1317,6 +2426,7 @@ def run_factory(
                         jobs_dir,
                         item,
                         max_rounds=max_rounds,
+                        max_qa_rounds=max_qa_rounds,
                         waiting_on=order_deps.get(item_num),
                         pid=runner_pid,
                     )
@@ -1526,5 +2636,16 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
     else:
         ok = False
         messages.append("FAIL: .gitignore must ignore `/factory/jobs/*` and `/.worktrees/`")
+
+    if cfg and (cfg.get("staging_qa") or {}).get("enabled"):
+        sqa = cfg["staging_qa"]
+        try:
+            secrets = load_staging_secrets(sqa.get("env_files") or [], repo_root=repo_root)
+            messages.append(
+                f"OK: staging_qa enabled (base_url={sqa.get('base_url')}, secrets_loaded={len(secrets)})"
+            )
+        except Exception as exc:
+            ok = False
+            messages.append(f"FAIL: staging_qa secret loading failed: {exc}")
 
     return ok, messages

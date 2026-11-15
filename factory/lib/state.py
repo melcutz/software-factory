@@ -16,8 +16,9 @@ TRANSITIONS: dict[str, list[str]] = {
     "gate": ["review", "build", "needs-human"],
     "review": ["approve", "build", "needs-human"],
     "approve": ["merging", "ready", "needs-human"],
-    "merging": ["merged", "needs-human"],
-    "needs-human": ["intake", "spec", "build", "merging", "rejected"],
+    "merging": ["staging_qa", "merged", "needs-human"],
+    "staging_qa": ["merged", "merging", "build", "needs-human"],
+    "needs-human": ["intake", "spec", "build", "merging", "staging_qa", "rejected"],
     "ready": ["merged"],
     "merged": [],
     "rejected": [],
@@ -155,6 +156,7 @@ def enqueue_job(
     jobs_dir: str,
     issue: dict,
     max_rounds: int,
+    max_qa_rounds: int = 3,
     *,
     waiting_on: set[int] | list[int] | None = None,
     pid: int | None = None,
@@ -182,12 +184,15 @@ def enqueue_job(
                 "stage": "queued",
                 "round": 0,
                 "round_limit": max_rounds,
+                "qa_round": 0,
+                "qa_round_limit": max_qa_rounds,
                 "risk": "low",
                 "surfaces": [],
                 "total_slices": 0,
                 "completed_slices": 0,
                 "pr_number": None,
                 "pr_url": None,
+                "prior_prs": [],
                 "activity": activity_str,
                 "pid": pid,
                 "usage": {
@@ -218,7 +223,12 @@ def enqueue_job(
         return _atomic_write_job(jobs_dir, job_id, job)
 
 
-def create_or_resume_job(jobs_dir: str, issue: dict, max_rounds: int) -> tuple[dict, str]:
+def create_or_resume_job(
+    jobs_dir: str,
+    issue: dict,
+    max_rounds: int,
+    max_qa_rounds: int = 3,
+) -> tuple[dict, str]:
     issue_num = int(issue["number"])
     job_id = f"job-{issue_num}"
     with _job_lock(jobs_dir, job_id):
@@ -235,12 +245,15 @@ def create_or_resume_job(jobs_dir: str, issue: dict, max_rounds: int) -> tuple[d
                 "stage": "intake",
                 "round": 0,
                 "round_limit": max_rounds,
+                "qa_round": 0,
+                "qa_round_limit": max_qa_rounds,
                 "risk": "low",
                 "surfaces": [],
                 "total_slices": 0,
                 "completed_slices": 0,
                 "pr_number": None,
                 "pr_url": None,
+                "prior_prs": [],
                 "activity": None,
                 "pid": None,
                 "usage": {
@@ -259,6 +272,11 @@ def create_or_resume_job(jobs_dir: str, issue: dict, max_rounds: int) -> tuple[d
             return _atomic_write_job(jobs_dir, job_id, job), "new"
 
         job = load_job(jobs_dir, job_id)
+        job.setdefault("qa_round", 0)
+        job.setdefault("qa_round_limit", max_qa_rounds)
+        job.setdefault("prior_prs", [])
+        job.setdefault("activity", None)
+        job.setdefault("pid", None)
         if issue.get("title"):
             job["issue_title"] = issue["title"]
         if issue.get("url"):
@@ -288,6 +306,8 @@ def create_or_resume_job(jobs_dir: str, issue: dict, max_rounds: int) -> tuple[d
             if escalated_from == "merging" and job.get("pr_number"):
                 _atomic_write_job(jobs_dir, job_id, job)
                 return advance_stage(jobs_dir, job_id, "merging", preserve_last_error=True), "resume"
+            if escalated_from == "staging_qa":
+                job["qa_round_limit"] = max(job.get("qa_round_limit", max_qa_rounds), job.get("qa_round", 0) + 1)
             job["round_limit"] = max(job.get("round_limit", max_rounds), job.get("round", 0) + 1)
             _atomic_write_job(jobs_dir, job_id, job)
             return advance_stage(jobs_dir, job_id, "build", preserve_last_error=True), "resume"

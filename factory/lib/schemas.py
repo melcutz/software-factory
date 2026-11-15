@@ -156,6 +156,40 @@ SCHEMAS: dict[str, dict] = {
             "question": {"type": "string"},
         },
     },
+    "qa": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "verdict",
+            "summary",
+            "scenarios_tested",
+            "personas_used",
+            "failures",
+            "reproduction_steps",
+        ],
+        "properties": {
+            "verdict": {"type": "string", "enum": ["PASS", "FAIL"]},
+            "summary": {"type": "array", "items": {"type": "string"}},
+            "scenarios_tested": {"type": "array", "items": {"type": "string"}},
+            "personas_used": {"type": "array", "items": {"type": "string"}},
+            "failures": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["scenario", "expected", "actual", "url", "evidence"],
+                    "properties": {
+                        "scenario": {"type": "string"},
+                        "expected": {"type": "string"},
+                        "actual": {"type": "string"},
+                        "url": {"type": "string"},
+                        "evidence": {"type": "string"},
+                    },
+                },
+            },
+            "reproduction_steps": {"type": "array", "items": {"type": "string"}},
+        },
+    },
 }
 
 
@@ -229,6 +263,28 @@ def validate_stage_output(stage: str, payload: dict) -> dict:
             raise ValueError(f"Invalid approve decision: {data['decision']!r}")
         if data["decision"] == "ESCALATE" and not str(data["question"]).strip():
             raise ValueError("ESCALATE decision must include a non-empty question")
+
+    elif stage == "qa":
+        if data["verdict"] not in {"PASS", "FAIL"}:
+            raise ValueError(f"Invalid qa verdict: {data['verdict']!r}")
+        scenarios = [str(s).strip() for s in (data.get("scenarios_tested") or []) if str(s).strip()]
+        if not scenarios:
+            raise ValueError("qa scenarios_tested must include at least one executed scenario")
+        data["scenarios_tested"] = scenarios
+        if not isinstance(data.get("failures"), list):
+            raise ValueError("qa failures must be a list")
+        fail_req = schema["properties"]["failures"]["items"]["required"]
+        for idx, fl in enumerate(data["failures"]):
+            _require_keys(f"qa.failures[{idx}]", fl, fail_req)
+        if data["failures"]:
+            data["verdict"] = "FAIL"
+        if data["verdict"] == "FAIL":
+            if not data["failures"]:
+                raise ValueError("FAIL qa verdict must provide at least one failure entry")
+            repro = [str(r).strip() for r in (data.get("reproduction_steps") or []) if str(r).strip()]
+            if not repro:
+                raise ValueError("FAIL qa verdict must provide reproduction_steps")
+            data["reproduction_steps"] = repro
 
     return data
 
@@ -400,4 +456,56 @@ def render_pr_body(
         "## Merge-Danger Assessment",
         merge_danger,
     ]
+    return "\n".join(parts) + "\n"
+
+
+def render_qa_md(data: dict) -> str:
+    personas = ", ".join(data.get("personas_used") or []) or "none"
+    failure_lines = []
+    for f in data.get("failures", []):
+        failure_lines.append(
+            f"- **{f['scenario']}** (`{f['url']}`): expected {f['expected']}; "
+            f"actual {f['actual']} *(Evidence: `{f['evidence']}`)*"
+        )
+    failures_block = "\n".join(failure_lines) if failure_lines else "- No failures detected."
+    parts = [
+        f"VERDICT: {data['verdict']}",
+        f"PERSONAS: {personas}",
+        "",
+        "## Summary",
+        _bullets(data.get("summary", [])),
+        "",
+        "## Scenarios Tested",
+        _bullets(data.get("scenarios_tested", [])),
+        "",
+        "## Failures",
+        failures_block,
+    ]
+    if data.get("reproduction_steps"):
+        parts.extend(["", "## Reproduction Steps", _bullets(data["reproduction_steps"])])
+    return "\n".join(parts) + "\n"
+
+
+def render_qa_failure_md(
+    qa_round: int,
+    max_qa_rounds: int,
+    reason: str,
+    qa_data: dict | None = None,
+) -> str:
+    parts = [
+        f"Staging QA cycle {qa_round}/{max_qa_rounds} failed (base branch and staging deployment rolled back).",
+        "",
+        "### Failure Summary",
+        reason.strip(),
+    ]
+    if qa_data:
+        if qa_data.get("failures"):
+            parts.extend(["", "### Failed Scenarios"])
+            for f in qa_data["failures"]:
+                parts.append(
+                    f"- **{f['scenario']}** (`{f['url']}`): expected `{f['expected']}`, "
+                    f"got `{f['actual']}` (evidence: `{f['evidence']}`)"
+                )
+        if qa_data.get("reproduction_steps"):
+            parts.extend(["", "### Reproduction Steps", _bullets(qa_data["reproduction_steps"])])
     return "\n".join(parts) + "\n"

@@ -339,6 +339,13 @@ class GitHubClient:
     def close_issue(self, issue_number: int) -> None:
         self._runner(["issue", "close", str(issue_number)], self.repo_root)
 
+    def reopen_issue(self, issue_number: int) -> None:
+        try:
+            self._runner(["issue", "reopen", str(issue_number)], self.repo_root)
+        except RuntimeError as exc:
+            if "already open" not in str(exc).lower():
+                raise
+
     def get_pr_merge_commit(self, pr_number: int) -> str:
         raw = self._runner(["pr", "view", str(pr_number), "--json", "mergeCommit"], self.repo_root)
         parsed = json.loads(raw or "{}")
