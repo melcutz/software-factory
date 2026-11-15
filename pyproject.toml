@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "software-factory-agy"
-version = "0.1.0"
+version = "0.2.0"
 description = "Autonomous Software Factory for Google Antigravity (agy)"
 readme = "README.md"
 license = {text = "MIT"}
