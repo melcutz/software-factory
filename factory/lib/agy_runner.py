@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import signal
 import subprocess
+import threading
 import time
 
 from factory.lib.git_ops import head_sha, is_worktree_clean, reset_worktree_clean
@@ -17,6 +20,9 @@ You were dispatched as an autonomous headless subagent to execute one specific f
 """
 
 _SUBPROCESS_TIMEOUT_GRACE_SEC = 30
+_DEFAULT_IDLE_BG_GRACE_SEC = 45.0
+_IDLE_BG_RE = re.compile(r"root agent idle;\s*waiting up to .* background task", re.IGNORECASE)
+_ORIG_SUBPROCESS_RUN = subprocess.run
 
 
 class AgentExecutionError(RuntimeError):
@@ -35,6 +41,32 @@ def load_agent_instructions(factory_dir: str, agent_name: str) -> str:
         if len(parts) >= 3:
             return parts[2].strip()
     return content.strip()
+
+
+def load_repo_map(factory_dir: str) -> str:
+    """Read optional factory/REPO_MAP.md if present and non-empty."""
+    path = os.path.join(factory_dir, "REPO_MAP.md")
+    if not os.path.isfile(path):
+        return ""
+    with open(path, encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def build_agent_prompt(
+    factory_dir: str,
+    stage: str,
+    agent_name: str,
+    task_prompt: str,
+) -> str:
+    """Assemble headless subagent prompt with optional REPO_MAP context."""
+    instructions = load_agent_instructions(factory_dir, agent_name)
+    parts = [f"{SUBAGENT_PREAMBLE}\n{instructions}"]
+    if stage != "plan":
+        repo_map = load_repo_map(factory_dir)
+        if repo_map:
+            parts.append(f"## Repository Architecture Map\n\n{repo_map}")
+    parts.append(f"## Stage Task\n\n{task_prompt}")
+    return "\n\n---\n\n".join(parts)
 
 
 def _extract_json_envelope(stdout: str) -> dict:
@@ -73,6 +105,171 @@ def _extract_json_envelope(stdout: str) -> dict:
     raise ValueError(f"Could not parse JSON envelope from agy stdout: {text[:300]!r}")
 
 
+def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
+    """Terminate an entire POSIX process group cleanly (SIGTERM -> 5s -> SIGKILL)."""
+    pgid = proc.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        proc.terminate()
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            break
+        except OSError:
+            if proc.poll() is not None:
+                break
+        if proc.poll() is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        proc.wait(timeout=2.0)
+
+
+def _invoke_agy_process(
+    cmd: list[str],
+    cwd: str,
+    env: dict[str, str] | None,
+    hard_timeout_sec: float,
+    idle_bg_grace_sec: float,
+) -> tuple[int, str, str, str | None]:
+    """Spawn agy in its own process group and enforce hard + idle-background-task timeouts."""
+    if subprocess.run is not _ORIG_SUBPROCESS_RUN:
+        try:
+            res = subprocess.run(
+                cmd,
+                cwd=cwd,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=hard_timeout_sec,
+                check=False,
+            )
+            return int(res.returncode), res.stdout or "", res.stderr or "", None
+        except subprocess.TimeoutExpired as exc:
+            return (
+                -9,
+                (exc.stdout or "") if isinstance(exc.stdout, str) else "",
+                (exc.stderr or "") if isinstance(exc.stderr, str) else "",
+                f"agy timed out after {hard_timeout_sec:.1f}s",
+            )
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    state_lock = threading.Lock()
+    idle_since: float | None = None
+
+    def _read_stdout() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            stdout_chunks.append(line)
+
+    def _read_stderr() -> None:
+        nonlocal idle_since
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_chunks.append(line)
+            stripped = line.strip()
+            if not stripped:
+                continue
+            with state_lock:
+                if _IDLE_BG_RE.search(stripped):
+                    if idle_since is None:
+                        idle_since = time.monotonic()
+                else:
+                    idle_since = None
+
+    t_out = threading.Thread(target=_read_stdout, daemon=True)
+    t_err = threading.Thread(target=_read_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+
+    t0 = time.monotonic()
+    hard_deadline = t0 + max(1.0, float(hard_timeout_sec))
+    grace = max(0.1, float(idle_bg_grace_sec))
+    killed_reason: str | None = None
+
+    try:
+        while proc.poll() is None:
+            now = time.monotonic()
+            if now >= hard_deadline:
+                killed_reason = f"agy timed out after {hard_timeout_sec:.1f}s"
+                _terminate_process_group(proc)
+                break
+            with state_lock:
+                cur_idle = idle_since
+            if cur_idle is not None and (now - cur_idle) >= grace:
+                killed_reason = (
+                    f"agy hung waiting on background task(s) for {grace:.1f}s after root agent went idle"
+                )
+                _terminate_process_group(proc)
+                break
+            time.sleep(0.05)
+    finally:
+        if proc.poll() is None:
+            _terminate_process_group(proc)
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        t_out.join(timeout=2.0)
+        t_err.join(timeout=2.0)
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()
+
+    returncode = proc.returncode if proc.returncode is not None else -9
+    return returncode, "".join(stdout_chunks), "".join(stderr_chunks), killed_reason
+
+
+def _resolve_idle_bg_grace_sec(factory_dir: str, explicit: float | None) -> float:
+    if explicit is not None:
+        return float(explicit)
+    cfg_path = os.path.join(factory_dir, "config.json")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                raw = json.load(f)
+            val = raw.get("idle_bg_grace_sec") if isinstance(raw, dict) else None
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 5:
+                return float(val)
+        except (OSError, ValueError):
+            pass
+    return _DEFAULT_IDLE_BG_GRACE_SEC
+
+
 def run_agent(
     factory_dir: str,
     job_dir: str,
@@ -88,10 +285,11 @@ def run_agent(
     log_name: str = "",
     extra_env: dict[str, str] | None = None,
     protect_head: bool = False,
+    idle_bg_grace_sec: float | None = None,
 ) -> tuple[dict, dict, float]:
     """Run one headless `agy -p` turn with JSON Schema validation and 1 retry."""
-    instructions = load_agent_instructions(factory_dir, agent_name)
-    full_prompt = f"{SUBAGENT_PREAMBLE}\n{instructions}\n\n---\n\n## Stage Task\n\n{task_prompt}"
+    effective_idle_grace = _resolve_idle_bg_grace_sec(factory_dir, idle_bg_grace_sec)
+    full_prompt = build_agent_prompt(factory_dir, stage, agent_name, task_prompt)
     schema_str = json.dumps(schema, separators=(",", ":"))
 
     logs_dir = os.path.join(job_dir, "logs")
@@ -124,14 +322,12 @@ def run_agent(
         t0 = time.monotonic()
         try:
             try:
-                proc = subprocess.run(
+                returncode, stdout_text, stderr_text, killed_reason = _invoke_agy_process(
                     cmd,
                     cwd=worktree,
                     env=proc_env,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_sec + _SUBPROCESS_TIMEOUT_GRACE_SEC,
-                    check=False,
+                    hard_timeout_sec=float(timeout_sec + _SUBPROCESS_TIMEOUT_GRACE_SEC),
+                    idle_bg_grace_sec=effective_idle_grace,
                 )
             finally:
                 if guard_head:
@@ -157,9 +353,10 @@ def run_agent(
                 "stage": stage,
                 "model": model,
                 "sandbox": sandbox,
-                "returncode": proc.returncode,
-                "stdout": proc.stdout,
-                "stderr": proc.stderr,
+                "returncode": returncode,
+                "killed_reason": killed_reason,
+                "stdout": stdout_text,
+                "stderr": stderr_text,
             }
             log_file = os.path.join(
                 logs_dir,
@@ -168,12 +365,14 @@ def run_agent(
             with open(log_file, "w", encoding="utf-8") as f:
                 json.dump(log_record, f, indent=2)
 
-            if proc.returncode != 0:
+            if killed_reason:
+                raise AgentExecutionError(f"{killed_reason}: {(stderr_text or stdout_text)[:400]}")
+            if returncode != 0:
                 raise AgentExecutionError(
-                    f"agy exited with code {proc.returncode}: {(proc.stderr or proc.stdout or '')[:400]}"
+                    f"agy exited with code {returncode}: {(stderr_text or stdout_text)[:400]}"
                 )
 
-            envelope = _extract_json_envelope(proc.stdout)
+            envelope = _extract_json_envelope(stdout_text)
             if envelope.get("status") != "SUCCESS":
                 raise AgentExecutionError(f"agy returned non-SUCCESS status: {envelope.get('status')!r}")
 

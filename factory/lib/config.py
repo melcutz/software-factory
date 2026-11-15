@@ -24,6 +24,9 @@ DEFAULT_CONFIG: dict = {
     "max_slice_retries": 2,
     "agent_timeout_sec": 900,
     "gate_timeout_sec": 600,
+    "idle_bg_grace_sec": 45,
+    "auto_polish": True,
+    "auto_approve_clean": True,
     "base_branch": "main",
     "merge_method": "merge",
     "auto_merge": "low",
@@ -125,6 +128,15 @@ def load_config(factory_dir: str) -> dict:
         val = cfg.get(int_key)
         if not isinstance(val, int) or isinstance(val, bool) or val < 1:
             raise ValueError(f"{int_key} must be a positive integer, got {val!r}")
+
+    idle_grace = cfg.get("idle_bg_grace_sec")
+    if not isinstance(idle_grace, int) or isinstance(idle_grace, bool) or idle_grace < 5:
+        raise ValueError(f"idle_bg_grace_sec must be an integer >= 5, got {idle_grace!r}")
+
+    for bool_key in ("auto_polish", "auto_approve_clean"):
+        bval = cfg.get(bool_key)
+        if not isinstance(bval, bool):
+            raise ValueError(f"{bool_key} must be a boolean, got {bval!r}")
 
     if not isinstance(cfg.get("base_branch"), str) or not cfg["base_branch"].strip():
         raise ValueError("base_branch must be a non-empty string")

@@ -18,10 +18,15 @@ from factory.lib.config import (
     resolve_reviewers,
     split_model_and_effort,
 )
-from factory.lib.gate_runner import run_gate
+from factory.lib.gate_runner import (
+    auto_polish_worktree,
+    run_gate,
+    select_pre_merge_gate_scope,
+)
 from factory.lib.planner import plan_dependency_dag
 from factory.lib.git_ops import (
     GitHubClient,
+    _run_git,
     abort_merge,
     commits_ahead,
     conflicted_files,
@@ -35,6 +40,7 @@ from factory.lib.git_ops import (
     repo_lock,
     reset_worktree_clean,
     sync_with_base,
+    try_resolve_generated_asset_conflicts,
 )
 from factory.lib.schemas import (
     SCHEMAS,
@@ -263,6 +269,50 @@ def _aggregate_slice_builds(jdir: str, total_completed: int) -> tuple[dict, str]
     return agg, "\n\n".join(slice_mds)
 
 
+def should_auto_approve_clean(
+    cfg: dict,
+    job: dict,
+    checks_md: str,
+    reviews_dict: dict[str, dict],
+    qa_failure_md: str = "",
+) -> bool:
+    """Return True when a clean Round-1 PR can be deterministically approved without an LLM call."""
+    if not cfg.get("auto_approve_clean", True):
+        return False
+    if int(job.get("round", 0) or 0) != 1:
+        return False
+    if job.get("last_error") or (qa_failure_md or "").strip():
+        return False
+    if not (checks_md or "").startswith("VERDICT: PASS"):
+        return False
+
+    expected = resolve_reviewers(cfg, job.get("risk", "low"), job.get("surfaces") or [])
+    if not expected:
+        return False
+    for rev_name in expected:
+        rev = reviews_dict.get(rev_name)
+        if not isinstance(rev, dict) or rev.get("verdict") != "PASS":
+            return False
+        for finding in rev.get("findings") or ():
+            if isinstance(finding, dict) and finding.get("severity") in {"must_fix", "should_fix"}:
+                return False
+    return True
+
+
+def build_auto_approve_payload() -> dict:
+    """Construct a schema-valid deterministic APPROVE payload."""
+    return {
+        "decision": "APPROVE",
+        "summary": ["All deterministic gates and routed reviews passed cleanly on round 1."],
+        "reasoning": (
+            "Auto-approved deterministically: checks.sh passed and all routed reviewers "
+            "returned PASS with zero must_fix/should_fix findings."
+        ),
+        "merge_danger": "none",
+        "question": "",
+    }
+
+
 def _sync_pr_with_base(
     repo_root: str,
     factory_dir: str,
@@ -276,6 +326,8 @@ def _sync_pr_with_base(
     cfg: dict,
 ) -> tuple[bool, str]:
     """Sync branch with origin/<base_branch>, using builder to resolve conflicts before pre-merge gate."""
+    pre_sync_head = head_sha(worktree)
+    had_code_conflicts = False
     ok, head_changed, detail = sync_with_base(worktree, base_branch, abort_on_conflict=False)
     if not ok:
         if not merge_in_progress(worktree):
@@ -286,78 +338,100 @@ def _sync_pr_with_base(
             )
 
         before_resolve = head_sha(worktree)
-        conflicts = conflicted_files(worktree)
-        spec_md = _read_text(os.path.join(jdir, "spec.md"))
-        builder_model = cfg["models"]["builder"]
-        timeout_sec = int(cfg["agent_timeout_sec"])
-        conflict_list = "\n".join(f"- {path}" for path in conflicts) or "(see git status)"
-        conflict_prompt = (
-            f"JOB_ID: {job_id}\nROUND: {round_num}\nBRANCH: {branch}\nBASE_BRANCH: {base_branch}\n\n"
-            f"A `git merge --no-edit origin/{base_branch}` is currently in progress in this worktree "
-            f"and hit merge conflicts in:\n{conflict_list}\n\n"
-            f"## Git Output\n```\n{detail[:1500]}\n```\n\n"
-            "## Instructions\n"
-            f"1. Inspect the conflicted files and resolve all conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) "
-            f"preserving both `origin/{base_branch}`'s changes and this branch's intended behavior.\n"
-            "2. Do NOT run `git merge --abort` or `git push`.\n"
-            "3. Run targeted tests and fast linters on the affected files, stage the resolved files (`git add`), "
-            "and complete the merge commit (`git commit --no-edit`), leaving `git status --porcelain` clean.\n"
-            "4. Return `verdict: \"BLOCKED\"` with a concrete `blocked_reason` if the conflict cannot be safely resolved.\n"
-        )
-        if spec_md:
-            conflict_prompt += f"\n## Specification\n{spec_md}"
-
-        _set_activity(jobs_dir, job_id, "running:conflict-resolve")
-        _log(job_id, f"merge-conflict resolve start files={len(conflicts)} ({_fmt_model_tag(builder_model)})")
-        try:
-            resolve_out, usage, dur = run_agent(
-                factory_dir,
-                jdir,
-                worktree,
-                "build",
-                "builder",
-                builder_model,
-                conflict_prompt,
-                SCHEMAS["build"],
-                timeout_sec,
-                sandbox=False,
-                log_name=f"r{round_num}-merge-conflict",
+        if try_resolve_generated_asset_conflicts(worktree):
+            _log(job_id, "merge-conflict auto-resolved generated asset conflict deterministically")
+            head_changed = True
+        else:
+            had_code_conflicts = True
+            conflicts = conflicted_files(worktree)
+            spec_md = _read_text(os.path.join(jdir, "spec.md"))
+            builder_model = cfg["models"]["builder"]
+            timeout_sec = int(cfg["agent_timeout_sec"])
+            conflict_list = "\n".join(f"- {path}" for path in conflicts) or "(see git status)"
+            conflict_prompt = (
+                f"JOB_ID: {job_id}\nROUND: {round_num}\nBRANCH: {branch}\nBASE_BRANCH: {base_branch}\n\n"
+                f"A `git merge --no-edit origin/{base_branch}` is currently in progress in this worktree "
+                f"and hit merge conflicts in:\n{conflict_list}\n\n"
+                f"## Git Output\n```\n{detail[:1500]}\n```\n\n"
+                "## Instructions\n"
+                f"1. Inspect the conflicted files and resolve all conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) "
+                f"preserving both `origin/{base_branch}`'s changes and this branch's intended behavior.\n"
+                "2. Do NOT run `git merge --abort` or `git push`.\n"
+                "3. Run targeted tests and fast linters on the affected files, stage the resolved files (`git add`), "
+                "and complete the merge commit (`git commit --no-edit`), leaving `git status --porcelain` clean.\n"
+                "4. Return `verdict: \"BLOCKED\"` with a concrete `blocked_reason` if the conflict cannot be safely resolved.\n"
             )
-        except Exception as exc:
-            abort_merge(worktree)
-            return (
-                False,
-                f"Merge conflict resolution failed while syncing `{branch}` with `origin/{base_branch}`: {exc}",
-            )
+            if spec_md:
+                conflict_prompt += f"\n## Specification\n{spec_md}"
 
-        metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
-        _log(job_id, f"merge-conflict resolve verdict={resolve_out['verdict']} ({metrics_str})")
+            _set_activity(jobs_dir, job_id, "running:conflict-resolve")
+            _log(job_id, f"merge-conflict resolve start files={len(conflicts)} ({_fmt_model_tag(builder_model)})")
+            try:
+                resolve_out, usage, dur = run_agent(
+                    factory_dir,
+                    jdir,
+                    worktree,
+                    "build",
+                    "builder",
+                    builder_model,
+                    conflict_prompt,
+                    SCHEMAS["build"],
+                    timeout_sec,
+                    sandbox=False,
+                    log_name=f"r{round_num}-merge-conflict",
+                )
+            except Exception as exc:
+                abort_merge(worktree)
+                return (
+                    False,
+                    f"Merge conflict resolution failed while syncing `{branch}` with `origin/{base_branch}`: {exc}",
+                )
 
-        if resolve_out["verdict"] == "BLOCKED":
-            abort_merge(worktree)
-            return (
-                False,
-                f"Merge conflict while syncing `{branch}` with `origin/{base_branch}` "
-                f"(builder blocked: {resolve_out['blocked_reason']}):\n\n```\n{detail[:800]}\n```",
-            )
+            metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
+            _log(job_id, f"merge-conflict resolve verdict={resolve_out['verdict']} ({metrics_str})")
 
-        if (
-            merge_in_progress(worktree)
-            or conflicted_files(worktree)
-            or not is_worktree_clean(worktree)
-            or head_sha(worktree) == before_resolve
-        ):
-            abort_merge(worktree)
-            return (
-                False,
-                f"Merge conflict resolution for `{branch}` with `origin/{base_branch}` "
-                "did not complete a clean merge commit.",
-            )
-        head_changed = True
+            if resolve_out["verdict"] == "BLOCKED":
+                abort_merge(worktree)
+                return (
+                    False,
+                    f"Merge conflict while syncing `{branch}` with `origin/{base_branch}` "
+                    f"(builder blocked: {resolve_out['blocked_reason']}):\n\n```\n{detail[:800]}\n```",
+                )
+
+            if (
+                merge_in_progress(worktree)
+                or conflicted_files(worktree)
+                or not is_worktree_clean(worktree)
+                or head_sha(worktree) == before_resolve
+            ):
+                abort_merge(worktree)
+                return (
+                    False,
+                    f"Merge conflict resolution for `{branch}` with `origin/{base_branch}` "
+                    "did not complete a clean merge commit.",
+                )
+            head_changed = True
 
     if head_changed:
-        _set_activity(jobs_dir, job_id, "running:pre-merge-gate")
-        _log(job_id, "gate pre-merge scope=full running checks.sh")
+        if cfg.get("auto_polish", True):
+            if auto_polish_worktree(worktree, base_branch, cfg.get("protected_paths", [])):
+                _log(job_id, "auto-polished formatting/assets after base sync")
+        upstream_diff = _run_git(
+            worktree,
+            "diff",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            f"{pre_sync_head}..HEAD",
+            check=False,
+        )
+        upstream_changed = [p for p in upstream_diff.stdout.split("\0") if p]
+        pre_merge_scope = select_pre_merge_gate_scope(
+            upstream_changed,
+            had_code_conflicts=had_code_conflicts,
+        )
+        _set_activity(jobs_dir, job_id, f"running:pre-merge-gate:{pre_merge_scope}")
+        _log(job_id, f"gate pre-merge scope={pre_merge_scope} running checks.sh")
         t_gate = time.monotonic()
         passed, sync_checks_md = run_gate(
             repo_root,
@@ -366,12 +440,12 @@ def _sync_pr_with_base(
             round_num,
             cfg,
             tag="pre-merge",
-            scope="full",
+            scope=pre_merge_scope,
         )
         gate_dur = time.monotonic() - t_gate
         _log(
             job_id,
-            f"gate pre-merge scope=full verdict={'PASS' if passed else 'FAIL'} (dur={_fmt_duration(gate_dur)})",
+            f"gate pre-merge scope={pre_merge_scope} verdict={'PASS' if passed else 'FAIL'} (dur={_fmt_duration(gate_dur)})",
         )
         if not passed:
             return (
@@ -600,6 +674,10 @@ def process_job(
                                 retry_feedback = "No commits exist on branch ahead of base branch. Commit your implementation and tests."
                                 continue
 
+                            if cfg.get("auto_polish", True):
+                                if auto_polish_worktree(worktree, base_branch, cfg.get("protected_paths", [])):
+                                    _log(job_id, f"build slice={slice_num}/{total_slices} auto-polished formatting/assets")
+
                             gate_scope = "slice" if slice_num < total_slices else "full"
                             _set_activity(jobs_dir, job_id, f"running:slice-{slice_num}-gate")
                             _log(
@@ -738,6 +816,9 @@ def process_job(
                             )
                             passed, checks_md = True, existing_checks
                             break
+                        if cfg.get("auto_polish", True):
+                            if auto_polish_worktree(worktree, base_branch, cfg.get("protected_paths", [])):
+                                _log(job_id, "gate auto-polished formatting/assets before checks.sh")
                         _set_activity(jobs_dir, job_id, f"running:gate-{attempt + 1}")
                         _log(job_id, f"gate scope=full running checks.sh (attempt={attempt + 1})")
                         t_gate = time.monotonic()
@@ -923,56 +1004,60 @@ def process_job(
                     elif fname.startswith("review-") and fname.endswith(".md"):
                         review_blocks.append(_read_text(os.path.join(round_dir, fname)))
 
-                approve_parts = [
-                    f"JOB_ID: {job_id}",
-                    f"ROUND: {round_num}",
-                    f"BASE_BRANCH: {base_branch}",
-                    "",
-                    "## Diff Stat (`origin/<base_branch>...HEAD`)",
-                    diff_stat(worktree, base_branch),
-                    "",
-                    "## Issue & Human Comments",
-                    issue_md,
-                ]
-                if job.get("last_error"):
-                    approve_parts.extend(["", "## Prior Escalation History", job["last_error"]])
-                approve_parts.extend(
-                    [
+                if should_auto_approve_clean(cfg, job, checks_md, reviews_dict):
+                    approve_out = build_auto_approve_payload()
+                    _log(job_id, "approve decision=APPROVE (auto-approved clean round-1 fast-path)")
+                else:
+                    approve_parts = [
+                        f"JOB_ID: {job_id}",
+                        f"ROUND: {round_num}",
+                        f"BASE_BRANCH: {base_branch}",
                         "",
-                        "## Intake",
-                        intake_md,
+                        "## Diff Stat (`origin/<base_branch>...HEAD`)",
+                        diff_stat(worktree, base_branch),
                         "",
-                        "## Specification",
-                        spec_md,
-                        "",
-                        "## Build Summary",
-                        build_md,
-                        "",
-                        "## Gate Status",
-                        checks_md,
-                        "",
-                        "## Reviews",
-                        "\n\n".join(review_blocks),
+                        "## Issue & Human Comments",
+                        issue_md,
                     ]
-                )
-                approver_model = cfg["models"]["approver"]
-                _set_activity(jobs_dir, job_id, "running:approve")
-                _log(job_id, f"approve start ({_fmt_model_tag(approver_model)})")
-                approve_out, usage, dur = run_agent(
-                    factory_dir,
-                    jdir,
-                    worktree,
-                    "approve",
-                    "approver",
-                    approver_model,
-                    "\n".join(approve_parts),
-                    SCHEMAS["approve"],
-                    timeout_sec,
-                    sandbox=True,
-                    log_name=f"r{round_num}-approve",
-                )
-                metrics_str = _record_and_format_step(jobs_dir, job_id, approver_model, usage, dur, cfg)
-                _log(job_id, f"approve decision={approve_out['decision']} ({metrics_str})")
+                    if job.get("last_error"):
+                        approve_parts.extend(["", "## Prior Escalation History", job["last_error"]])
+                    approve_parts.extend(
+                        [
+                            "",
+                            "## Intake",
+                            intake_md,
+                            "",
+                            "## Specification",
+                            spec_md,
+                            "",
+                            "## Build Summary",
+                            build_md,
+                            "",
+                            "## Gate Status",
+                            checks_md,
+                            "",
+                            "## Reviews",
+                            "\n\n".join(review_blocks),
+                        ]
+                    )
+                    approver_model = cfg["models"]["approver"]
+                    _set_activity(jobs_dir, job_id, "running:approve")
+                    _log(job_id, f"approve start ({_fmt_model_tag(approver_model)})")
+                    approve_out, usage, dur = run_agent(
+                        factory_dir,
+                        jdir,
+                        worktree,
+                        "approve",
+                        "approver",
+                        approver_model,
+                        "\n".join(approve_parts),
+                        SCHEMAS["approve"],
+                        timeout_sec,
+                        sandbox=True,
+                        log_name=f"r{round_num}-approve",
+                    )
+                    metrics_str = _record_and_format_step(jobs_dir, job_id, approver_model, usage, dur, cfg)
+                    _log(job_id, f"approve decision={approve_out['decision']} ({metrics_str})")
                 _write_json(os.path.join(round_dir, "approve.json"), approve_out)
                 _write_text(os.path.join(round_dir, "approve.md"), render_approve_md(approve_out))
 

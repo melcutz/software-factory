@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
+from factory.lib.config import load_config
 from factory.lib.git_ops import is_worktree_clean
 from factory.lib.pipeline import factory_runner_status, format_status_table, process_job, run_doctor, run_factory
 from factory.lib.state import load_job
@@ -550,7 +551,8 @@ class PipelineE2ETests(unittest.TestCase):
 
     def test_merge_conflict_and_max_rounds_escalate_cleanly(self):
         self._seed_issue(50, "Conflicting edit")
-        conflict_job = process_job(self.repo, 50)
+        cfg_llm_approve = {**load_config(os.path.join(self.repo, "factory")), "auto_approve_clean": False}
+        conflict_job = process_job(self.repo, 50, config=cfg_llm_approve)
         self.assertEqual(conflict_job["stage"], "needs-human")
         wt50 = os.path.join(self.repo, ".worktrees", "job-50")
         self.assertTrue(is_worktree_clean(wt50))
@@ -584,7 +586,8 @@ class PipelineE2ETests(unittest.TestCase):
     def test_approver_escalate_carries_question_and_human_reply_and_tolerates_post_merge_label_error(self):
         os.environ["FAIL_POST_MERGE_LABEL_EDIT"] = "1"
         self._seed_issue(70, "Profile cache")
-        esc = process_job(self.repo, 70)
+        cfg_llm_approve = {**load_config(os.path.join(self.repo, "factory")), "auto_approve_clean": False}
+        esc = process_job(self.repo, 70, config=cfg_llm_approve)
         self.assertEqual(esc["stage"], "needs-human")
 
         # Human answers on GitHub and swaps label back to factory

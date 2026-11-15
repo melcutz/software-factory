@@ -1,6 +1,7 @@
 """Git worktree operations and GitHub CLI (gh) wrapper."""
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -129,6 +130,62 @@ def abort_merge(worktree: str) -> None:
     """Abort any in-progress merge and restore a clean worktree."""
     _run_git(worktree, "merge", "--abort", check=False)
     reset_worktree_clean(worktree)
+
+
+def is_generated_tailwind_path(relpath: str) -> bool:
+    """Return True if relpath is a content-hashed Tailwind CSS bundle under a static/ dir."""
+    norm = (relpath or "").strip().replace("\\", "/").lstrip("./")
+    return norm.endswith(".css") and "/static/tailwind-" in f"/{norm}"
+
+
+def try_resolve_generated_asset_conflicts(worktree: str) -> bool:
+    """Deterministically resolve pure generated Tailwind CSS merge conflicts."""
+    if not merge_in_progress(worktree):
+        return False
+    conflicts = conflicted_files(worktree)
+    if not conflicts or any(not is_generated_tailwind_path(p) for p in conflicts):
+        return False
+    build_script = os.path.join(worktree, "scripts", "build_tailwind.py")
+    if not os.path.isfile(build_script):
+        return False
+
+    static_dirs = sorted({os.path.dirname(p) for p in conflicts})
+    candidates: set[str] = set(conflicts)
+    for srel in static_dirs:
+        sabs = os.path.join(worktree, srel)
+        for p in glob.glob(os.path.join(sabs, "tailwind-*.css")):
+            candidates.add(os.path.relpath(p, worktree))
+    if candidates:
+        _run_git(worktree, "rm", "-f", "--ignore-unmatch", "--", *sorted(candidates), check=False)
+    for srel in static_dirs:
+        for abs_css in glob.glob(os.path.join(worktree, srel, "tailwind-*.css")):
+            try:
+                os.unlink(abs_css)
+            except OSError:
+                pass
+        os.makedirs(os.path.join(worktree, srel), exist_ok=True)
+
+    proc = subprocess.run(
+        ["python3", "scripts/build_tailwind.py"],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return False
+
+    for srel in static_dirs:
+        _run_git(worktree, "add", "-A", srel, check=False)
+    if conflicted_files(worktree):
+        return False
+    commit_res = _run_git(worktree, "commit", "--no-edit", check=False)
+    return (
+        commit_res.returncode == 0
+        and not merge_in_progress(worktree)
+        and is_worktree_clean(worktree)
+    )
 
 
 def sync_with_base(
