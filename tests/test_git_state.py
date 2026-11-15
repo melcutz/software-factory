@@ -123,3 +123,27 @@ def test_staging_lock_control_quota_and_prune(tmp_path):
     assert s1.get_quota_state()["models"]["gemini-4-argon"]["consecutive_429s"] == 1
     s1.clear_quota_cooldown("gemini-4-argon")
     assert "gemini-4-argon" not in s0.get_quota_state()["models"]
+
+
+def test_halt_and_resume_preserves_checkpoint_without_needs_human(tmp_path):
+    _, clones = _init_bare_and_clones(tmp_path, n=1)
+    s0 = GitStateStore(clones[0], "m0")
+    s0.write_worker_heartbeat(1, 2, False)
+    ok, job = s0.claim_job_lease("job-55", {"id": "job-55", "issue": 55, "stage": "build", "round": 1, "completed_slices": 2})
+    assert ok
+    jdir = tmp_path / "j55"
+    jdir.mkdir()
+    s0.checkpoint_job("job-55", str(jdir), job, release_lease=False)
+
+    from factory import cli
+    rc = cli.main(["halt", "--repo", clones[0], "--reason", "lunch break"])
+    assert rc == 0
+    assert s0.get_control_state()["halted"] is True
+
+    rc2 = cli.main(["resume", "--repo", clones[0]])
+    assert rc2 == 0
+    assert s0.get_control_state()["halted"] is False
+    hydrated = s0.hydrate_job("job-55", str(tmp_path / "j55_after"))
+    assert hydrated["stage"] == "build"
+    assert hydrated["completed_slices"] == 2
+

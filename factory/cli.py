@@ -11,7 +11,15 @@ import sys
 from factory.lib.config import load_config
 from factory.lib.gate_runner import run_gate
 from factory.lib.git_ops import GitHubClient
-from factory.lib.pipeline import factory_runner_status, format_status_table, run_doctor, run_factory
+from factory.lib.git_state import GitStateStore
+from factory.lib.pipeline import (
+    factory_runner_status,
+    format_status_table,
+    run_doctor,
+    run_factory,
+    run_halt,
+    run_resume,
+)
 from factory.lib.project_board import create_factory_board
 from factory.lib.state import list_jobs, load_job
 
@@ -120,6 +128,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_board.add_argument("--owner", default="@me", help="GitHub owner login (default: @me)")
     p_board.add_argument("--title", default="Factory", help="Project title (default: Factory)")
 
+    p_halt = sub.add_parser("halt", parents=[repo_flags], help="Globally halt the factory fleet and checkpoint active jobs")
+    p_halt.add_argument("--reason", default="", help="Optional reason recorded in refs/factory/control")
+    p_halt.add_argument("--force", action="store_true", help="Interrupt immediately even during staging deploy")
+
+    sub.add_parser("resume", parents=[repo_flags], help="Clear global halt and allow workers to resume")
+
     return parser
 
 
@@ -177,14 +191,48 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         for idx, repo in enumerate(repos):
             jobs_dir = os.path.join(repo, "factory", "jobs")
-            jobs = list_jobs(jobs_dir)
+            local_jobs = list_jobs(jobs_dir)
+            merged_by_id = {j["id"]: j for j in local_jobs if j.get("id")}
+            fleet_banner = ""
+            try:
+                store = GitStateStore(repo, "status-viewer")
+                ctrl = store.get_control_state()
+                workers = store.list_worker_heartbeats()
+                quota = store.get_quota_state().get("models") or {}
+                for rj in store.list_remote_jobs():
+                    rid = rj.get("id")
+                    if rid:
+                        merged_by_id[rid] = rj
+                if ctrl.get("halted") or workers or quota:
+                    state_word = f"HALTED ({ctrl.get('reason') or 'operator'})" if ctrl.get("halted") else "RUNNING"
+                    parts = [f"Fleet: {state_word}"]
+                    if workers:
+                        w_desc = ", ".join(
+                            f"{wid}({w.get('active_jobs', 0)}/{w.get('max_workers', 0)})"
+                            for wid, w in sorted(workers.items())
+                        )
+                        parts.append(f"workers=[{w_desc}]")
+                    if quota:
+                        parts.append(f"cooldowns={list(sorted(quota.keys()))}")
+                    fleet_banner = " | ".join(parts)
+            except Exception:
+                pass
+            jobs = [merged_by_id[k] for k in sorted(merged_by_id)]
             if multi:
                 if idx > 0:
                     print()
                 print(f"=== {os.path.basename(repo)} ({repo}) ===")
+            if fleet_banner:
+                print(fleet_banner)
             print(factory_runner_status(jobs_dir, jobs))
             print(format_status_table(jobs))
         return 0
+
+    if args.command == "halt":
+        return run_halt(repos, reason=args.reason, force=args.force)
+
+    if args.command == "resume":
+        return run_resume(repos)
 
     if args.command == "gate":
         if multi:

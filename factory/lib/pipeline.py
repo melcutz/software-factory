@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import graphlib
+import hashlib
 import inspect
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -24,6 +27,7 @@ from factory.lib.gate_runner import (
     run_gate,
     select_pre_merge_gate_scope,
 )
+from factory.lib.git_state import GitStateStore, LeaseLostError
 from factory.lib.planner import plan_dependency_dag
 from factory.lib.project_board import ProjectBoardSync
 from factory.lib.git_ops import (
@@ -882,6 +886,24 @@ def _safe_finalize_train_ticket(
         ticket.done_event.set()
 
 
+@contextlib.contextmanager
+def _distributed_staging_lock(
+    state_store: GitStateStore | None,
+    repo_root: str,
+    batch: list[TrainTicket],
+):
+    if state_store is None:
+        yield
+        return
+    while not state_store.acquire_staging_lock([t.job_id for t in batch]):
+        check_halt_or_lease(repo_root, batch[0].job_id, state_store)
+        time.sleep(2.0)
+    try:
+        yield
+    finally:
+        state_store.release_staging_lock()
+
+
 def _execute_staging_train_batch(
     batch: list[TrainTicket],
     *,
@@ -890,6 +912,7 @@ def _execute_staging_train_batch(
     jobs_dir: str,
     cfg: dict,
     gh_client: GitHubClient,
+    state_store: GitStateStore | None = None,
 ) -> None:
     staging_cfg = cfg.get("staging_qa") or {}
     labels = cfg["labels"]
@@ -899,7 +922,7 @@ def _execute_staging_train_batch(
     for t in batch:
         _set_activity(jobs_dir, t.job_id, "waiting:staging_lock")
 
-    with staging_lock(jobs_dir):
+    with _distributed_staging_lock(state_store, repo_root, batch), staging_lock(jobs_dir):
         secrets = load_staging_secrets(staging_cfg.get("env_files") or [], repo_root=repo_root)
         merged_tickets: list[TrainTicket] = []
         train_base_sha = ""
@@ -1506,6 +1529,83 @@ def _execute_staging_train_batch(
             )
 
 
+class JobHaltedError(RuntimeError):
+    """Raised when global or local halt signal is active."""
+
+
+def _default_machine_id() -> str:
+    return socket.gethostname()
+
+
+def _halt_signal_path() -> str:
+    host_dir = os.path.expanduser(os.environ.get("FACTORY_HOST_DIR") or os.path.join("~", ".config", "factory"))
+    return os.path.join(host_dir, "halt.signal")
+
+
+def is_local_halted() -> bool:
+    return os.path.isfile(_halt_signal_path())
+
+
+def check_halt_or_lease(repo_root: str, job_id: str, store: GitStateStore | None) -> None:
+    """Raise JobHaltedError if local or fleet-wide halt is active."""
+    if is_local_halted():
+        raise JobHaltedError("local halt.signal active")
+    if store is not None:
+        ctrl = store.get_control_state()
+        if ctrl.get("halted"):
+            raise JobHaltedError(f"fleet halted: {ctrl.get('reason') or 'operator halt'}")
+
+
+def _checkpoint_if_store(
+    store: GitStateStore | None,
+    job_id: str,
+    jdir: str,
+    jobs_dir: str,
+    *,
+    worktree: str | None = None,
+    release_lease: bool = False,
+) -> None:
+    if store is None:
+        return
+    if worktree and os.path.isdir(worktree):
+        store.push_slice_checkpoint(job_id, worktree)
+    job_data = load_job(jobs_dir, job_id)
+    store.checkpoint_job(job_id, jdir, job_data, release_lease=release_lease)
+
+
+def run_halt(repos: list[str], reason: str = "", force: bool = False) -> int:
+    """Activate global halt signal locally and across all target repos' refs/factory/control."""
+    sig_path = _halt_signal_path()
+    os.makedirs(os.path.dirname(sig_path), exist_ok=True)
+    with open(sig_path, "w", encoding="utf-8") as f:
+        json.dump({"halted": True, "reason": reason, "force": bool(force)}, f, indent=2)
+
+    mid = _default_machine_id()
+    for repo in repos:
+        try:
+            store = GitStateStore(repo, mid)
+            store.set_halted(True, reason=reason)
+        except Exception as exc:
+            print(f"[halt] warning: failed to update refs/factory/control in {repo}: {exc}", file=sys.stderr)
+    return 0
+
+
+def run_resume(repos: list[str]) -> int:
+    """Clear local halt signal and set halted=false on all target repos' refs/factory/control."""
+    sig_path = _halt_signal_path()
+    if os.path.isfile(sig_path):
+        os.remove(sig_path)
+
+    mid = _default_machine_id()
+    for repo in repos:
+        try:
+            store = GitStateStore(repo, mid)
+            store.set_halted(False, reason="")
+        except Exception as exc:
+            print(f"[resume] warning: failed to clear refs/factory/control in {repo}: {exc}", file=sys.stderr)
+    return 0
+
+
 def process_job(
     repo_root: str,
     issue_number: int,
@@ -1513,6 +1613,7 @@ def process_job(
     gh: GitHubClient | None = None,
     train_coordinator: StagingTrainCoordinator | None = None,
     board: ProjectBoardSync | None = None,
+    state_store: GitStateStore | None = None,
 ) -> dict:
     """Drive one GitHub issue from its current/resumed stage until paused or completed."""
     repo_root = os.path.abspath(repo_root)
@@ -1548,16 +1649,31 @@ def process_job(
             print(f"[{job_id}] warning: failed to remove queue label on skipped job: {exc}", file=sys.stderr)
         return job
 
+    worktree = ""
+    halted_cleanly = False
     try:
         worktree, branch = ensure_worktree(repo_root, job_id, base_branch, branch=job.get("branch"))
+        if state_store is not None:
+            remote_job = state_store.hydrate_job(job_id, jdir)
+            if remote_job and int(remote_job.get("completed_slices") or 0) > 0:
+                state_store.fetch_slice_checkpoint(job_id, worktree)
 
+        last_checkpointed_stage = ""
         while True:
+            check_halt_or_lease(repo_root, job_id, state_store)
             job = load_job(jobs_dir, job_id)
             branch = job.get("branch") or f"factory/{job_id}"
             stage = job["stage"]
+            if state_store is not None and stage != last_checkpointed_stage:
+                _checkpoint_if_store(state_store, job_id, jdir, jobs_dir)
+                last_checkpointed_stage = stage
             if board_sync:
                 board_sync.sync_stage(issue_url, stage)
             if stage in TERMINAL_OR_READY_STAGES or stage in {"needs-info", "needs-human"}:
+                if state_store is not None:
+                    _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, release_lease=True)
+                    if stage in TERMINAL_OR_READY_STAGES:
+                        state_store.delete_slice_checkpoint(job_id)
                 return job
 
             _log(job_id, f"stage={stage} round={job['round']}")
@@ -1779,6 +1895,8 @@ def process_job(
                                 if gate_scope == "full":
                                     update_fields["verified_gate_sha"] = head_sha(worktree)
                                 update_job(jobs_dir, job_id, **update_fields)
+                                _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, worktree=worktree)
+                                check_halt_or_lease(repo_root, job_id, state_store)
                                 slice_done = True
                                 break
 
@@ -2234,6 +2352,7 @@ def process_job(
                         jobs_dir=jobs_dir,
                         cfg=cfg,
                         gh_client=gh_client,
+                        state_store=state_store,
                     ),
                 )
                 if outcome.action == "continue":
@@ -2243,6 +2362,18 @@ def process_job(
 
             raise RuntimeError(f"Unhandled stage {stage!r} for {job_id}")
 
+    except JobHaltedError:
+        halted_cleanly = True
+        if worktree and os.path.isdir(worktree):
+            reset_worktree_clean(worktree)
+        _set_activity(jobs_dir, job_id, "halted")
+        if state_store is not None:
+            _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, release_lease=True)
+        return load_job(jobs_dir, job_id)
+    except LeaseLostError:
+        if worktree and os.path.isdir(worktree):
+            reset_worktree_clean(worktree)
+        return load_job(jobs_dir, job_id)
     except (AgentExecutionError, subprocess.CalledProcessError, RuntimeError, ValueError) as exc:
         cur = load_job(jobs_dir, job_id)
         if cur["stage"] not in TERMINAL_OR_READY_STAGES and cur["stage"] not in {"needs-info", "needs-human"}:
@@ -2256,7 +2387,8 @@ def process_job(
             )
         raise
     finally:
-        _set_activity(jobs_dir, job_id, None)
+        if not halted_cleanly:
+            _set_activity(jobs_dir, job_id, None)
         if board_sync:
             try:
                 final_job = load_job(jobs_dir, job_id)
@@ -2271,8 +2403,19 @@ def _plan_queue_batch(
     jobs_dir: str,
     cfg: dict,
     issues: list[dict],
+    state_store: GitStateStore | None = None,
 ) -> tuple[dict[int, set[int]], dict[int, set[int]]]:
     """Build `(order_deps, hard_deps)` DAGs for a batch of issues using explicit refs + optional LLM planner."""
+    issue_set_hash = ""
+    if state_store is not None and len(issues) > 1:
+        key = ",".join(str(int(item["number"])) for item in sorted(issues, key=lambda x: int(x["number"])))
+        issue_set_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        cached = state_store.get_cached_dag(issue_set_hash)
+        if cached:
+            order_deps = {int(k): {int(v) for v in vs} for k, vs in (cached.get("order_deps") or {}).items()}
+            hard_deps = {int(k): {int(v) for v in vs} for k, vs in (cached.get("hard_deps") or {}).items()}
+            return order_deps, hard_deps
+
     planner_agent_path = resolve_agent_path(factory_dir, "planner")
 
     def _run_planner(batch: list[dict]) -> dict:
@@ -2316,6 +2459,15 @@ def _plan_queue_batch(
         issues,
         planner_fn=_run_planner if len(issues) > 1 else None,
     )
+    if state_store is not None and issue_set_hash:
+        try:
+            state_store.put_cached_dag(
+                issue_set_hash,
+                {str(k): sorted(v) for k, v in order_deps.items()},
+                {str(k): sorted(v) for k, v in hard_deps.items()},
+            )
+        except Exception:
+            pass
     return order_deps, hard_deps
 
 
@@ -2542,7 +2694,7 @@ def factory_runner_status(jobs_dir: str, jobs: list[dict] | None = None) -> str:
 def format_status_table(jobs: list[dict]) -> str:
     if not jobs:
         return "No factory jobs recorded."
-    headers = ("JOB", "STAGE", "ACTIVITY", "ROUND", "SLICES", "RISK", "TOKENS", "COST", "PR")
+    headers = ("JOB", "STAGE", "ACTIVITY", "MACHINE", "ROUND", "SLICES", "RISK", "TOKENS", "COST", "PR")
     rows = [headers]
     for j in jobs:
         slices = f"{j.get('completed_slices', 0)}/{j.get('total_slices', 0)}"
@@ -2555,11 +2707,14 @@ def format_status_table(jobs: list[dict]) -> str:
             else "-"
         )
         pr_str = j.get("pr_url") or (f"#{j['pr_number']}" if j.get("pr_number") else "-")
+        lease = j.get("lease") or {}
+        machine_str = str(lease.get("hostname") or lease.get("worker_id") or "-")
         rows.append(
             (
                 str(j.get("id", "")),
                 str(j.get("stage", "")),
                 _format_activity(j),
+                machine_str,
                 f"{j.get('round', 0)}/{j.get('round_limit', 0)}",
                 slices,
                 str(j.get("risk", "-")),
