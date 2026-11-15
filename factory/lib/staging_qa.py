@@ -7,6 +7,7 @@ import importlib.util
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -40,6 +41,7 @@ def _load_repo_hooks(repo_root: str | None) -> ModuleType | None:
             _HOOKS_CACHE[norm_root] = None
             return None
         mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
         spec.loader.exec_module(mod)
         _HOOKS_CACHE[norm_root] = mod
         return mod
