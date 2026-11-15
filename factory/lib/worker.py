@@ -1,0 +1,344 @@
+"""Continuous competing-consumer worker loop, spread-first scheduler, and _exec-job runner."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+
+from factory.lib.config import load_config
+from factory.lib.git_ops import GitHubClient
+from factory.lib.git_state import SKEW_MARGIN_SEC, TERMINAL_STAGES, GitStateStore
+from factory.lib.herdr_bridge import HerdrBridge
+from factory.lib.pipeline import (
+    _plan_queue_batch,
+    is_local_halted,
+    process_job,
+    run_doctor,
+)
+
+
+def host_config_dir() -> str:
+    return os.path.expanduser(os.environ.get("FACTORY_HOST_DIR") or os.path.join("~", ".config", "factory"))
+
+
+@dataclass
+class HostConfig:
+    machine_id: str
+    max_workers: int = 2
+    min_free_ram_gb: float = 2.0
+    max_cpu_load_pct: float = 85.0
+    ramp_up_delay_sec: float = 20.0
+    poll_interval_sec: float = 45.0
+
+
+def load_host_config() -> HostConfig:
+    path = os.path.join(host_config_dir(), "host.json")
+    data: dict = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+        except (OSError, ValueError):
+            pass
+    return HostConfig(
+        machine_id=str(data.get("machine_id") or socket.gethostname()),
+        max_workers=max(1, int(data.get("max_workers", 2))),
+        min_free_ram_gb=float(data.get("min_free_ram_gb", 2.0)),
+        max_cpu_load_pct=float(data.get("max_cpu_load_pct", 85.0)),
+        ramp_up_delay_sec=float(data.get("ramp_up_delay_sec", 20.0)),
+        poll_interval_sec=float(data.get("poll_interval_sec", 45.0)),
+    )
+
+
+def pause_file_path() -> str:
+    return os.path.join(host_config_dir(), "paused")
+
+
+def is_host_paused() -> bool:
+    return os.path.isfile(pause_file_path())
+
+
+def set_host_paused(paused: bool, *, drain: bool = False) -> None:
+    path = pause_file_path()
+    if paused:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"paused": True, "drain": bool(drain)}, f)
+    elif os.path.isfile(path):
+        os.remove(path)
+
+
+class ClaimPacer:
+    """Enforces spread-first ramp-up delay between consecutive job claims on one machine."""
+
+    def __init__(self, ramp_up_delay_sec: float = 20.0) -> None:
+        self.ramp_up_delay_sec = max(0.0, float(ramp_up_delay_sec))
+        self._next_claim_allowed_at = 0.0
+
+    def can_claim(self, *, now: float | None = None) -> bool:
+        ts = time.monotonic() if now is None else now
+        return ts >= self._next_claim_allowed_at
+
+    def record_claim(self, *, now: float | None = None) -> None:
+        ts = time.monotonic() if now is None else now
+        self._next_claim_allowed_at = ts + self.ramp_up_delay_sec
+
+
+def _is_lease_expired(lease: dict, workers: dict[str, dict], now_ts: float) -> bool:
+    owner = lease.get("worker_id")
+    if not owner:
+        return True
+    w = workers.get(owner)
+    exp = float((w or {}).get("expires_at_ts") or lease.get("expires_at_ts") or 0.0)
+    return now_ts > (exp + SKEW_MARGIN_SEC)
+
+
+def select_next_candidate(
+    machine_id: str,
+    remote_jobs: list[dict],
+    ready_issues: list[dict],
+    workers: dict[str, dict],
+    *,
+    now_ts: float | None = None,
+) -> tuple[str, int, dict] | None:
+    """Select next job/issue using Tier 1 (own) > Tier 2 (orphaned) > Tier 3 (spread-first DAG)."""
+    ts = time.time() if now_ts is None else now_ts
+    tier1: list[dict] = []
+    tier2: list[dict] = []
+    known_issues: set[int] = set()
+
+    for j in remote_jobs:
+        issue_num = j.get("issue")
+        if issue_num is not None:
+            known_issues.add(int(issue_num))
+        stage = str(j.get("stage") or "")
+        if stage in TERMINAL_STAGES or stage in {"needs-human", "needs-info"}:
+            continue
+        lease = j.get("lease")
+        if lease is None:
+            if j.get("last_worker_id") == machine_id:
+                tier1.append(j)
+            else:
+                tier2.append(j)
+        elif isinstance(lease, dict):
+            if lease.get("worker_id") == machine_id:
+                tier1.append(j)
+            elif _is_lease_expired(lease, workers, ts):
+                tier2.append(j)
+
+    if tier1:
+        job = sorted(tier1, key=lambda x: int(x.get("issue") or 0))[0]
+        return ("resume", int(job["issue"]), job)
+    if tier2:
+        def _tier2_key(j: dict) -> tuple[int, int]:
+            prev_owner = j.get("last_worker_id") or (j.get("lease") or {}).get("worker_id")
+            owner_w = workers.get(prev_owner) if prev_owner else None
+            owner_online = 1 if (owner_w and ts <= float(owner_w.get("expires_at_ts") or 0.0)) else 0
+            return (owner_online, int(j.get("issue") or 0))
+
+        job = sorted(tier2, key=_tier2_key)[0]
+        return ("resume", int(job["issue"]), job)
+
+    fresh = [iss for iss in ready_issues if int(iss["number"]) not in known_issues]
+    if not fresh:
+        return None
+    fresh.sort(
+        key=lambda iss: hashlib.sha256(f"{machine_id}:{int(iss['number'])}".encode("utf-8")).hexdigest()
+    )
+    chosen = fresh[0]
+    return ("new", int(chosen["number"]), chosen)
+
+
+def exec_job_command(repo_root: str, issue_number: int) -> int:
+    """Execute one factory job inside an hc child terminal or local worker thread."""
+    repo_root = os.path.abspath(repo_root)
+    host_cfg = load_host_config()
+    bridge = HerdrBridge.from_env()
+    store = GitStateStore(repo_root, host_cfg.machine_id)
+    bridge.emit_status("working", progress=5)
+
+    job = process_job(repo_root, issue_number, state_store=store)
+    stage = str(job.get("stage") or "")
+    if stage == "needs-human":
+        bridge.emit_status("blocked", kind="question")
+        wt = os.path.join(repo_root, ".worktrees", job.get("id", f"job-{issue_number}"))
+        print(f"\n[needs-human] {job.get('id')} paused for human intervention.")
+        print(f"Worktree: {wt}")
+        if job.get("last_error"):
+            print(f"Reason: {job['last_error']}")
+        if sys.stdin.isatty() and os.path.isdir(wt):
+            shell = os.environ.get("SHELL") or "/bin/bash"
+            subprocess.run([shell], cwd=wt, check=False)
+        return 2
+
+    bridge.emit_status("done")
+    return 0
+
+
+def run_worker(
+    repos: list[str],
+    *,
+    once: bool = False,
+) -> int:
+    """Run continuous competing-consumer worker loop across target repositories."""
+    host_cfg = load_host_config()
+    bridge = HerdrBridge.from_env()
+    pacer = ClaimPacer(host_cfg.ramp_up_delay_sec)
+    stop_event = threading.Event()
+
+    healthy_repos: list[str] = []
+    for repo in repos:
+        ok, msgs = run_doctor(repo)
+        if ok:
+            healthy_repos.append(os.path.abspath(repo))
+        else:
+            print(f"[worker] skipping unhealthy repo {repo}: {'; '.join(msgs)}", file=sys.stderr)
+
+    if not healthy_repos:
+        print("[worker] no healthy repositories to watch.", file=sys.stderr)
+        return 1
+
+    stores = {r: GitStateStore(r, host_cfg.machine_id) for r in healthy_repos}
+    active_threads: list[tuple[str, int, threading.Thread]] = []
+
+    def _handle_sig(_signum, _frame):
+        stop_event.set()
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, _handle_sig)
+        signal.signal(signal.SIGTERM, _handle_sig)
+
+    last_hb = 0.0
+    last_prune = 0.0
+    while not stop_event.is_set():
+        active_threads = [(r, i, t) for (r, i, t) in active_threads if t.is_alive()]
+        now = time.monotonic()
+
+        if now - last_hb >= 120.0:
+            for store in stores.values():
+                try:
+                    store.write_worker_heartbeat(len(active_threads), host_cfg.max_workers, is_host_paused())
+                except Exception:
+                    pass
+            last_hb = now
+
+        if now - last_prune >= 86400.0:
+            for store in stores.values():
+                try:
+                    store.prune_stale_refs()
+                except Exception:
+                    pass
+            last_prune = now
+
+        if is_local_halted() or is_host_paused():
+            bridge.emit_status("idle")
+            if once:
+                break
+            stop_event.wait(min(host_cfg.poll_interval_sec, 20.0))
+            continue
+
+        # Check host admission and shared quota if governor is available
+        try:
+            from factory.lib.governor import check_host_admission
+            admitted, _reason = check_host_admission(host_cfg)
+        except ImportError:
+            admitted = True
+
+        if not admitted or len(active_threads) >= host_cfg.max_workers or not pacer.can_claim():
+            bridge.emit_status("working" if active_threads else "idle")
+            if once:
+                break
+            stop_event.wait(5.0)
+            continue
+
+        claimed_any = False
+        for repo in healthy_repos:
+            if len(active_threads) >= host_cfg.max_workers or not pacer.can_claim():
+                break
+            store = stores[repo]
+            if store.get_control_state().get("halted"):
+                continue
+
+            cfg = load_config(os.path.join(repo, "factory"))
+            gh = GitHubClient(repo)
+            issues = gh.list_queue_issues(cfg)
+            remote_jobs = store.list_remote_jobs()
+            workers = store.list_worker_heartbeats()
+
+            done_issues = {int(j["issue"]) for j in remote_jobs if j.get("stage") == "merged" and j.get("issue")}
+            order_deps, hard_deps = _plan_queue_batch(
+                repo,
+                os.path.join(repo, "factory"),
+                os.path.join(repo, "factory", "jobs"),
+                cfg,
+                issues,
+                state_store=store,
+            ) if issues else ({}, {})
+            ready = [
+                iss
+                for iss in issues
+                if all(
+                    dep in done_issues
+                    for dep in (
+                        order_deps.get(int(iss["number"]), set())
+                        | hard_deps.get(int(iss["number"]), set())
+                    )
+                )
+            ]
+
+            cand = select_next_candidate(host_cfg.machine_id, remote_jobs, ready, workers)
+            if not cand:
+                continue
+
+            kind, issue_num, payload = cand
+            job_id = f"job-{issue_num}"
+            initial = (
+                None
+                if kind == "resume"
+                else {"id": job_id, "issue": issue_num, "stage": "intake", "last_worker_id": host_cfg.machine_id}
+            )
+            ok, _ = store.claim_job_lease(job_id, initial)
+            if not ok:
+                continue
+
+            pacer.record_claim()
+            claimed_any = True
+            bridge.emit_status("working")
+            name = f"{os.path.basename(repo)}-{issue_num}"
+            if bridge.enabled:
+                tid = bridge.spawn_job_terminal(
+                    name,
+                    repo,
+                    [sys.executable, "-m", "factory.cli", "_exec-job", "--repo", repo, str(issue_num)],
+                )
+                if tid:
+                    continue
+
+            t = threading.Thread(target=exec_job_command, args=(repo, issue_num), daemon=True)
+            t.start()
+            active_threads.append((repo, issue_num, t))
+
+        if not claimed_any:
+            bridge.emit_status("working" if active_threads else "idle")
+        if once:
+            for _, _, t in active_threads:
+                t.join()
+            break
+        stop_event.wait(host_cfg.poll_interval_sec)
+
+    for store in stores.values():
+        try:
+            store.delete_worker_heartbeat()
+        except Exception:
+            pass
+    bridge.emit_status("idle")
+    return 0

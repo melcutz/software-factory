@@ -9,6 +9,7 @@ import subprocess
 import sys
 
 from factory.lib.config import load_config
+from factory.lib.fleet import fleet_pause, fleet_status, fleet_unpause, fleet_wake
 from factory.lib.gate_runner import run_gate
 from factory.lib.git_ops import GitHubClient
 from factory.lib.git_state import GitStateStore
@@ -22,6 +23,7 @@ from factory.lib.pipeline import (
 )
 from factory.lib.project_board import create_factory_board
 from factory.lib.state import list_jobs, load_job
+from factory.lib.worker import exec_job_command, run_worker, set_host_paused
 
 DEFAULT_REPOS_CONFIG = os.path.join("~", ".config", "factory", "repos.json")
 
@@ -134,6 +136,22 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("resume", parents=[repo_flags], help="Clear global halt and allow workers to resume")
 
+    p_worker = sub.add_parser("worker", parents=[repo_flags], help="Run continuous competing-consumer worker loop")
+    p_worker.add_argument("--once", action="store_true", help="Run a single poll cycle and exit")
+
+    p_exec = sub.add_parser("_exec-job", parents=[repo_flags], help="Internal: execute a single claimed job")
+    p_exec.add_argument("issue", type=int, help="GitHub issue number")
+
+    p_pause = sub.add_parser("pause", parents=[repo_flags], help="Pause new job claims on this machine")
+    p_pause.add_argument("--drain", action="store_true", help="Drain active jobs cleanly")
+
+    sub.add_parser("unpause", parents=[repo_flags], help="Resume job claims on this machine")
+
+    p_fleet = sub.add_parser("fleet", parents=[repo_flags], help="Manage peer machines via hc machine")
+    p_fleet.add_argument("action", choices=["status", "wake", "pause", "unpause"], help="Fleet action")
+    p_fleet.add_argument("machine", nargs="?", help="Optional target machine name")
+    p_fleet.add_argument("--drain", action="store_true", help="Drain active jobs when pausing")
+
     return parser
 
 
@@ -147,6 +165,35 @@ def main(argv: list[str] | None = None) -> int:
         verb = "Created" if res["created"] else "Already exists"
         print(f"{verb}: {proj.get('title', args.title)} ({proj.get('url', '')})")
         return 0
+
+    if args.command == "pause":
+        set_host_paused(True, drain=args.drain)
+        print("Paused new job claims on this machine.")
+        return 0
+
+    if args.command == "unpause":
+        set_host_paused(False)
+        print("Unpaused job claims on this machine.")
+        return 0
+
+    if args.command == "fleet":
+        if args.action == "status":
+            for m in fleet_status():
+                print(f"{m['name']}\t{m.get('via', '')}\t{m.get('raw', '')}")
+            return 0
+        if args.action == "wake":
+            for name, rc, out in fleet_wake():
+                print(f"{name}: rc={rc} {out}".strip())
+            return 0
+        if args.action == "pause":
+            for name, rc, out in fleet_pause(args.machine, drain=args.drain):
+                print(f"{name}: rc={rc} {out}".strip())
+            return 0
+        if args.action == "unpause":
+            for name, rc, out in fleet_unpause(args.machine):
+                print(f"{name}: rc={rc} {out}".strip())
+            return 0
+        return 1
 
     repos = resolve_target_repos(args)
     multi = len(repos) > 1
@@ -233,6 +280,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "resume":
         return run_resume(repos)
+
+    if args.command == "worker":
+        return run_worker(repos, once=args.once)
+
+    if args.command == "_exec-job":
+        if multi:
+            print("Error: _exec-job requires a single repository.", file=sys.stderr)
+            return 1
+        return exec_job_command(repos[0], args.issue)
 
     if args.command == "gate":
         if multi:
