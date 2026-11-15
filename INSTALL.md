@@ -21,6 +21,9 @@ factory/lib/git_ops.py
 factory/lib/gate_runner.py
 factory/lib/agy_runner.py
 factory/lib/pipeline.py
+factory/lib/planner.py
+factory/lib/project_board.py
+factory/agents/planner.md
 factory/agents/intake.md
 factory/agents/spec-writer.md
 factory/agents/builder.md
@@ -51,7 +54,7 @@ chmod +x factory/bin/factory factory/checks.sh
      - `"low"` *(default)*: Auto-merge passing `low`-risk PRs; mark passing `medium`/`high`-risk PRs ready (`gh pr ready`) for 1-click human merge.
      - `"all"`: Auto-merge all approved PRs regardless of risk tier.
      - `"none"`: Never auto-merge; stop every approved PR at `ready`.
-   - Adjust `concurrency` (default `3`), `models`, and optional `model_pricing` overrides if desired.
+   - Adjust `concurrency` (default `4`), `models` (including `planner`), `auto_polish`, and optional `model_pricing` overrides if desired.
 3. **`.gitignore`**: Append:
    ```gitignore
    /factory/jobs/*
@@ -64,6 +67,11 @@ chmod +x factory/bin/factory factory/checks.sh
    gh label create "factory:needs-info" --color "FBCA04" --description "Factory waiting for clarification" --force
    gh label create "factory:needs-human" --color "D93F0B" --description "Factory escalated for human review" --force
    ```
+5. **GitHub Project Board (Optional)**: If you want a Kanban board (`Inbox`, `Ready`, `Building`, `Review`, `Done`, `Deployed`, `Skipped`, `Needs Human`) that automatically tracks issues as the factory executes them:
+   ```bash
+   ./factory/bin/factory init-board
+   ```
+   *(Requires `gh auth refresh -s project` if your token does not yet include the `project` scope. Whenever a `"Factory"` project exists in your GitHub account, the runner syncs issue columns automatically.)*
 
 ## 3. Verify Installation
 
@@ -78,6 +86,6 @@ Both commands must exit `0`.
 
 ## 4. Run
 
-- Label any GitHub issue `factory` (from small bugfixes to complex multi-file features).
-- Inside `agy`, run `/factory run` (or run `./factory/bin/factory run` directly from any terminal, SSH session, or cron job).
-- Check progress anytime with `/factory status` or `./factory/bin/factory status`.
+- Label any GitHub issue `factory` (from small bugfixes to complex multi-file features). Use `Depends on #N`, `Blocked by #N`, or `After #N` in issue bodies to sequence dependent work.
+- Inside `agy`, run `/factory run` (or run `./factory/bin/factory run` / `./factory/bin/factory run 42 43` directly from any terminal, SSH session, or cron job).
+- Check runner liveness, per-job activity/PID, slice progress, cost, and PR URLs anytime with `/factory status` or `./factory/bin/factory status`.

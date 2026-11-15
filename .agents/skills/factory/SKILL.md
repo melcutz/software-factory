@@ -9,19 +9,20 @@ You operate the repository's autonomous software factory (`factory/bin/factory`)
 
 ## Commands
 
-### `/factory run` or `/factory run <issue-number>`
-Drain all eligible open `factory`-labeled GitHub issues (up to `concurrency` in `factory/config.json`), or process a single issue number:
+### `/factory run` or `/factory run <issue-number ...>`
+Drain all eligible open `factory`-labeled GitHub issues (DAG-scheduled up to `concurrency` in `factory/config.json`), or process specific issue number(s):
 
 ```bash
 ./factory/bin/factory run          # drain all eligible queued issues
 ./factory/bin/factory run 42       # run or resume only issue #42
+./factory/bin/factory run 42 43    # run or resume a specific batch of issues
 ```
 
 - Long multi-slice runs can take several minutes; run with an appropriate command wait or monitor progress via `./factory/bin/factory status`.
 - When finished, summarize each processed job's final stage (`merged`, `ready`, `needs-info`, `needs-human`, `rejected`), PR link, slice count, and any question needing human input.
 
 ### `/factory status [job-id]`
-Show the summary table of all jobs (stage, round, completed slices, risk, tokens, PR URL) or inspect one job's `job.json`:
+Show the runner liveness banner (`Factory: RUNNING` / `Factory: NOT RUNNING`) and summary table of all jobs (stage, live activity/stale PID, round, slices, risk, tokens, cost, PR URL), or inspect one job's `job.json`:
 
 ```bash
 ./factory/bin/factory status
