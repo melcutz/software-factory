@@ -30,6 +30,28 @@ class AgentExecutionError(RuntimeError):
     """Raised when `agy -p` fails or violates stage constraints after retry."""
 
 
+class QuotaExhaustedError(RuntimeError):
+    """Raised immediately when an LLM provider returns HTTP 429 / RESOURCE_EXHAUSTED."""
+
+    def __init__(self, model_spec: str, retry_after_sec: int | None = None, message: str = "") -> None:
+        self.model_spec = model_spec
+        self.retry_after_sec = retry_after_sec
+        super().__init__(message or f"LLM quota exhausted for {model_spec}")
+
+
+_QUOTA_RE = re.compile(r"(?:\b429\b|RESOURCE_EXHAUSTED|rate[ _-]?limit(?:ed| exceeded)|quota[ _-]?exceeded)", re.IGNORECASE)
+_RETRY_AFTER_RE = re.compile(r"retry[- _]?after[:\s]+(\d+)\s*s?", re.IGNORECASE)
+
+
+def _detect_quota_error(model_spec: str, stdout_text: str, stderr_text: str) -> QuotaExhaustedError | None:
+    combined = f"{stderr_text}\n{stdout_text}"
+    if not _QUOTA_RE.search(combined):
+        return None
+    m = _RETRY_AFTER_RE.search(combined)
+    retry_after = int(m.group(1)) if m else None
+    return QuotaExhaustedError(model_spec, retry_after_sec=retry_after, message=combined.strip()[:400])
+
+
 def resolve_agent_path(factory_dir: str, agent_name: str) -> str | None:
     """Return per-repo agent prompt path if present, else the built-in engine prompt path."""
     for base in (factory_dir, ENGINE_FACTORY_DIR):
@@ -463,6 +485,9 @@ def run_agent(
             if killed_reason:
                 raise AgentExecutionError(f"{killed_reason}: {(stderr_text or stdout_text)[:400]}")
             if returncode != 0:
+                quota_err = _detect_quota_error(model, stdout_text, stderr_text)
+                if quota_err is not None:
+                    raise quota_err
                 raise AgentExecutionError(
                     f"agy exited with code {returncode}: {(stderr_text or stdout_text)[:400]}"
                 )
@@ -485,6 +510,8 @@ def run_agent(
 
         except Exception as exc:
             last_err = exc
+            if isinstance(exc, QuotaExhaustedError):
+                raise
             if isinstance(exc, AgentExecutionError) and "illegally moved HEAD" in str(exc):
                 raise
             if attempt == 2:

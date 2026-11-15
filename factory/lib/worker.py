@@ -269,6 +269,17 @@ def run_worker(
                 continue
 
             cfg = load_config(os.path.join(repo, "factory"))
+            try:
+                from factory.lib.config import split_model_and_effort
+                from factory.lib.governor import is_model_in_cooldown
+
+                quota_state = store.get_quota_state()
+                intake_model, _ = split_model_and_effort((cfg.get("models") or {}).get("intake", ""))
+                in_cd, _ = is_model_in_cooldown(quota_state, intake_model) if intake_model else (False, 0.0)
+                if in_cd:
+                    continue
+            except Exception:
+                pass
             gh = GitHubClient(repo)
             issues = gh.list_queue_issues(cfg)
             remote_jobs = store.list_remote_jobs()

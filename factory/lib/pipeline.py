@@ -15,7 +15,7 @@ import sys
 import time
 from datetime import datetime
 
-from factory.lib.agy_runner import AgentExecutionError, resolve_agent_path, run_agent
+from factory.lib.agy_runner import AgentExecutionError, QuotaExhaustedError, resolve_agent_path, run_agent
 from factory.lib.config import (
     estimate_usage_cost_usd,
     load_config,
@@ -2368,6 +2368,17 @@ def process_job(
             reset_worktree_clean(worktree)
         _set_activity(jobs_dir, job_id, "halted")
         if state_store is not None:
+            _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, release_lease=True)
+        return load_job(jobs_dir, job_id)
+    except QuotaExhaustedError as exc:
+        halted_cleanly = True
+        if worktree and os.path.isdir(worktree):
+            reset_worktree_clean(worktree)
+        _set_activity(jobs_dir, job_id, "cooldown: quota")
+        if state_store is not None:
+            base_model, _ = split_model_and_effort(exc.model_spec)
+            base_model = base_model.split(":", 1)[0].split()[0]
+            state_store.record_quota_cooldown(base_model, str(exc), exc.retry_after_sec)
             _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, release_lease=True)
         return load_job(jobs_dir, job_id)
     except LeaseLostError:
