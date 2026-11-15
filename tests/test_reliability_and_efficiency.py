@@ -148,6 +148,17 @@ class ReliabilityAndEfficiencyTests(unittest.TestCase):
         job_r2 = {**job, "round": 2}
         self.assertFalse(should_auto_approve_clean(cfg, job_r2, "VERDICT: PASS\n", reviews))
 
+        job_high = {**job, "risk": "high", "surfaces": []}
+        reviews_high = {
+            "code": {"verdict": "PASS", "findings": [], "summary": ["ok"]},
+            "security": {"verdict": "PASS", "findings": [], "summary": ["ok"]},
+            "ux": {"verdict": "PASS", "findings": [], "summary": ["ok"]},
+            "ui": {"verdict": "PASS", "findings": [], "summary": ["ok"]},
+        }
+        self.assertFalse(
+            should_auto_approve_clean(cfg, job_high, "VERDICT: PASS\n", reviews_high)
+        )
+
     def test_tailwind_conflict_auto_resolver_and_auto_polish_guard(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             bare = os.path.join(d, "origin.git")

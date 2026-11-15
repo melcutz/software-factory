@@ -43,6 +43,7 @@ _FULL_PRE_MERGE_INFRA_EXACT: frozenset[str] = frozenset(
         "go.mod",
         "go.sum",
         "tests/conftest.py",
+        "worker.py",
     }
 )
 
@@ -82,7 +83,19 @@ def select_pre_merge_gate_scope(
         if (
             norm in _FULL_PRE_MERGE_INFRA_EXACT
             or norm.startswith(("vendor/", "migrations/", "control_migrations/"))
-            or norm.endswith(("/conftest.py", "/app.py", "/config.py", "/providers.py", "/db.py"))
+            or norm.endswith(
+                (
+                    "/conftest.py",
+                    "/app.py",
+                    "/config.py",
+                    "/providers.py",
+                    "/db.py",
+                    "/spi.py",
+                    "/deps.py",
+                    "/worker.py",
+                    "/runtime.py",
+                )
+            )
         ):
             return "full"
     return "slice"
@@ -179,8 +192,14 @@ def auto_polish_worktree(
     ]
 
     build_tw = os.path.join(worktree, "scripts", "build_tailwind.py")
-    existing_tw = glob.glob(os.path.join(worktree, "**", "static", "tailwind-*.css"), recursive=True)
-    tw_trigger = len(existing_tw) > 1 or any(
+    existing_tw: list[str] = []
+    for pattern in (
+        "src/*/static/tailwind-*.css",
+        "*/static/tailwind-*.css",
+        "static/tailwind-*.css",
+    ):
+        existing_tw.extend(glob.glob(os.path.join(worktree, pattern)))
+    tw_trigger = len(set(existing_tw)) > 1 or any(
         p.startswith(("templates/", "src/"))
         or p in {"tailwind.config.js", "tailwind-input.css"}
         for p in changed

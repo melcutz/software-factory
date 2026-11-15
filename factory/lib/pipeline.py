@@ -281,6 +281,8 @@ def should_auto_approve_clean(
         return False
     if int(job.get("round", 0) or 0) != 1:
         return False
+    if job.get("risk") == "high":
+        return False
     if job.get("last_error") or (qa_failure_md or "").strip():
         return False
     if not (checks_md or "").startswith("VERDICT: PASS"):
@@ -412,24 +414,33 @@ def _sync_pr_with_base(
                 )
             head_changed = True
 
-    if head_changed:
+    force_full_gate = False
+    try:
+        force_full_gate = bool(load_job(jobs_dir, job_id).get("needs_pre_merge_gate"))
+    except FileNotFoundError:
+        force_full_gate = False
+
+    if head_changed or force_full_gate:
         if cfg.get("auto_polish", True):
             if auto_polish_worktree(worktree, base_branch, cfg.get("protected_paths", [])):
                 _log(job_id, "auto-polished formatting/assets after base sync")
-        upstream_diff = _run_git(
-            worktree,
-            "diff",
-            "-z",
-            "--name-only",
-            "--no-renames",
-            f"{pre_sync_head}..HEAD",
-            check=False,
-        )
-        upstream_changed = [p for p in upstream_diff.stdout.split("\0") if p]
-        pre_merge_scope = select_pre_merge_gate_scope(
-            upstream_changed,
-            had_code_conflicts=had_code_conflicts,
-        )
+        if force_full_gate:
+            pre_merge_scope = "full"
+        else:
+            upstream_diff = _run_git(
+                worktree,
+                "diff",
+                "-z",
+                "--name-only",
+                "--no-renames",
+                f"{pre_sync_head}..HEAD",
+                check=False,
+            )
+            upstream_changed = [p for p in upstream_diff.stdout.split("\0") if p]
+            pre_merge_scope = select_pre_merge_gate_scope(
+                upstream_changed,
+                had_code_conflicts=had_code_conflicts,
+            )
         _set_activity(jobs_dir, job_id, f"running:pre-merge-gate:{pre_merge_scope}")
         _log(job_id, f"gate pre-merge scope={pre_merge_scope} running checks.sh")
         t_gate = time.monotonic()
@@ -452,7 +463,17 @@ def _sync_pr_with_base(
                 False,
                 f"Post-sync gate failed after merging `origin/{base_branch}`:\n\n{sync_checks_md[:1200]}",
             )
-        push_branch(worktree, branch)
+        try:
+            update_job(
+                jobs_dir,
+                job_id,
+                needs_pre_merge_gate=False,
+                verified_gate_sha=head_sha(worktree),
+            )
+        except FileNotFoundError:
+            pass
+        if head_sha(worktree) != pre_sync_head:
+            push_branch(worktree, branch)
 
     return True, ""
 
