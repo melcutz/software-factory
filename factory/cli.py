@@ -178,8 +178,24 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "fleet":
         if args.action == "status":
-            for m in fleet_status():
-                print(f"{m['name']}\t{m.get('via', '')}\t{m.get('raw', '')}")
+            machines = fleet_status()
+            headers = ("NAME", "HOST", "STATE", "VERSION", "VIA")
+            rows = [headers]
+            for m in machines:
+                rows.append(
+                    (
+                        str(m.get("name") or "-"),
+                        str(m.get("host") or m.get("target") or "-"),
+                        str(m.get("state") or ("paused" if m.get("paused") else "-")),
+                        str(m.get("version") or "-"),
+                        str(m.get("via") or "-"),
+                    )
+                )
+            widths = [max(len(r[c]) for r in rows) for c in range(len(headers))]
+            for idx, r in enumerate(rows):
+                print("  ".join(r[c].ljust(widths[c]) for c in range(len(headers))).rstrip())
+                if idx == 0:
+                    print("  ".join("-" * w for w in widths))
             return 0
         if args.action == "wake":
             for name, rc, out in fleet_wake():

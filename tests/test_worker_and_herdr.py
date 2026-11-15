@@ -103,12 +103,14 @@ def test_fleet_wake_uses_hc_machine_ls_and_hc_run_on(tmp_path, monkeypatch):
     fake_hc = tmp_path / "hc"
     fake_hc.write_text(
         f"#!{sys.executable}\n"
-        "import sys\n"
+        "import json, sys\n"
         f"with open({str(log_file)!r}, 'a') as f:\n"
         "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
         "if sys.argv[1:3] == ['machine', 'ls']:\n"
-        "    print('ryzen-box  user@100.64.0.2  ready')\n"
-        "    print('wsl-node   via wsl.exe      ready')\n",
+        "    print(json.dumps({'machines': [\n"
+        "        {'name': 'ryzen-box', 'host': 'ryzen', 'state': 'connected', 'version': '0.1.16'},\n"
+        "        {'name': 'wsl-node', 'host': 'wsl', 'state': 'connected', 'version': '0.1.16'},\n"
+        "    ]}))\n",
         encoding="utf-8",
     )
     fake_hc.chmod(0o755)

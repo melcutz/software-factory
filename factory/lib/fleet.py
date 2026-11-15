@@ -23,14 +23,40 @@ def discover_machines() -> list[dict]:
         try:
             res = subprocess.run([hc, "machine", "ls"], capture_output=True, text=True, timeout=5.0, check=False)
             if res.returncode == 0:
-                for raw in res.stdout.splitlines():
-                    line = raw.strip()
-                    if not line or line.lower().startswith("name ") or line.startswith("-"):
-                        continue
-                    name = line.split()[0]
-                    if name and name not in seen:
-                        seen.add(name)
-                        machines.append({"name": name, "via": "hc", "raw": line})
+                stdout = (res.stdout or "").strip()
+                parsed_json = None
+                if stdout.startswith("{") or stdout.startswith("["):
+                    try:
+                        parsed_json = json.loads(stdout)
+                    except ValueError:
+                        parsed_json = None
+
+                if isinstance(parsed_json, dict) and isinstance(parsed_json.get("machines"), list):
+                    for item in parsed_json["machines"]:
+                        if not isinstance(item, dict):
+                            continue
+                        name = str(item.get("name") or item.get("target") or "").strip()
+                        if name and name not in seen:
+                            seen.add(name)
+                            machines.append(
+                                {
+                                    "name": name,
+                                    "via": "hc",
+                                    "host": str(item.get("host") or ""),
+                                    "state": str(item.get("state") or ""),
+                                    "version": str(item.get("version") or ""),
+                                    "target": str(item.get("target") or name),
+                                }
+                            )
+                else:
+                    for raw in stdout.splitlines():
+                        line = raw.strip()
+                        if not line or line.lower().startswith("name ") or line.startswith("-"):
+                            continue
+                        name = line.split()[0]
+                        if name and name not in seen:
+                            seen.add(name)
+                            machines.append({"name": name, "via": "hc", "raw": line})
         except (OSError, subprocess.TimeoutExpired):
             pass
 
