@@ -126,3 +126,27 @@ def test_fleet_wake_uses_hc_machine_ls_and_hc_run_on(tmp_path, monkeypatch):
     assert any("run --on ryzen-box --bg --name factory-worker-ryzen-box -- factory worker --all" in ln for ln in lines)
     assert any("run --on wsl-node --bg --name factory-worker-wsl-node -- factory worker --all" in ln for ln in lines)
 
+
+def test_fleet_update_runs_git_pull_on_all_machines(tmp_path, monkeypatch):
+    log_file = tmp_path / "hc_update.log"
+    fake_hc = tmp_path / "hc"
+    fake_hc.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"with open({str(log_file)!r}, 'a') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1:3] == ['machine', 'ls']:\n"
+        "    print(json.dumps({'machines': [{'name': 'lenovo', 'state': 'connected'}]}))\n"
+        "else:\n"
+        "    print('Already up to date.')\n",
+        encoding="utf-8",
+    )
+    fake_hc.chmod(0o755)
+    monkeypatch.setenv("HC_BIN_PATH", str(fake_hc))
+    monkeypatch.setenv("FACTORY_HOST_DIR", str(tmp_path))
+
+    from factory import cli
+    assert cli.main(["fleet", "update"]) == 0
+    lines = log_file.read_text().splitlines()
+    assert any("run --on lenovo -- sh -lc" in ln and "pull --ff-only" in ln for ln in lines)
+

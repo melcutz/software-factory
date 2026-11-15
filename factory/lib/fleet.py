@@ -146,3 +146,22 @@ def fleet_unpause(machine: str | None = None) -> list[tuple[str, int, str]]:
             rc, out = _run_on_machine(m, ["factory", "unpause"])
             results.append((m["name"], rc, out))
     return results
+
+
+def fleet_update(machine: str | None = None) -> list[tuple[str, int, str]]:
+    """Pull latest software-factory-agy on all (or one) fleet machine(s)."""
+    update_script = (
+        'DIR=$(python3 -c "import os,factory; print(os.path.dirname(list(factory.__path__)[0]))" 2>/dev/null || echo "$HOME/work/software-factory-agy"); '
+        'git -C "$DIR" pull --ff-only'
+    )
+    machines = discover_machines()
+    if machine:
+        machines = [m for m in machines if m["name"] == machine]
+    if not machines:
+        res = subprocess.run(["sh", "-lc", update_script], capture_output=True, text=True, timeout=30.0, check=False)
+        return [("local", res.returncode, (res.stdout or res.stderr or "").strip())]
+    results: list[tuple[str, int, str]] = []
+    for m in machines:
+        rc, out = _run_on_machine(m, ["sh", "-lc", update_script])
+        results.append((m["name"], rc, out))
+    return results

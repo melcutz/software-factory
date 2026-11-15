@@ -121,7 +121,7 @@ If a job exhausts its retry budget or hits `BLOCKED`, it transitions to `needs-h
 | `factory resume` | Clear global halt and allow workers to resume |
 | `factory pause [--drain]` | Pause new job claims on the current machine |
 | `factory unpause` | Resume job claims on the current machine |
-| `factory fleet {status,wake,pause,unpause} [machine]` | Discover and control peer machines via `hc machine ls` / `hc run --on` |
+| `factory fleet {status,wake,pause,unpause,update} [machine]` | Discover, update, and control peer machines via `hc machine ls` / `hc run --on` |
 | `factory init-board` | Create a generic `"Factory"` GitHub ProjectV2 board (`Status` + `Priority`) |
 | `factory gate <job-id>` | Run protected-path and `factory/checks.sh` verification on a worktree |
 | `factory doctor` | Validate Python, `git`, `gh`, `agy`, `config.json`, `checks.sh`, and `.gitignore` |

@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 from factory.lib.config import load_config
-from factory.lib.fleet import fleet_pause, fleet_status, fleet_unpause, fleet_wake
+from factory.lib.fleet import fleet_pause, fleet_status, fleet_unpause, fleet_update, fleet_wake
 from factory.lib.gate_runner import run_gate
 from factory.lib.git_ops import GitHubClient
 from factory.lib.git_state import GitStateStore
@@ -148,7 +148,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("unpause", parents=[repo_flags], help="Resume job claims on this machine")
 
     p_fleet = sub.add_parser("fleet", parents=[repo_flags], help="Manage peer machines via hc machine")
-    p_fleet.add_argument("action", choices=["status", "wake", "pause", "unpause"], help="Fleet action")
+    p_fleet.add_argument("action", choices=["status", "wake", "pause", "unpause", "update"], help="Fleet action")
     p_fleet.add_argument("machine", nargs="?", help="Optional target machine name")
     p_fleet.add_argument("--drain", action="store_true", help="Drain active jobs when pausing")
 
@@ -207,6 +207,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.action == "unpause":
             for name, rc, out in fleet_unpause(args.machine):
+                print(f"{name}: rc={rc} {out}".strip())
+            return 0
+        if args.action == "update":
+            for name, rc, out in fleet_update(args.machine):
                 print(f"{name}: rc={rc} {out}".strip())
             return 0
         return 1
