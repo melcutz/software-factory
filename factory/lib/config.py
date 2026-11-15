@@ -24,7 +24,7 @@ DEFAULT_CONFIG: dict = {
     "max_slice_retries": 2,
     "agent_timeout_sec": 900,
     "gate_timeout_sec": 600,
-    "idle_bg_grace_sec": 45,
+    "idle_bg_grace_sec": 600,
     "auto_polish": True,
     "auto_approve_clean": True,
     "base_branch": "main",
