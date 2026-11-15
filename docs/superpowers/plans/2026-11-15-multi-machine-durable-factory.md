@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn `software-factory-agy` into a durable, multi-machine autonomous factory using Git-native `refs/factory/*` coordination, Herdr-native live visibility/intervention, a global kill switch (`factory halt`/`resume`), and a polite host/LLM quota governor.
+**Goal:** Turn `software-factory-agy` into a durable, multi-machine autonomous factory using Git-native `refs/factory/*` coordination, `herdr-core` (`hc`) + `herdr-app` live visibility/intervention (OSC 7501 + `hc run --bg`), a global kill switch (`factory halt`/`resume`), and a polite host/LLM quota governor.
 
-**Architecture:** Peer machines run `factory worker --all` inside Herdr without any central coordinator server. All leases, checkpoints, locks, DAG cache, halt control, and 429 quota cooldowns live in orphan Git commits under `refs/factory/*` updated via `--force-with-lease`.
+**Architecture:** Peer machines run `factory worker --all` inside `herdr-core` (`hc`) without any central coordinator server (falling back to local threads/subprocesses in plain terminals). All leases, checkpoints, locks, DAG cache, halt control, and 429 quota cooldowns live in orphan Git commits under `refs/factory/*` updated via `--force-with-lease`.
 
-**Tech Stack:** Python 3.12 (`stdlib` only: `subprocess`, `json`, `hashlib`, `threading`, `socket`, `dataclasses`, `argparse`), Git plumbing, `gh` CLI, Herdr CLI (`$HERDR_BIN_PATH`), `pytest`.
+**Tech Stack:** Python 3.12 (`stdlib` only: `subprocess`, `json`, `hashlib`, `threading`, `socket`, `dataclasses`, `argparse`), Git plumbing, `gh` CLI, `herdr-core` (`hc`) + OSC 7501, `pytest`.
 
 **Spec:** `docs/superpowers/specs/2026-11-15-multi-machine-durable-factory-design.md`
 
@@ -17,7 +17,7 @@
 - Never push mid-build slice checkpoints to `refs/heads/factory/job-<N>` (use `refs/factory/checkpoints/job-<N>`) so private-repo GitHub Actions minutes are not consumed.
 - Worker heartbeats use one ref per machine (`refs/factory/workers/<machine_id>`, 120s interval, 360s TTL, +60s skew buffer for takeover = 420s).
 - `factory halt` must never increment `round`, `qa_round`, or escalate an issue to `needs-human`.
-- Outside `HERDR_ENV=1`, all Herdr calls must be fast no-ops so standalone CLI and `pytest` continue working identically.
+- When `$HC_TERMINAL_ID` is unset (plain terminal, CI, `pytest`), `HerdrBridge` must fall back cleanly without invoking `hc` or failing.
 
 ## Review Focus
 
@@ -25,7 +25,7 @@
 - **Empty / initial repo without `refs/factory/*`:** `claim_job_lease` when `refs/factory/jobs/job-<N>` does not yet exist on `origin` must pass `0000000000000000000000000000000000000000` (40 zeros) as expected old SHA to `--force-with-lease`.
 - **Halt during `deploy_to_staging`:** Without `--force`, a worker inside `deploy_to_staging` must finish the deploy/rollback atomically before honoring `halt` and checkpointing, whereas `--force` interrupts immediately.
 - **Quota backoff reset:** A `429` sets `consecutive_429s=1` (`120s`), escalating `300s -> 900s -> 3600s` max, and the first successful `agy` call for that base model clears its cooldown entry.
-- **Non-Herdr execution:** Running `factory worker --all` or `factory run` without `HERDR_ENV=1` must execute jobs in local worker threads without raising or invoking `herdr`.
+- **Non-Herdr execution:** Running `factory worker --all` or `factory run` without `$HC_TERMINAL_ID` must execute jobs in local worker threads/subprocesses without raising or invoking `hc`.
 
 ---
 
@@ -292,71 +292,69 @@ git commit -m "feat(pipeline): wire distributed leases, slice checkpoints, halt/
 
 ---
 
-### Task 3: Herdr Self-Reporting Bridge & Ephemeral Job Tabs (`factory/lib/herdr_bridge.py`)
+### Task 3: `herdr-core` (`hc`) Bridge & OSC 7501 Status Protocol (`factory/lib/herdr_bridge.py`)
 
 **Files:**
 - Create: `factory/lib/herdr_bridge.py`
 - Test: `tests/test_worker_and_herdr.py`
 
 **Interfaces:**
-- Consumes: `HERDR_ENV`, `HERDR_BIN_PATH`, `HERDR_PANE_ID`, `HERDR_WORKSPACE_ID` env vars
+- Consumes: `HC_TERMINAL_ID` env var, `hc` binary (`shutil.which("hc")` or `HC_BIN_PATH` override for tests)
 - Produces:
   - `HerdrBridge.from_env() -> HerdrBridge`
   - `HerdrBridge.enabled -> bool`
-  - `HerdrBridge.report_agent(source: str, agent: str, state: str, *, message: str = "", resume_argv: list[str] | None = None) -> None`
-  - `HerdrBridge.report_metadata(source: str, agent: str, *, display_agent: str = "", state_label_pair: tuple[str, str] | None = None, title: str = "") -> None`
-  - `HerdrBridge.release_agent(source: str, agent: str) -> None`
-  - `HerdrBridge.spawn_job_tab(title: str, cwd: str, cmd: list[str]) -> str | None`
-  - `HerdrBridge.close_tab(tab_id: str | None) -> None`
+  - `HerdrBridge.emit_status(state: str, *, kind: str = "", progress: int | None = None) -> None` (emits OSC 7501 `\033]7501;state=...[:kind=...][:progress=...]\033\\` to `sys.stdout` when `enabled`)
+  - `HerdrBridge.spawn_job_terminal(name: str, cwd: str, cmd: list[str]) -> str | None` (`hc run --bg --name <name> --cwd <cwd> -- <cmd...>`)
+  - `HerdrBridge.list_terminals() -> list[str]` (`hc ls`)
 
 - [ ] **Step 1: Write the failing tests in `tests/test_worker_and_herdr.py`**
 
 ```python
-import os
+import io
 import sys
 
 from factory.lib.herdr_bridge import HerdrBridge
 
 
-def test_herdr_bridge_noop_outside_herdr(monkeypatch):
-    monkeypatch.delenv("HERDR_ENV", raising=False)
-    bridge = HerdrBridge.from_env()
+def test_herdr_bridge_noop_outside_hc(monkeypatch):
+    monkeypatch.delenv("HC_TERMINAL_ID", raising=False)
+    buf = io.StringIO()
+    bridge = HerdrBridge.from_env(stream=buf)
     assert bridge.enabled is False
-    bridge.report_agent("factory:worker", "factory-worker", "working")
-    assert bridge.spawn_job_tab("repo#1", "/tmp", ["echo", "hi"]) is None
+    bridge.emit_status("working", progress=50)
+    assert buf.getvalue() == ""
+    assert bridge.spawn_job_terminal("repo-1", "/tmp", ["echo", "hi"]) is None
 
 
-def test_herdr_bridge_reports_monotonic_seq_and_metadata(tmp_path, monkeypatch):
-    log_file = tmp_path / "herdr_calls.log"
-    fake_bin = tmp_path / "herdr"
+def test_herdr_bridge_osc7501_and_spawn_job_terminal(tmp_path, monkeypatch):
+    log_file = tmp_path / "hc_calls.log"
+    fake_bin = tmp_path / "hc"
     fake_bin.write_text(
         f"#!{sys.executable}\n"
-        "import json, sys\n"
+        "import sys\n"
         f"with open({str(log_file)!r}, 'a') as f:\n"
         "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
-        "if sys.argv[1:3] == ['tab', 'create']:\n"
-        "    print(json.dumps({'result': {'tab': {'tab_id': 'w1:t9'}, 'root_pane': {'pane_id': 'w1:p9'}}}))\n",
+        "if sys.argv[1:2] == ['run']:\n"
+        "    print('t9')\n",
         encoding="utf-8",
     )
     fake_bin.chmod(0o755)
-    monkeypatch.setenv("HERDR_ENV", "1")
-    monkeypatch.setenv("HERDR_BIN_PATH", str(fake_bin))
-    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
-    monkeypatch.setenv("HERDR_WORKSPACE_ID", "w1")
+    monkeypatch.setenv("HC_TERMINAL_ID", "t1")
+    monkeypatch.setenv("HC_BIN_PATH", str(fake_bin))
 
-    bridge = HerdrBridge.from_env()
+    buf = io.StringIO()
+    bridge = HerdrBridge.from_env(stream=buf)
     assert bridge.enabled is True
-    bridge.report_agent("factory:worker", "factory-worker", "working", resume_argv=["factory", "worker", "--all"])
-    bridge.report_metadata("factory:worker", "factory-worker", display_agent="Factory (1/2)", state_label_pair=("working", "1 active"))
-    tab_id = bridge.spawn_job_tab("repo#5", str(tmp_path), ["factory", "_exec-job", "5"])
-    assert tab_id == "w1:t9"
-    bridge.close_tab(tab_id)
+    bridge.emit_status("working", progress=40)
+    bridge.emit_status("blocked", kind="question")
+    tid = bridge.spawn_job_terminal("repo-5", str(tmp_path), ["factory", "_exec-job", "5"])
+    assert tid == "t9"
 
+    out = buf.getvalue()
+    assert "\033]7501;state=working:progress=40\033\\" in out
+    assert "\033]7501;state=blocked:kind=question\033\\" in out
     lines = log_file.read_text().splitlines()
-    assert any("pane report-agent w1:p1" in ln and "-- factory worker --all" in ln for ln in lines)
-    assert any("pane report-metadata w1:p1" in ln and "--display-agent Factory (1/2)" in ln for ln in lines)
-    assert any("tab create --workspace w1" in ln for ln in lines)
-    assert any("tab close --tab w1:t9" in ln for ln in lines)
+    assert any(ln.startswith("run --bg --name repo-5") and "-- factory _exec-job 5" in ln for ln in lines)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -366,7 +364,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'factory.lib.herdr_bri
 
 - [ ] **Step 3: Implement `factory/lib/herdr_bridge.py`**
 
-Implement `HerdrBridge` with `threading.Lock`-protected monotonic `--seq` counter, `timeout=3.0` subprocess invocations (swallowing errors cleanly so Herdr hiccups never crash jobs), and no-op fallback when `HERDR_ENV != "1"`.
+Implement `HerdrBridge` with `threading.Lock`-protected OSC 7501 writes (`emit_status`), `timeout=5.0` `hc run --bg` spawning (swallowing errors cleanly so `hc` hiccups never crash jobs), and no-op fallback when `HC_TERMINAL_ID` is unset.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -377,7 +375,7 @@ Expected: PASS (2 passed)
 
 ```bash
 git add factory/lib/herdr_bridge.py tests/test_worker_and_herdr.py
-git commit -m "feat(herdr): add HerdrBridge self-reporting agent state, metadata, and tab helpers"
+git commit -m "feat(herdr): add HerdrBridge for hc background terminals and OSC 7501 status"
 ```
 
 ---
@@ -406,7 +404,7 @@ Add tests asserting:
 1. `select_next_candidate` orders Tier 1 (own interrupted/halted jobs) before Tier 2 (peer orphaned jobs) before Tier 3 (fresh DAG-ready issues), and two different `machine_id`s pick different tie-broken issues for Tier 3.
 2. Spread-first pacing enforces `ramp_up_delay_sec` between claims (`_next_claim_allowed_at`).
 3. `factory pause` / `factory unpause` toggles `~/.config/factory/paused` (overridable via `FACTORY_HOST_DIR` for tests).
-4. `fleet_wake` reads `herdr machine list --json` and invokes `ssh -o BatchMode=yes` on enabled targets.
+4. `fleet_wake` reads `hc machine ls` (plus optional `fleet.json` fallback) and invokes `hc run --on <machine> --bg --name ... -- factory worker --all`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -415,9 +413,9 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'factory.lib.worker'`
 
 - [ ] **Step 3: Implement `factory/lib/worker.py`, `factory/lib/fleet.py`, and CLI subcommands in `factory/cli.py`**
 
-- `worker.py`: startup `run_doctor` filtering per repo, background 120s worker heartbeat + 20s `refs/factory/control` watcher + 24h `prune_stale_refs`, spread-first poll loop claiming at most 1 job per `ramp_up_delay_sec`, spawning Herdr job tab (`_exec-job`) when inside Herdr or local thread outside Herdr, and releasing leases cleanly on `SIGTERM`/`SIGINT`/`pause --drain`.
-- `exec_job_command`: runs `process_job` with `HerdrBridge`, closes tab on terminal/halted stages, or reports `--state blocked` and leaves interactive shell in `.worktrees/job-<N>` on `needs-human`.
-- `fleet.py`: wraps `herdr machine list --json` + `ssh -o BatchMode=yes` for `wake`, `pause`, `unpause`, and `status`.
+- `worker.py`: startup `run_doctor` filtering per repo, background 120s worker heartbeat + 20s `refs/factory/control` watcher + 24h `prune_stale_refs`, spread-first poll loop claiming at most 1 job per `ramp_up_delay_sec`, spawning an `hc run --bg` child terminal (`_exec-job`) when `$HC_TERMINAL_ID` is set or a local thread outside `hc`, and releasing leases cleanly on `SIGTERM`/`SIGINT`/`pause --drain`.
+- `exec_job_command`: runs `process_job` with `HerdrBridge`, emits OSC 7501 `state=done` on terminal/halted stages and exits cleanly, or emits OSC 7501 `state=blocked:kind=question` and leaves an interactive rescue shell in `.worktrees/job-<N>` on `needs-human`.
+- `fleet.py`: wraps `hc machine ls` + `hc run --on <machine>` (with optional `fleet.json` / `ssh` fallback) for `wake`, `pause`, `unpause`, and `status`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -468,7 +466,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'factory.lib.governor'
 - `governor.py`: cross-platform Linux/WSL2 (`/proc/meminfo`) and macOS (`vm_stat`) probe + `check_host_admission`.
 - `agy_runner.py`: detect rate-limit / `429` / `RESOURCE_EXHAUSTED` / `quota exceeded` patterns in stderr/stdout/JSON envelope and raise `QuotaExhaustedError(model_spec, retry_after_sec)` immediately; on success, notify caller so `clear_quota_cooldown(base_model)` runs.
 - `pipeline.py`: between build slices, check `check_host_admission`; if host stays busy > 60s, checkpoint and release lease (`activity="yielded: host busy"`). On `QuotaExhaustedError`, record shared cooldown in `refs/factory/quota` (mirrored to registered repos) and release lease cleanly.
-- `worker.py`: gate new claims on `check_host_admission` and `refs/factory/quota` cooldowns, updating Herdr sidebar label when throttled or in quota cooldown.
+- `worker.py`: gate new claims on `check_host_admission` and `refs/factory/quota` cooldowns, emitting OSC 7501 `state=idle` and logging when throttled or in quota cooldown.
 
 - [ ] **Step 4: Run full `pytest` suite**
 

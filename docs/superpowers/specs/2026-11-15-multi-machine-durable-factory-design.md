@@ -12,7 +12,7 @@ Transform `software-factory-agy` from a single-machine, one-shot CLI (`factory r
 
 ### Core Goals
 1. **Zero Central Infrastructure:** No central coordinator server, daemon, message broker, or cloud database to host or maintain. All cross-machine coordination uses **native Git refs (`refs/factory/*`) with atomic `--force-with-lease` Compare-And-Swap** on GitHub.
-2. **Homelab-First Visibility & Intervention via Herdr:** Each machine runs `factory worker --all` inside **Herdr** (`herdr.dev`), reporting live semantic state (`working`, `idle`, `blocked`), custom progress labels, and native session-restore commands (`pane report-agent` / `pane report-metadata`). From a single Herdr window on any machine, an operator sees every machine's active jobs, receives desktop notifications on `needs-human`, and attaches directly into any remote job's worktree.
+2. **Homelab-First Visibility & Intervention via Herdr (`herdr-app` + `herdr-core`):** Each machine runs `factory worker --all` inside **`herdr-core` (`hc`)**, emitting native **OSC 7501** status sequences (`working`, `idle`, `blocked`, `done`, `progress`) and spawning job workers as background child terminals (`hc run --bg`). From **`herdr-app`** (or `hc` in any terminal), an operator sees every local and remote machine's active jobs in the Agents sidebar, receives desktop notifications on `needs-human`, and clicks to **peek** or attach directly into any remote job's worktree.
 3. **Mid-Job Crash Recovery:** Checkpoints job metadata and completed TDD slices to Git (`refs/factory/jobs/*` and `refs/factory/checkpoints/*`) so if a machine powers off or drops offline after Slice 2/4, another machine reclaims the expired lease and resumes directly at Slice 3/4.
 4. **Global Kill Switch (`factory halt` / `factory resume`):** An emergency brake that grinds the entire fleet to a halt within seconds, cleanly terminates in-flight `agy` / gate subprocesses without burning retry rounds or escalating to `needs-human`, saves slice checkpoints, and resumes seamlessly later.
 5. **Polite Shared-Machine Resource & Quota Governance:** Dynamically yields when a human is actively taxing CPU/RAM on a machine, spreads small issue batches evenly across idle machines instead of hogging one host, and turns LLM `429` / quota errors into shared fleet-wide cooldowns rather than job failures.
@@ -30,22 +30,22 @@ The design is cohesive end-to-end and implemented in three ordered, independentl
 
 1. **Phase 1 — Git-Native Distributed Leases, Checkpoints, Locks & Kill Switch (`factory/lib/git_state.py`)**  
    Replaces local-only coordination with atomic `refs/factory/*` leases, per-machine heartbeats, slice-level crash checkpoints, cross-machine staging locks, `factory halt` / `factory resume`, and fleet-wide `factory status`.
-2. **Phase 2 — Herdr-Native Worker, Spread-First Scheduler & Fleet CLI (`factory/lib/herdr_bridge.py`, `factory/lib/worker.py`, `factory/lib/fleet.py`)**  
-   Continuous competing-consumer `factory worker --all` loop with spread-first pacing, warm-worktree affinity, ephemeral per-job Herdr tabs, interactive `needs-human` rescue panes, local `factory pause` / `unpause`, and `factory fleet` SSH helpers.
+2. **Phase 2 — `herdr-core` (`hc`) Worker, Spread-First Scheduler & Fleet CLI (`factory/lib/herdr_bridge.py`, `factory/lib/worker.py`, `factory/lib/fleet.py`)**  
+   Continuous competing-consumer `factory worker --all` loop with spread-first pacing, warm-worktree affinity, `hc run --bg` child job terminals with OSC 7501 status reporting (plus plain-terminal fallback when `$HC_TERMINAL_ID` is unset), interactive `needs-human` rescue shells, local `factory pause` / `unpause`, and `factory fleet` wrapping `hc machine`.
 3. **Phase 3 — Homelab-Polite Resource & Shared LLM Quota Governor (`factory/lib/governor.py`, `factory/lib/agy_runner.py`)**  
    Host CPU/RAM admission checks before job claims and between slices, plus `QuotaExhaustedError` detection and shared exponential backoff via `refs/factory/quota`.
 
 ```mermaid
 flowchart TD
-    subgraph MachineA["Homelab Machine A (Herdr Session)"]
-        WA["Controller Pane: factory worker --all"]
-        JA1["Job Tab: keepfor-cloud#620 (slice 2/4)"]
+    subgraph MachineA["Homelab Machine A (herdr-core / hc)"]
+        WA["Controller Terminal: factory worker --all"]
+        JA1["Child Terminal (hc run --bg): keepfor-cloud-620"]
         WA -->|spawns / monitors| JA1
     end
 
-    subgraph MachineB["Homelab Machine B (Herdr Session)"]
-        WB["Controller Pane: factory worker --all"]
-        JB1["Job Tab: keepfor-cloud#621 (review)"]
+    subgraph MachineB["Homelab Machine B (herdr-core / hc)"]
+        WB["Controller Terminal: factory worker --all"]
+        JB1["Child Terminal (hc run --bg): keepfor-cloud-621"]
         WB -->|spawns / monitors| JB1
     end
 
@@ -167,7 +167,7 @@ Machines operate as peer **competing consumers** governed by `~/.config/factory/
 
 | Command | Scope | Mechanism & Effect |
 | :--- | :--- | :--- |
-| `factory halt [--reason TEXT] [--force]` | **Entire Fleet** (all machines & repos) | 1. Writes `halted=true` to `refs/factory/control` on all target repos.<br>2. Writes local `~/.config/factory/halt.signal` and sends non-interactive SSH signal to reachable Herdr machines for sub-second response.<br>3. Active jobs terminate `agy` / `checks.sh` immediately (unless mid-`deploy_to_staging` without `--force`, which finishes/rolls back atomically first), run `reset_worktree_clean`, push last completed slice to `refs/factory/checkpoints/job-<N>`, CAS-update `refs/factory/jobs/job-<N>` with `lease=null, activity="halted"` (**no round/retry increment, no `needs-human` escalation**), and close ephemeral job tabs.<br>4. Controller panes park in `idle ("HALTED: <reason>")`. |
+| `factory halt [--reason TEXT] [--force]` | **Entire Fleet** (all machines & repos) | 1. Writes `halted=true` to `refs/factory/control` on all target repos.<br>2. Writes local `~/.config/factory/halt.signal` and sends non-interactive signal to reachable `hc` / SSH machines for sub-second response.<br>3. Active jobs terminate `agy` / `checks.sh` immediately (unless mid-`deploy_to_staging` without `--force`, which finishes/rolls back atomically first), run `reset_worktree_clean`, push last completed slice to `refs/factory/checkpoints/job-<N>`, CAS-update `refs/factory/jobs/job-<N>` with `lease=null, activity="halted"` (**no round/retry increment, no `needs-human` escalation**), and let background `hc` child terminals exit cleanly.<br>4. Controller terminals emit OSC 7501 `state=idle` (`"HALTED: <reason>"`). |
 | `factory resume` | **Entire Fleet** | Writes `halted=false` to `refs/factory/control`, clears local/remote halt signals, and pokes reachable workers to poll immediately and resume saved jobs. |
 | `factory pause [--drain]` | **Single Machine** | Writes `~/.config/factory/paused`. Default stops claiming new jobs while finishing in-flight jobs; `--drain` aborts current `agy` steps at the last clean slice and releases leases (`lease=null`) so other machines pick them up immediately. |
 | `factory unpause` | **Single Machine** | Removes `~/.config/factory/paused` and triggers an immediate poll on this machine. |
@@ -176,25 +176,24 @@ Workers also check `refs/factory/control` via lightweight `git ls-remote` every 
 
 ---
 
-### 3.4 Herdr-Native Runtime & Fleet CLI (`herdr_bridge.py`, `fleet.py`)
+### 3.4 `herdr-core` (`hc`) Runtime, OSC 7501 & Fleet CLI (`herdr_bridge.py`, `fleet.py`)
 
-#### First-Class Self-Reporting Protocol (`factory/lib/herdr_bridge.py`)
-- Active only when `os.environ.get("HERDR_ENV") == "1"` and `HERDR_BIN_PATH` + `HERDR_PANE_ID` are set; otherwise all methods are fast no-ops (preserving standalone CLI & `pytest` behavior).
-- Uses monotonic millisecond `--seq`, `timeout=3s`, and background/best-effort execution so Herdr IPC never blocks or crashes the pipeline.
-- **Controller Pane (`factory worker --all`):**
-  - Reports `pane report-agent "$HERDR_PANE_ID" --source factory:worker --agent factory-worker --state working|idle -- factory worker --all` so Herdr's default `resume_agents_on_restore = true` automatically restarts the worker when a Herdr session restores.
-  - Updates `pane report-metadata` with `--display-agent "Factory (<active>/<max>)"` and `--state-label` (`"2 running"`, `"idle (queue empty)"`, `"paused"`, `"throttled (CPU 84%)"`, `"HALTED"`).
-- **Ephemeral Job Tabs (`factory _exec-job --repo <repo> <issue>`):**
-  - When running inside Herdr, `factory worker` spawns a background tab in `$HERDR_WORKSPACE_ID` (`herdr tab create --workspace "$HERDR_WORKSPACE_ID" --title "<repo>#<issue>" --cwd "<repo>" --no-focus`) and starts `factory _exec-job` inside its root pane (outside Herdr, `factory worker` runs `_exec-job` in a local worker thread/subprocess).
-  - Job pane reports `--source factory:job --agent factory-job`, `--display-agent "<repo>#<issue>"`, and updates `--state-label working="round 1 | slice 2/4 (builder)"` at every stage/slice transition.
-  - **Clean Completion (`merged`, `ready`, `rejected`, `needs-info`, `halted`):** Calls `pane release-agent` and `herdr tab close` on its own tab so completed jobs never clutter the sidebar.
-  - **Human Intervention (`needs-human`):** Calls `pane report-agent ... --state blocked --message "<concise error>"` (illuminating the red **Blocked** badge in Herdr's cross-machine sidebar and triggering Herdr's native desktop notification/sound), prints the worktree path + escalation details, and leaves an interactive rescue shell in `.worktrees/job-<N>`.
+#### OSC 7501 Status Protocol & Background Child Terminals (`factory/lib/herdr_bridge.py`)
+- Detects `herdr-core` when `os.environ.get("HC_TERMINAL_ID")` is set (and resolves `hc` via `shutil.which("hc")`). Outside `hc` (plain terminal, CI, `pytest`), spawning falls back to local subprocesses/threads and OSC 7501 emission is suppressed unless explicitly enabled.
+- **Zero-IPC Status Reporting (OSC 7501):** Emits `ESC ] 7501 ; state=<state>[:kind=<kind>][:progress=<0-100>] ESC \` directly to stdout/PTY—zero subprocess overhead, works identically across local PTYs, remote SSH (`hc machine`), and `herdr-app`:
+  - **Controller Terminal (`factory worker --all`):** Emits `state=working` while claiming/running jobs and `state=idle` when the queue is empty, paused, throttled, or `HALTED`, plus concise terminal title / log lines (`"Factory (1/2) — running"`).
+  - **Job Child Terminals (`factory _exec-job --repo <repo> <issue>`):**
+    - When inside `hc`, `factory worker` spawns each job as a background child terminal: `hc run --bg --name "<repo>-<issue>" --cwd "<repo>" -- factory _exec-job --repo "<repo>" <issue>` (outside `hc`, runs `_exec-job` in a local worker thread/subprocess).
+    - `herdr-app` automatically surfaces all child terminals in its **Agents sidebar** (**Working / Blocked / Done / Idle**) and opens any background job in **peek** on click—no UI tab-creation/closing plumbing needed.
+    - `_exec-job` emits OSC 7501 `state=working:progress=<pct>` at each stage/slice transition.
+    - **Clean Completion (`merged`, `ready`, `rejected`, `needs-info`, `halted`):** Emits OSC 7501 `state=done` (or `state=clear`) and exits `0` cleanly.
+    - **Human Intervention (`needs-human`):** Emits OSC 7501 `state=blocked:kind=question` (moving the terminal into `herdr-app`'s **Blocked** group and triggering notifications), prints the worktree path + escalation details, and leaves an interactive rescue shell in `.worktrees/job-<N>`.
 
 #### Fleet CLI (`factory fleet`) & Global `factory status`
 - **`factory fleet status | wake | pause | unpause`:**
-  - Discovers peer hosts from `herdr machine list --json` (supplemented by optional `~/.config/factory/fleet.json` SSH targets).
-  - `factory fleet wake`: Runs `ssh -o BatchMode=yes <target>` over Tailscale to ensure `herdr` has a `factory` workspace running `factory worker --all` (solving cold-start after an unattended OS reboot).
-  - `factory fleet pause [<machine>]` / `unpause [<machine>]`: Invokes `factory pause` / `factory unpause` locally or on the specified SSH target(s).
+  - Discovers peer hosts from `hc machine ls` (supplemented by optional `~/.config/factory/fleet.json` targets, supporting both SSH targets and Windows WSL `--via 'wsl.exe ...'` machines).
+  - `factory fleet wake`: Ensures `factory worker --all` is running on each machine via `hc run --on <machine> --bg --name "factory-worker-<machine>" -- factory worker --all` (or `hc ls` check to avoid duplicates), solving cold-start after an unattended OS reboot.
+  - `factory fleet pause [<machine>]` / `unpause [<machine>]`: Invokes `factory pause` / `factory unpause` locally or on the specified machine via `hc run --on <machine>` (or SSH fallback).
 - **`factory status [--all]`:**
   - Fetches `refs/factory/control`, `refs/factory/workers/*`, `refs/factory/quota`, and `refs/factory/jobs/*` (falling back to local `factory/jobs/` for legacy history) and prints:
     1. Fleet banner (`RUNNING` vs `HALTED`, active quota cooldowns, live connected machines with `slots`, `CPU%`, `free RAM`, `state`).
@@ -229,7 +228,7 @@ Workers also check `refs/factory/control` via lightweight `git ls-remote` every 
 
 ## 5. Verification & Testing Strategy
 
-All automated tests run offline in `pytest` using temporary bare Git repositories (`tmp_path / "origin.git"`) and mocked `HERDR_BIN_PATH` / SSH / `agy` executables:
+All automated tests run offline in `pytest` using temporary bare Git repositories (`tmp_path / "origin.git"`) and mocked `hc` / SSH / `agy` executables:
 
 1. **`tests/test_git_state.py` (Phase 1):**
    - Concurrent multi-thread `--force-with-lease` races on `claim_job_lease` and `acquire_staging_lock` verifying exactly 1 winner and monotonic `fencing_token`.
@@ -240,8 +239,8 @@ All automated tests run offline in `pytest` using temporary bare Git repositorie
 2. **`tests/test_worker_and_herdr.py` (Phase 2):**
    - Spread-first scheduler distributing 3 issues `1-1-1` across 3 simulated workers instead of `3-0-0`.
    - Warm-worktree affinity preferring `last_worker_id` when online and immediate peer takeover when `last_worker_id` is paused/offline.
-   - Mock `HERDR_BIN_PATH` script recording `pane report-agent`, `pane report-metadata`, `tab create`, `tab close` on merge, and `--state blocked` preservation on `needs-human`.
-   - `factory fleet` command construction over mocked `herdr machine list --json` and `ssh`.
+   - Mock `hc` binary recording `hc run --bg --name ...`, OSC 7501 sequences (`state=working`, `state=done`, `state=blocked:kind=question` on `needs-human`), and plain-terminal fallback when `HC_TERMINAL_ID` is unset.
+   - `factory fleet` command construction over mocked `hc machine ls` and `hc run --on <machine>`.
 3. **`tests/test_governor_and_quota.py` (Phase 3):**
    - Host CPU/RAM parser tests (Linux `/proc/meminfo` + macOS `vm_stat` fixtures) blocking claims and yielding between slices when thresholds are exceeded.
    - `QuotaExhaustedError` classification in `agy_runner.py` and shared `refs/factory/quota` exponential backoff across two simulated workers without escalating jobs to `needs-human`.
