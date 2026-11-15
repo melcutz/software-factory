@@ -11,7 +11,7 @@ import sys
 import time
 from datetime import datetime
 
-from factory.lib.agy_runner import AgentExecutionError, run_agent
+from factory.lib.agy_runner import AgentExecutionError, resolve_agent_path, run_agent
 from factory.lib.config import (
     estimate_usage_cost_usd,
     load_config,
@@ -1202,10 +1202,10 @@ def _plan_queue_batch(
     issues: list[dict],
 ) -> tuple[dict[int, set[int]], dict[int, set[int]]]:
     """Build `(order_deps, hard_deps)` DAGs for a batch of issues using explicit refs + optional LLM planner."""
-    planner_agent_path = os.path.join(factory_dir, "agents", "planner.md")
+    planner_agent_path = resolve_agent_path(factory_dir, "planner")
 
     def _run_planner(batch: list[dict]) -> dict:
-        if not os.path.isfile(planner_agent_path):
+        if not planner_agent_path:
             return {}
         models = cfg.get("models") or {}
         planner_model = models.get("planner") or models.get("intake", "")

@@ -23,17 +23,29 @@ _SUBPROCESS_TIMEOUT_GRACE_SEC = 30
 _DEFAULT_IDLE_BG_GRACE_SEC = 600.0
 _IDLE_BG_RE = re.compile(r"root agent idle;\s*waiting up to .* background task", re.IGNORECASE)
 _ORIG_SUBPROCESS_RUN = subprocess.run
+ENGINE_FACTORY_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class AgentExecutionError(RuntimeError):
     """Raised when `agy -p` fails or violates stage constraints after retry."""
 
 
+def resolve_agent_path(factory_dir: str, agent_name: str) -> str | None:
+    """Return per-repo agent prompt path if present, else the built-in engine prompt path."""
+    for base in (factory_dir, ENGINE_FACTORY_DIR):
+        candidate = os.path.join(base, "agents", f"{agent_name}.md")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 def load_agent_instructions(factory_dir: str, agent_name: str) -> str:
-    """Read factory/agents/<agent_name>.md, stripping YAML frontmatter."""
-    path = os.path.join(factory_dir, "agents", f"{agent_name}.md")
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Agent definition not found: {path}")
+    """Read factory/agents/<agent_name>.md (per-repo override or engine default), stripping YAML frontmatter."""
+    path = resolve_agent_path(factory_dir, agent_name)
+    if not path:
+        raise FileNotFoundError(
+            f"Agent definition not found for {agent_name!r} in {factory_dir} or {ENGINE_FACTORY_DIR}"
+        )
     with open(path, encoding="utf-8") as f:
         content = f.read()
     if content.startswith("---"):

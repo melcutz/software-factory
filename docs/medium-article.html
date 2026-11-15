@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Medium Copy-Paste Ready: Autonomous Software Factory</title>
+  <style>
+    body { font-family: Georgia, Cambria, "Times New Roman", Times, serif; max-width: 720px; margin: 40px auto; padding: 0 20px; color: #242424; line-height: 1.65; font-size: 18px; }
+    .toolbar { position: sticky; top: 0; background: #fff; border-bottom: 1px solid #e5e5e5; padding: 12px 0; margin-bottom: 24px; display: flex; gap: 12px; align-items: center; font-family: system-ui, -apple-system, sans-serif; font-size: 14px; }
+    button { background: #1a8917; color: #fff; border: 0; border-radius: 999px; padding: 8px 18px; font-size: 14px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #156d12; }
+    #status { color: #555; }
+    h1 { font-family: system-ui, -apple-system, sans-serif; font-size: 34px; line-height: 1.2; margin-bottom: 12px; }
+    h2 { font-family: system-ui, -apple-system, sans-serif; font-size: 24px; margin-top: 36px; }
+    h3 { font-family: system-ui, -apple-system, sans-serif; font-size: 20px; margin-top: 28px; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.85em; background: #f2f2f2; padding: 2px 5px; border-radius: 3px; }
+    hr { border: 0; border-top: 1px solid #ddd; margin: 32px 0; }
+    li { margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button onclick="copyForMedium()">Copy Article for Medium</button>
+    <span id="status">Or select the article below and press Ctrl+C, then paste directly into Medium.</span>
+  </div>
+  <article id="article">
+<h1>Building an Autonomous Software Factory: Why 66% of Our Wait Time Wasn't LLMs (and How We Cut PR Cost 35x)</h1>
+<p><em>Lessons, telemetry, and production war stories from shipping 29 multi-file PRs autonomously on a live SaaS codebase.</em></p>
+<p>Most conversations about AI coding agents obsess over prompts, context windows, and which frontier model writes slightly cleaner Python.</p>
+<p>When we built an autonomous software factory (<a href="https://github.com/melcutz/software-factory-agy"><code>software-factory-agy</code></a>) and pointed it at a real production SaaS codebase (<code>keepfor-cloud</code> -- a multi-tenant FastAPI + Cloudflare Python Workers + D1 + Queues + Stripe + Workers AI app with 3,264 tests and 8 CI invariant gates), <strong>the bottlenecks that actually mattered had almost nothing to do with prompt engineering.</strong></p>
+<p>Across <strong>36 queued GitHub issues</strong>, the factory shipped <strong>29 merged multi-file PRs (70 vertical slices)</strong>, rejected 1 out-of-scope issue cleanly in 25 seconds for <code>$0.00</code>, and processed <strong>217.2M tokens</strong> across <strong>10.45 hours</strong> of cumulative model time.</p>
+<p>Here is what the numbers taught us -- and the 10 hard-won engineering lessons that turned a fragile prototype into an unattended delivery pipeline.</p>
+<hr>
+<h2>The Architecture in 60 Seconds</h2>
+<p>Every GitHub issue moves through a gated state machine inside an isolated <code>git worktree</code>:</p>
+<ol>
+  <li><strong>Intake &amp; Spec:</strong> Triage the issue (<code>rejected</code> / <code>needs-human</code> / <code>proceed</code>), classify risk (<code>low</code> / <code>medium</code> / <code>high</code>), and slice it into vertical deliverables (<code>spec.json</code>).</li>
+  <li><strong>Vertical-Slice Build:</strong> Implement one slice at a time and pass the deterministic CI gate (<code>checks.sh</code>).</li>
+  <li><strong>Routed Multi-Persona Review:</strong> Run specialized reviewers in parallel (<code>code</code>, <code>security</code>, <code>ui</code>, <code>ux</code>), routed by risk and changed surfaces. Clean low/medium Round-1 PRs auto-approve deterministically; high-risk or multi-round PRs go to an <code>approver</code> agent.</li>
+  <li><strong>Coalesced Staging Deploy + Live Browser QA:</strong> Merge PRs onto <code>main</code> via a staging deploy train, deploy to live Cloudflare Workers staging, and run an autonomous Playwright QA agent across 4 user personas (<code>pro</code>, <code>smoke</code>, <code>fresh_signup</code>, <code>anonymous</code>).</li>
+  <li><strong>Auto-Rollback on Failure:</strong> If live browser QA fails, <code>git revert</code> <code>main</code>, roll back the Cloudflare Workers, hand the failure screenshot + HTTP logs back to Builder on a <code>-qa2</code> branch, and retry automatically.</li>
+</ol>
+<p><em>[Insert Diagram: Factory Pipeline &amp; Staging Train Architecture -- export from <code>docs/lessons-learned.md</code>]</em></p>
+<hr>
+<h2>By the Numbers: 36 Real Issues in Production</h2>
+<ul>
+  <li><strong>Total issues processed:</strong> 36 jobs (<code>29</code> merged to <code>main</code>, <code>1</code> rejected at intake, <code>6</code> in-flight / queued in Wave 2)</li>
+  <li><strong>Wave 1 completion rate:</strong> <code>22 / 22</code> accepted issues merged (<code>100%</code>)</li>
+  <li><strong>Vertical slices shipped:</strong> <code>70</code> slices (<code>1</code> to <code>5</code> per issue; median <code>2</code>)</li>
+  <li><strong>Total tokens processed:</strong> <code>217.2M</code> (<code>26.5M</code> uncached input, <strong><code>188.2M</code> cache reads</strong>, <code>2.5M</code> output, <code>1.2M</code> thinking)</li>
+  <li><strong>Prompt-cache hit rate:</strong> <strong><code>87.7%</code></strong></li>
+  <li><strong>Cost per PR (early all-frontier baseline):</strong> <code>$7.03</code> - <code>$14.25</code> (<code>$21.28</code> for 2 PRs)</li>
+  <li><strong>Cost per PR (after role-based model tiering, 19 Wave 1 PRs):</strong> <strong><code>$0.27</code> median</strong> (<code>$0.05</code> - <code>$0.51</code>; <strong><code>$4.97</code> total for all 19 PRs combined</strong>)</li>
+  <li><strong>Full 8-step CI gate (<code>3,264</code> tests):</strong> <strong><code>~6m 30s</code> -&gt; <code>1m 12.5s</code></strong> (<strong>5.4x faster</strong>)</li>
+  <li><strong>Post-approve (<code>merging</code> + <code>staging_qa</code>) median wall-clock:</strong> <strong><code>24.4 min</code> -&gt; <code>3.0 - 4.9 min</code></strong> (<strong>5x - 8x faster</strong>)</li>
+  <li><strong>End-to-end job median wall-clock:</strong> <strong><code>52.2 min</code> -&gt; <code>18.9 - 22.3 min</code></strong> (<strong>~2.5x faster</strong>)</li>
+</ul>
+<hr>
+<h2>10 Hard-Won Lessons from Running It Live</h2>
+<h3>1. Most of Your Wall-Clock Time Isn't LLM Inference -- It's Tests, Deploys, and Locks</h3>
+<p>When Wave 1 felt slow (~50-65 minutes per ticket), our first instinct was to blame LLM latency. Then we measured timestamps across 14 uninterrupted Wave 1 jobs:</p>
+<ul>
+  <li><strong>Median end-to-end wall-clock:</strong> <code>52.2 minutes</code></li>
+  <li><strong>Median total LLM time across every stage combined:</strong> <strong><code>16.3 minutes</code> (<code>33.4%</code>)</strong></li>
+  <li><strong>Median non-LLM time (tests, deploys, locks):</strong> <strong><code>35.9 minutes</code> (<code>66.6%</code>)</strong></li>
+</ul>
+<p>On smaller 2-slice fixes, LLMs were just <strong><code>14.7% - 17.2%</code></strong> of wall-clock time. After a PR was approved, Playwright QA's LLM turn took only <strong><code>2.9 minutes</code></strong>, while <strong><code>21.5 minutes</code></strong> went to waiting on locks, running <code>pre-merge</code> gates, bundling two Cloudflare Python Workers, and running D1 migrations one PR at a time.</p>
+<p><strong>What fixed it:</strong></p>
+<ul>
+  <li><strong>Adaptive <code>pytest-xdist</code> (<code>--dist loadfile</code>):</strong> Dynamically budgeting CPU workers across concurrent gates cut full <code>checks.sh</code> (<code>3,264</code> tests) from <strong><code>6m 30s</code> to <code>1m 12.5s</code> (5.4x faster)</strong>.</li>
+  <li><strong>Diff-aware <code>pre-merge</code> gates:</strong> Disjoint upstream merges with no shared-infra changes run a slice-scoped gate in <strong><code>&lt; 4 seconds</code></strong> instead of re-running all 3,264 tests.</li>
+  <li><strong>Selective staging deploy flags:</strong> Skip staging deploy + QA for docs/tests-only PRs, and pass <code>--web-only --skip-migrations</code> when ingest Worker code and D1 SQL are untouched.</li>
+  <li><strong>Coalesced Staging Deploy Train:</strong> Batch up to <code>4</code> ready PRs onto <code>main</code>, deploy to Cloudflare staging <strong>once</strong>, and fan out per-PR Playwright QA in parallel. If 1 PR fails QA, surgically <code>git revert</code> just that culprit commit and re-deploy the other 3.</li>
+</ul>
+<p>Result: post-approve time dropped from <code>24.4 min</code> to <strong><code>3.0 - 4.9 min</code></strong>, cutting total end-to-end delivery for clean 2-slice PRs to <strong><code>18.9 - 22.3 min</code></strong>.</p>
+<h3>2. Right-Sizing Models + Prompt Caching Cut PR Cost by 35x (<code>$14.25</code> -&gt; <code>$0.27</code>)</h3>
+<p>Our first three jobs ran a frontier reasoning model across every stage. One 2-slice security PR burned <code>82 minutes</code> of model time, <code>33.2M</code> cached tokens, and <strong><code>$14.25</code> on a single PR</strong>.</p>
+<p>Per-step token and dollar telemetry made the fix obvious:</p>
+<ul>
+  <li><strong>Match model tier to cognitive load:</strong> Keep frontier reasoning where architectural judgment matters (<code>spec</code> on complex tickets, <code>security</code> review, <code>approver</code> on <code>risk == "high"</code>), and route structured execution (<code>intake</code>, vertical-slice <code>builder</code>, <code>code</code>/<code>ux</code>/<code>ui</code> review, Playwright <code>qa</code>) to fast mid-tier models.</li>
+  <li><strong>Prepend a static ~90-line <code>REPO_MAP.md</code>:</strong> Eliminated 6-10 cold-start <code>find</code>/<code>grep</code> turns per stage and drove our <strong><code>87.7%</code> prompt-cache hit ratio</strong> (<code>188.2M</code> cache reads).</li>
+  <li><strong>Deterministic Round-1 auto-approval (<code>risk != "high"</code>):</strong> If tests pass and every reviewer returns <code>PASS</code> with zero findings, don't pay an LLM <code>approver</code> to rubber-stamp <code>APPROVE</code>.</li>
+</ul>
+<p>Across the next <strong>19 consecutive merged PRs (49 slices)</strong>, total LLM spend was <strong><code>$4.97</code> combined -- a <code>$0.27</code> median per PR</strong> with a <code>100%</code> merge rate.</p>
+<h3>3. Local Unit Tests Lie About Edge Runtimes -- Live Staging QA Paid for Itself Twice</h3>
+<p>Why deploy to live staging and run headless Chromium if you already have 3,264 tests and multi-agent code review? Two real jobs answered that:</p>
+<ul>
+  <li><strong>The <code>1 MiB</code> Multipart Parser Trap (<code>job-525</code>):</strong> Enforced a <code>10 MB</code> <code>.html</code> bookmark import limit. All 3,200+ local ASGI <code>TestClient</code> tests passed. On live Cloudflare Workers staging, Playwright uploaded a <code>2 MB</code> file and hit <code>HTTP 400: There was an error parsing the body</code> -- Starlette's <code>MultiPartParser</code> defaulted <code>max_part_size</code> to <code>1 MiB</code>. The factory automatically <code>git revert</code>ed <code>main</code>, rolled back Workers, patched <code>max_part_size</code>, and shipped the fix on QA Round 2 (<code>$0.51</code> total).</li>
+  <li><strong>The Missing Wrangler Bundle Glob (<code>job-568</code>):</strong> Extracted ~900 KB of inline <code>&lt;script&gt;</code> tags into <code>/static/base.js</code>, <code>/static/library.js</code>, and <code>/static/tags.js</code>. All 3,264 local tests passed because local Python reads static files straight from disk. On live staging, Chromium got <code>404</code> (<code>window.showToast === "undefined"</code>) because <code>wrangler.staging.jsonc</code> only bundled <code>["**/*.html", "**/*.sql", "**/*.md", "**/*.css"]</code> and omitted <code>"**/*.js"</code>. The factory reverted PR <code>#597</code>, rolled back staging, patched the Wrangler glob, passed 4-persona Playwright QA on PR <code>#598</code>, and merged -- <strong>just <code>11.5 minutes</code> from QA failure to self-healed merge</strong>.</li>
+</ul>
+<h3>4. Parallel Agents Expose Hidden Repo Coupling</h3>
+<p>Running 4-5 concurrent worktrees acted like a fuzz tester for our build and test infrastructure:</p>
+<ul>
+  <li><strong>Content-hashed CSS collisions:</strong> Parallel UI PRs edited completely different HTML templates, regenerated <code>tailwind-&lt;sha256&gt;.css</code>, and collided on <code>main</code> 100% of the time. A deterministic asset-conflict resolver + pre-gate auto-polish (<code>ruff format</code> + <code>build_tailwind.py</code> <em>before</em> <code>checks.sh</code>) eliminated an entire class of mechanical LLM retries.</li>
+  <li><strong>Latent test races:</strong> Enabling <code>pytest -n auto</code> immediately exposed two pre-existing bugs that had hidden under serial execution (one test deleting a shared build directory during <code>--dry-run</code>, and an order-dependent fixture). Fixing them made 8-way parallel test runs 100% deterministic.</li>
+</ul>
+<h3>5. Specialized Reviewers Catch What Code Review Misses (<code>job-527</code>)</h3>
+<p>In <code>job-527</code> (tag merge UX), <code>checks.sh</code> passed and <code>reviewer-code</code> approved. <code>reviewer-ux</code> flagged a real user-facing bug: an HTMX validation <code>400</code> on tag self-merge returned no <code>HX-Trigger</code> error toast, leaving the user staring at a dead button. Splitting review personas (<code>code</code>, <code>security</code>, <code>ui</code>, <code>ux</code>) paid for itself immediately.</p>
+<h3>6. Your Prototype's Shell Scripts Will Betray You First</h3>
+<p>We started with a 19-file bash-and-markdown prototype. It worked for one happy-path run and broke on partial outputs, concurrent <code>job.json</code> writes, and crash recovery. Rewriting the orchestrator in Python with strict JSON schemas, file locks, and unit/e2e tests was the minimum bar for debugging failures at 2 a.m.</p>
+<h3>7. <code>gh</code> CLI and <code>git worktree</code> Have Sharp Edges</h3>
+<ul>
+  <li>Always pass <code>--body-file</code> (never inline <code>--body</code>) for PR descriptions, and never interpolate LLM text into <code>bash -c</code>.</li>
+  <li>Never run <code>git pull --rebase</code> against a branch that shares worktree commits; use explicit <code>git fetch</code> + <code>git merge --no-edit</code>.</li>
+  <li>Never allow an <code>origin/&lt;base&gt;</code> fast-forward fallback when restoring a branch after a revert -- if the reverted PR's base commit is already an ancestor of <code>origin/main</code>, fast-forwarding silently wipes out the PR's work.</li>
+</ul>
+<h3>8. Naive Retries Re-Build Merged PRs and Run Your Test Suite 5x</h3>
+<p>Persist stage checkpoints (<code>verified_gate_sha</code>, <code>needs_pre_merge_gate</code>, <code>prior_prs</code>). If a job dies mid-review or mid-merge, skip re-running <code>checks.sh</code> when <code>HEAD == verified_gate_sha</code> and never rebuild an already-merged PR.</p>
+<h3>9. Parallel Workers Without a DAG Turn Into <code>needs-human</code> Spam</h3>
+<p>Unordered workers racing on related issues cause cascading rebase conflicts. Modeling <code>depends_on</code> as a first-class DAG in the scheduler (and resetting dependent PRs cleanly when a parent lands) keeps workers building on settled <code>main</code>.</p>
+<h3>10. Watchdogs Cut Both Ways -- And Battle-Tested 15 Live Rollbacks</h3>
+<p>When we enabled a <code>45s</code> idle-background watchdog on headless agent subprocesses, we missed one detail: our agent CLI auto-backgrounds any shell command taking <code>&gt;10s</code> (like <code>pytest</code> and Playwright) while printing an idle status line to <code>stderr</code>. The watchdog killed <strong>32 active test/QA runs</strong>, triggering <strong>15 consecutive unattended <code>git revert</code> + Cloudflare Worker rollbacks</strong>.</p>
+<p>Fixing the watchdog was straightforward once diagnosed (track child PIDs via <code>/proc</code> before unlatching the timer and raise the grace window to <code>600s</code>). The unexpected win? Having a <code>45s</code> gremlin fire <strong>15 live rollbacks in anger</strong> proved our automated rollback safety net never once left <code>main</code> broken or <code>/health</code> red.</p>
+<hr>
+<h2>If You're Building Your Own Factory, Start Here</h2>
+<ol>
+  <li><strong>Instrument wall-clock vs. LLM time and cost per step from day one</strong> -- your biggest speedup is probably your test suite or deploy pipeline, not your prompt.</li>
+  <li><strong>Tier models by cognitive load + inject a static <code>REPO_MAP.md</code></strong> -- don't pay frontier rates for cold-start <code>grep</code> or structured test fixes.</li>
+  <li><strong>Close the loop with live staging QA and automatic rollback</strong> -- unit tests won't catch bundler globs or framework parser limits.</li>
+  <li><strong>Automate deterministic formatting, asset hashes, and conflict recovery</strong> before spending tokens on them.</li>
+  <li><strong>Test your failure paths under real concurrency</strong> -- locks, <code>git revert</code>, and process watchdogs are where autonomous systems live or die.</li>
+</ol>
+  </article>
+  <script>
+    async function copyForMedium() {
+      const el = document.getElementById("article");
+      const status = document.getElementById("status");
+      try {
+        const htmlBlob = new Blob([el.innerHTML], { type: "text/html" });
+        const textBlob = new Blob([el.innerText], { type: "text/plain" });
+        await navigator.clipboard.write([new ClipboardItem({ "text/html": htmlBlob, "text/plain": textBlob })]);
+        status.textContent = "Copied rich HTML! Paste directly into Medium (Ctrl+V).";
+      } catch (e) {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        document.execCommand("copy");
+        status.textContent = "Copied via selection fallback! Paste into Medium (Ctrl+V).";
+      }
+    }
+  </script>
+</body>
+</html>

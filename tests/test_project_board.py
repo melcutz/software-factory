@@ -8,6 +8,7 @@ import os
 import unittest
 from unittest.mock import patch
 
+from factory import cli
 from factory.lib.project_board import (
     DEFAULT_BOARD_DESCRIPTION,
     DEFAULT_STATUS_OPTIONS,
@@ -17,12 +18,7 @@ from factory.lib.project_board import (
 
 
 def _load_cli_module():
-    cli_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "factory", "bin", "factory"))
-    loader = importlib.machinery.SourceFileLoader("factory_cli_board_mod", cli_path)
-    spec = importlib.util.spec_from_loader("factory_cli_board_mod", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
+    return cli
 
 
 class ProjectBoardTests(unittest.TestCase):

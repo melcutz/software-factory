@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from factory import cli
 from factory.lib.config import estimate_usage_cost_usd
 from factory.lib.git_ops import GitHubClient, is_worktree_clean
 from factory.lib.pipeline import (
@@ -21,12 +22,7 @@ from factory.lib.state import advance_stage, create_or_resume_job, list_jobs, up
 
 
 def _load_cli_module():
-    cli_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "factory", "bin", "factory"))
-    loader = importlib.machinery.SourceFileLoader("factory_cli_mod", cli_path)
-    spec = importlib.util.spec_from_loader("factory_cli_mod", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
+    return cli
 
 
 class PlannerTests(unittest.TestCase):
@@ -414,8 +410,7 @@ class PlannerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             jobs_dir = os.path.join(tmp, "factory", "jobs")
             os.makedirs(jobs_dir, exist_ok=True)
-            with patch.object(cli, "REPO_ROOT", tmp):
-                self.assertEqual(cli.main(["status", "job-9999"]), 1)
+            self.assertEqual(cli.main(["status", "--repo", tmp, "job-9999"]), 1)
 
             create_or_resume_job(jobs_dir, {"number": 55, "title": "T55", "url": "u55"}, max_rounds=3)
             update_job(jobs_dir, "job-55", activity="running:intake", pid=12345)
