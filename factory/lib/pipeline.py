@@ -19,7 +19,7 @@ from factory.lib.config import (
     split_model_and_effort,
 )
 from factory.lib.gate_runner import run_gate
-from factory.lib.planner import build_dependency_dag
+from factory.lib.planner import plan_dependency_dag
 from factory.lib.git_ops import (
     GitHubClient,
     abort_merge,
@@ -49,6 +49,7 @@ from factory.lib.state import (
     TERMINAL_OR_READY_STAGES,
     advance_stage,
     create_or_resume_job,
+    enqueue_job,
     list_jobs,
     load_job,
     record_usage,
@@ -160,12 +161,18 @@ def _is_pid_alive(pid: int | None) -> bool:
 
 def _format_activity(job: dict) -> str:
     stage = str(job.get("stage", ""))
-    if stage in TERMINAL_OR_READY_STAGES or stage in {"needs-human", "needs-info"}:
+    if stage in TERMINAL_OR_READY_STAGES:
         return "-"
     activity = job.get("activity")
     pid = job.get("pid")
     if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and _is_pid_alive(pid):
-        return str(activity or "running")
+        return str(activity or ("queued" if stage == "queued" else "running"))
+    if stage in {"needs-human", "needs-info"}:
+        return "-"
+    if stage == "queued":
+        if isinstance(activity, str) and activity.startswith("blocked"):
+            return activity
+        return "-"
     if activity:
         label = str(activity).split(":", 1)[-1]
         return f"stale ({label})"
@@ -520,6 +527,12 @@ def process_job(
                         _, prior_slices_md = _aggregate_slice_builds(jdir, idx)
 
                         for attempt in range(cfg["max_slice_retries"] + 1):
+                            if attempt == 0 and not is_worktree_clean(worktree):
+                                _log(
+                                    job_id,
+                                    f"build slice={slice_num}/{total_slices} cleaning uncommitted leftovers from prior interrupted run",
+                                )
+                                reset_worktree_clean(worktree)
                             _set_activity(jobs_dir, job_id, f"running:slice-{slice_num}")
                             _log(
                                 job_id,
@@ -1067,15 +1080,18 @@ def _plan_queue_batch(
     jobs_dir: str,
     cfg: dict,
     issues: list[dict],
-) -> dict[int, set[int]]:
-    """Build an acyclic dependency DAG for a batch of issues using explicit refs + optional LLM planner."""
+) -> tuple[dict[int, set[int]], dict[int, set[int]]]:
+    """Build `(order_deps, hard_deps)` DAGs for a batch of issues using explicit refs + optional LLM planner."""
     planner_agent_path = os.path.join(factory_dir, "agents", "planner.md")
 
     def _run_planner(batch: list[dict]) -> dict:
         if not os.path.isfile(planner_agent_path):
             return {}
-        planner_model = cfg["models"].get("planner") or cfg["models"]["intake"]
-        timeout_sec = int(cfg["agent_timeout_sec"])
+        models = cfg.get("models") or {}
+        planner_model = models.get("planner") or models.get("intake", "")
+        if not planner_model:
+            return {}
+        timeout_sec = int(cfg.get("agent_timeout_sec", 900))
         lines = ["Plan execution dependencies for the following queued GitHub issues:", ""]
         for item in batch:
             lines.append(f"## Issue #{int(item['number'])}: {item.get('title') or ''}")
@@ -1105,8 +1121,11 @@ def _plan_queue_batch(
             print(f"[factory] warning: queue planner failed, using explicit dependencies only: {exc}", file=sys.stderr)
             return {}
 
-    deps, _ = build_dependency_dag(issues, planner_fn=_run_planner if len(issues) > 1 else None)
-    return deps
+    order_deps, hard_deps, _ = plan_dependency_dag(
+        issues,
+        planner_fn=_run_planner if len(issues) > 1 else None,
+    )
+    return order_deps, hard_deps
 
 
 def run_factory(
@@ -1168,8 +1187,20 @@ def run_factory(
                 for item in batch:
                     seen_issues.add(int(item["number"]))
 
-                deps = _plan_queue_batch(repo_root, factory_dir, jobs_dir, cfg, batch)
-                sorter = graphlib.TopologicalSorter(deps)
+                order_deps, hard_deps = _plan_queue_batch(repo_root, factory_dir, jobs_dir, cfg, batch)
+                max_rounds = int(cfg.get("max_rounds", 3))
+                runner_pid = os.getpid()
+                for item in batch:
+                    item_num = int(item["number"])
+                    enqueue_job(
+                        jobs_dir,
+                        item,
+                        max_rounds=max_rounds,
+                        waiting_on=order_deps.get(item_num),
+                        pid=runner_pid,
+                    )
+
+                sorter = graphlib.TopologicalSorter(order_deps)
                 sorter.prepare()
 
                 in_flight: dict[concurrent.futures.Future, int] = {}
@@ -1182,11 +1213,21 @@ def run_factory(
 
                     while ready_queue and len(in_flight) < max_workers:
                         num = ready_queue.pop(0)
-                        blocked_by = next((p for p in sorted(deps.get(num, ())) if p in failed_parents), None)
+                        blocked_by = next((p for p in sorted(hard_deps.get(num, ())) if p in failed_parents), None)
                         if blocked_by is not None:
                             reason = failed_parents[blocked_by]
                             failed_parents[num] = reason
                             print(f"[job-{num}] skipped: blocked by prerequisite {reason}", file=sys.stderr)
+                            try:
+                                update_job(
+                                    jobs_dir,
+                                    f"job-{num}",
+                                    last_error=f"Blocked by prerequisite {reason}",
+                                    activity=f"blocked by #{blocked_by}",
+                                    pid=None,
+                                )
+                            except FileNotFoundError:
+                                pass
                             try:
                                 gh.comment_issue(
                                     num,
@@ -1222,8 +1263,17 @@ def run_factory(
 
         return results
     finally:
+        cur_pid = os.getpid()
+        for existing in list_jobs(jobs_dir):
+            if existing.get("pid") == cur_pid and existing.get("stage") == "queued":
+                act = existing.get("activity")
+                cleared_act = None if isinstance(act, str) and act.startswith("queued") else act
+                try:
+                    update_job(jobs_dir, existing["id"], activity=cleared_act, pid=None)
+                except FileNotFoundError:
+                    pass
         try:
-            if os.path.isfile(pid_path) and _read_text(pid_path).strip() == str(os.getpid()):
+            if os.path.isfile(pid_path) and _read_text(pid_path).strip() == str(cur_pid):
                 os.remove(pid_path)
         except OSError:
             pass
@@ -1235,15 +1285,18 @@ def factory_runner_status(jobs_dir: str, jobs: list[dict] | None = None) -> str:
     raw_pid = _read_text(pid_path).strip() if os.path.isfile(pid_path) else ""
     runner_pid = int(raw_pid) if raw_pid.isdigit() else None
     all_jobs = jobs if jobs is not None else []
+    queued_jobs = [j for j in all_jobs if j.get("stage") == "queued"]
     active_jobs = [
         j
         for j in all_jobs
         if j.get("stage") not in TERMINAL_OR_READY_STAGES
-        and j.get("stage") not in {"needs-human", "needs-info"}
+        and j.get("stage") not in {"needs-human", "needs-info", "queued"}
     ]
     live_workers = sum(1 for j in active_jobs if _is_pid_alive(j.get("pid")))
 
     if _is_pid_alive(runner_pid):
+        if queued_jobs:
+            return f"Factory: RUNNING (pid={runner_pid}, active_jobs={len(active_jobs)}, queued={len(queued_jobs)})"
         return f"Factory: RUNNING (pid={runner_pid}, active_jobs={len(active_jobs)})"
     if live_workers > 0:
         return f"Factory: RUNNING ({live_workers} live worker(s))"

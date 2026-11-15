@@ -41,10 +41,63 @@ def _has_path(deps: dict[int, set[int]], start: int, target: int) -> bool:
     return False
 
 
+_NON_CONFLICT_TOP_DIRS = {"tests", "test", "docs", "doc"}
+_EXTENSIONLESS_FILES = {"Makefile", "Dockerfile", "Procfile", "Justfile"}
+
+
+def _normalize_conflict_surfaces(paths: list[str]) -> list[str]:
+    """Normalize predicted surface paths to high-signal conflict targets only.
+
+    Broad directories (such as `tests/`, `templates/`, `src/pkg/`, or `static/`)
+    and test/doc/hashed-bundle paths are ignored so independent issues are not
+    chained sequentially. Ordered migration directories (`migrations/`,
+    `control_migrations/`) and specific source/template files are retained.
+    """
+    normalized: list[str] = []
+    for raw in paths:
+        if not raw or not str(raw).strip():
+            continue
+        stripped = str(raw).strip()
+        while stripped.startswith("./"):
+            stripped = stripped[2:]
+        stripped = stripped.lstrip("/")
+        explicit_dir = stripped.endswith("/")
+        clean = stripped.rstrip("/")
+        if not clean:
+            continue
+        parts = [p for p in clean.split("/") if p]
+        if not parts:
+            continue
+        if parts[0] in _NON_CONFLICT_TOP_DIRS:
+            continue
+
+        mig_idx = next(
+            (
+                idx
+                for idx, seg in enumerate(parts)
+                if seg in {"migrations", "control_migrations"} or seg.endswith("_migrations")
+            ),
+            None,
+        )
+        if mig_idx is not None:
+            normalized.append("/".join(parts[: mig_idx + 1]))
+            continue
+
+        basename = parts[-1]
+        if "static" in parts and (explicit_dir or "*" in basename or basename.startswith("tailwind")):
+            continue
+        if explicit_dir or "*" in basename:
+            continue
+        if "." not in basename and basename not in _EXTENSIONLESS_FILES and "bin" not in parts[:-1]:
+            continue
+        normalized.append("/".join(parts))
+    return normalized
+
+
 def _surfaces_overlap(paths_a: list[str], paths_b: list[str]) -> bool:
-    """Return True if two predicted surface lists touch the same file or nested path."""
-    norm_a = [p.strip().rstrip("/") for p in paths_a if p and p.strip()]
-    norm_b = [p.strip().rstrip("/") for p in paths_b if p and p.strip()]
+    """Return True if two predicted surface lists touch the same conflict target."""
+    norm_a = _normalize_conflict_surfaces(paths_a)
+    norm_b = _normalize_conflict_surfaces(paths_b)
     for pa in norm_a:
         for pb in norm_b:
             if pa == pb or pa.startswith(f"{pb}/") or pb.startswith(f"{pa}/"):
@@ -84,20 +137,29 @@ def _ensure_acyclic(deps: dict[int, set[int]]) -> dict[int, set[int]]:
                     return clean
 
 
-def build_dependency_dag(
+def plan_dependency_dag(
     issues: list[dict],
     *,
     planner_fn: Callable[[list[dict]], dict] | None = None,
-) -> tuple[dict[int, set[int]], dict[int, list[str]]]:
-    """Build an acyclic `{issue: {depends_on...}}` DAG and `{issue: [paths]}` map."""
+) -> tuple[dict[int, set[int]], dict[int, set[int]], dict[int, list[str]]]:
+    """Return `(order_deps, hard_deps, surfaces)` for a batch of issues.
+
+    - `hard_deps`: true prerequisites (`Depends on #N` + LLM logical `edges`).
+      Downstream issues should be skipped if a hard prerequisite fails to merge.
+    - `order_deps`: `hard_deps` plus soft conflict-avoidance ordering edges from
+      overlapping `predicted_surfaces`. Soft overlaps serialize execution to avoid
+      concurrent edits on the same file, without skipping downstream jobs if an
+      earlier job halts unmerged.
+    """
     explicit = parse_explicit_dependencies(issues)
-    deps: dict[int, set[int]] = {k: set(v) for k, v in explicit.items()}
-    surfaces: dict[int, list[str]] = {k: [] for k in deps}
-    batch_nums = set(deps.keys())
+    hard_deps: dict[int, set[int]] = {k: set(v) for k, v in explicit.items()}
+    surfaces: dict[int, list[str]] = {k: [] for k in hard_deps}
+    batch_nums = set(hard_deps.keys())
 
     if len(issues) > 1 and planner_fn is not None:
         try:
             plan = planner_fn(issues) or {}
+            candidate_hard = {k: set(v) for k, v in explicit.items()}
             for edge in plan.get("edges") or []:
                 num = int(edge["issue"])
                 if num not in batch_nums:
@@ -105,13 +167,17 @@ def build_dependency_dag(
                 for dep in edge.get("depends_on") or []:
                     dep_num = int(dep)
                     if dep_num in batch_nums and dep_num != num:
-                        deps[num].add(dep_num)
+                        candidate_hard[num].add(dep_num)
+
+            graphlib.TopologicalSorter(candidate_hard).prepare()
+            hard_deps = candidate_hard
 
             for surf in plan.get("predicted_surfaces") or []:
                 num = int(surf["issue"])
                 if num in batch_nums:
                     surfaces[num] = [str(p) for p in (surf.get("paths") or []) if str(p).strip()]
 
+            order_deps = {k: set(v) for k, v in hard_deps.items()}
             ordered_nums = sorted(batch_nums)
             for idx, a in enumerate(ordered_nums):
                 if not surfaces.get(a):
@@ -120,15 +186,28 @@ def build_dependency_dag(
                     if not surfaces.get(b):
                         continue
                     if _surfaces_overlap(surfaces[a], surfaces[b]):
-                        if not _has_path(deps, a, b) and not _has_path(deps, b, a):
-                            deps[b].add(a)
+                        if not _has_path(order_deps, a, b) and not _has_path(order_deps, b, a):
+                            order_deps[b].add(a)
 
-            graphlib.TopologicalSorter(deps).prepare()
-            return deps, surfaces
+            graphlib.TopologicalSorter(order_deps).prepare()
+            return order_deps, hard_deps, surfaces
         except graphlib.CycleError:
             # Fall back to explicit dependencies if LLM/surface edges introduced a cycle.
-            deps = {k: set(v) for k, v in explicit.items()}
+            hard_deps = _ensure_acyclic({k: set(v) for k, v in explicit.items()})
+            return {k: set(v) for k, v in hard_deps.items()}, hard_deps, surfaces
         except Exception:
-            deps = {k: set(v) for k, v in explicit.items()}
+            hard_deps = _ensure_acyclic({k: set(v) for k, v in explicit.items()})
+            return {k: set(v) for k, v in hard_deps.items()}, hard_deps, surfaces
 
-    return _ensure_acyclic(deps), surfaces
+    clean_hard = _ensure_acyclic(hard_deps)
+    return {k: set(v) for k, v in clean_hard.items()}, clean_hard, surfaces
+
+
+def build_dependency_dag(
+    issues: list[dict],
+    *,
+    planner_fn: Callable[[list[dict]], dict] | None = None,
+) -> tuple[dict[int, set[int]], dict[int, list[str]]]:
+    """Build an acyclic `{issue: {depends_on...}}` DAG and `{issue: [paths]}` map."""
+    order_deps, _, surfaces = plan_dependency_dag(issues, planner_fn=planner_fn)
+    return order_deps, surfaces

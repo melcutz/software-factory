@@ -14,6 +14,7 @@ EFFORT_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max", "none"}
 DEFAULT_MODEL_PRICING: dict[str, dict[str, float]] = {
     "gemini-3.6-flash": {"input_per_m": 0.15, "cached_per_m": 0.0375, "output_per_m": 0.60},
     "gemini-3.8-flash": {"input_per_m": 0.30, "cached_per_m": 0.075, "output_per_m": 2.50},
+    "gemini-4-hydrogen": {"input_per_m": 0.30, "cached_per_m": 0.075, "output_per_m": 2.50},
     "gemini-4-argon": {"input_per_m": 1.25, "cached_per_m": 0.3125, "output_per_m": 10.00},
 }
 
@@ -75,7 +76,7 @@ def estimate_usage_cost_usd(
         return None
     for direct_key in ("cost_usd", "cost"):
         val = usage.get(direct_key)
-        if isinstance(val, (int, float)) and not isinstance(val, bool):
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
             return round(float(val), 6)
 
     pricing_map = ((config or {}).get("model_pricing") if isinstance(config, dict) else None) or DEFAULT_MODEL_PRICING

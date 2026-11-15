@@ -232,7 +232,7 @@ class GitHubClient:
                 "--limit",
                 "100",
                 "--json",
-                "number,title,url,labels",
+                "number,title,body,url,labels",
             ],
             self.repo_root,
         )

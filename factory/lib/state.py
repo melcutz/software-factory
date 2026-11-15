@@ -8,6 +8,7 @@ import threading
 from datetime import datetime, timezone
 
 TRANSITIONS: dict[str, list[str]] = {
+    "queued": ["intake", "rejected"],
     "intake": ["spec", "needs-info", "rejected", "needs-human"],
     "needs-info": ["intake", "rejected"],
     "spec": ["build", "needs-human"],
@@ -150,6 +151,73 @@ def _has_valid_plan(jdir: str) -> bool:
         return False
 
 
+def enqueue_job(
+    jobs_dir: str,
+    issue: dict,
+    max_rounds: int,
+    *,
+    waiting_on: set[int] | list[int] | None = None,
+    pid: int | None = None,
+) -> dict:
+    """Register or refresh a batch-queued issue in `job.json` before a worker starts it."""
+    issue_num = int(issue["number"])
+    job_id = f"job-{issue_num}"
+    deps_sorted = sorted(int(x) for x in (waiting_on or ()) if int(x) != issue_num)
+    activity_str = (
+        f"queued (after #{',#'.join(str(x) for x in deps_sorted)})"
+        if deps_sorted
+        else "queued"
+    )
+    with _job_lock(jobs_dir, job_id):
+        jdir = _job_dir(jobs_dir, job_id)
+        path = os.path.join(jdir, "job.json")
+        now = _now_iso()
+        if not os.path.exists(path):
+            job = {
+                "id": job_id,
+                "issue": issue_num,
+                "issue_url": issue.get("url", ""),
+                "issue_title": issue.get("title", ""),
+                "branch": f"factory/{job_id}",
+                "stage": "queued",
+                "round": 0,
+                "round_limit": max_rounds,
+                "risk": "low",
+                "surfaces": [],
+                "total_slices": 0,
+                "completed_slices": 0,
+                "pr_number": None,
+                "pr_url": None,
+                "activity": activity_str,
+                "pid": pid,
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 0,
+                    "thinking_tokens": 0,
+                    "total_tokens": 0,
+                    "duration_seconds": 0.0,
+                    "cost_usd": 0.0,
+                },
+                "last_error": None,
+                "created": now,
+                "updated": now,
+            }
+            return _atomic_write_job(jobs_dir, job_id, job)
+
+        job = load_job(jobs_dir, job_id)
+        if job.get("stage") in TERMINAL_OR_READY_STAGES:
+            return job
+        if issue.get("title"):
+            job["issue_title"] = issue["title"]
+        if issue.get("url"):
+            job["issue_url"] = issue["url"]
+        job["activity"] = activity_str
+        job["pid"] = pid
+        job["updated"] = now
+        return _atomic_write_job(jobs_dir, job_id, job)
+
+
 def create_or_resume_job(jobs_dir: str, issue: dict, max_rounds: int) -> tuple[dict, str]:
     issue_num = int(issue["number"])
     job_id = f"job-{issue_num}"
@@ -199,6 +267,9 @@ def create_or_resume_job(jobs_dir: str, issue: dict, max_rounds: int) -> tuple[d
         stage = job["stage"]
         if stage in TERMINAL_OR_READY_STAGES:
             return job, "skip"
+        if stage == "queued":
+            _atomic_write_job(jobs_dir, job_id, job)
+            return advance_stage(jobs_dir, job_id, "intake"), "new"
         if stage == "needs-info":
             _atomic_write_job(jobs_dir, job_id, job)
             return advance_stage(jobs_dir, job_id, "intake"), "resume"

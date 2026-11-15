@@ -42,7 +42,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("doctor", help="Verify git, gh, agy, config.json, checks.sh, and .gitignore")
 
     args = parser.parse_args(argv)
-    jobs_dir = os.path.join(FACTORY_DIR, "jobs")
+    factory_dir = os.path.join(REPO_ROOT, "factory")
+    jobs_dir = os.path.join(factory_dir, "jobs")
 
     if args.command == "run":
         jobs = run_factory(REPO_ROOT, issue_numbers=args.issues or None)
@@ -50,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "queue":
-        cfg = load_config(FACTORY_DIR)
+        cfg = load_config(factory_dir)
         gh = GitHubClient(REPO_ROOT)
         for iss in gh.list_queue_issues(cfg):
             print(f"{iss['number']}\t{iss['title']}\t{iss['url']}")
@@ -71,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "gate":
-        cfg = load_config(FACTORY_DIR)
+        cfg = load_config(factory_dir)
         wt = args.worktree or os.path.join(REPO_ROOT, ".worktrees", args.job_id)
         passed, md = run_gate(REPO_ROOT, args.job_id, wt, args.round, cfg)
         print(md)
