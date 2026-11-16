@@ -3716,6 +3716,32 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
     else:
         messages.append(f"OK: git origin -> {rem.stdout.strip()}")
 
+    res_name = subprocess.run(
+        ["git", "-C", repo_root, "config", "user.name"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    user_name = res_name.stdout.strip()
+    if res_name.returncode != 0 or not user_name:
+        ok = False
+        messages.append("MISSING: git config user.name is not set")
+    else:
+        messages.append(f"OK: git user.name -> {user_name}")
+
+    res_email = subprocess.run(
+        ["git", "-C", repo_root, "config", "user.email"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    user_email = res_email.stdout.strip()
+    if res_email.returncode != 0 or not user_email:
+        ok = False
+        messages.append("MISSING: git config user.email is not set")
+    else:
+        messages.append(f"OK: git user.email -> {user_email}")
+
     try:
         cfg = load_config(factory_dir)
         messages.append(f"OK: factory/config.json valid (auto_merge={cfg['auto_merge']}, concurrency={cfg['concurrency']})")
@@ -3729,6 +3755,31 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
         messages.append("FAIL: factory/checks.sh missing or not executable")
     else:
         messages.append("OK: factory/checks.sh present and executable")
+
+    if os.path.isfile(checks_sh):
+        try:
+            with open(checks_sh, encoding="utf-8", errors="replace") as f:
+                checks_content = f.read()
+        except Exception:
+            checks_content = ""
+        if "pytest" in checks_content:
+            try:
+                res_pytest = subprocess.run(
+                    ["python3", "-m", "pytest", "--version"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if res_pytest.returncode != 0:
+                    ok = False
+                    messages.append(f"MISSING: python3 -m pytest (exit code {res_pytest.returncode})")
+                else:
+                    ver = res_pytest.stdout.strip() or res_pytest.stderr.strip()
+                    detail = f" ({ver})" if ver else ""
+                    messages.append(f"OK: python3 -m pytest{detail}")
+            except Exception as exc:
+                ok = False
+                messages.append(f"MISSING: python3 -m pytest ({exc})")
 
     ig = subprocess.run(
         ["git", "-C", repo_root, "check-ignore", "factory/jobs/probe-job", ".worktrees/probe-job"],
