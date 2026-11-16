@@ -71,6 +71,18 @@ def is_host_paused() -> bool:
     return os.path.isfile(pause_file_path())
 
 
+def is_host_draining() -> bool:
+    path = pause_file_path()
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return isinstance(data, dict) and bool(data.get("paused")) and bool(data.get("drain"))
+    except (OSError, ValueError):
+        return False
+
+
 def set_host_paused(paused: bool, *, drain: bool = False) -> None:
     path = pause_file_path()
     if paused:

@@ -195,6 +195,100 @@ print(json.dumps({"status": "SUCCESS", "duration_seconds": 1.0, "usage": {},
             self.assertIn("factory/lib/", prompt)
             self.assertIn("factory/checks.sh", prompt)
 
+    def test_run_agent_abort_check_terminates_process_group_without_retry(self):
+        import time
+        from factory.lib.agy_runner import _invoke_agy_process
+        from factory.lib.git_state import LeaseLostError
+        from factory.lib.pipeline import JobHaltedError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = os.path.join(tmp, "bin")
+            os.makedirs(bin_dir)
+            counter = os.path.join(tmp, "calls")
+            pid_file = os.path.join(tmp, "child.pid")
+            fake_agy = os.path.join(bin_dir, "agy")
+            with open(fake_agy, "w", encoding="utf-8") as f:
+                f.write(
+                    f"""#!/usr/bin/env python3
+import os, subprocess, time
+n = int(open({counter!r}).read()) + 1 if os.path.exists({counter!r}) else 1
+open({counter!r}, "w").write(str(n))
+child = subprocess.Popen(["python3", "-c", "import time; time.sleep(60)"])
+open({pid_file!r}, "w").write(str(child.pid))
+time.sleep(60)
+"""
+                )
+            os.chmod(fake_agy, 0o755)
+            wt = self._init_wt(tmp)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{bin_dir}:{old_path}"
+            try:
+                t0 = time.monotonic()
+                polls = {"n": 0}
+
+                def _abort():
+                    polls["n"] += 1
+                    if os.path.exists(pid_file) or time.monotonic() - t0 >= 1.5:
+                        return JobHaltedError("local halt.signal active")
+                    return None
+
+                with self.assertRaises(JobHaltedError):
+                    run_agent(
+                        os.path.abspath("factory"),
+                        os.path.join(tmp, "job-halt"),
+                        wt,
+                        "build",
+                        "builder",
+                        "gemini-4-argon-high",
+                        "Implement slice",
+                        SCHEMAS["build"],
+                        30,
+                        sandbox=False,
+                        log_name="r1-build",
+                        abort_check=_abort,
+                    )
+                elapsed = time.monotonic() - t0
+                self.assertLess(elapsed, 2.0)
+                with open(counter, encoding="utf-8") as cf:
+                    self.assertEqual(int(cf.read().strip()), 1)
+                self.assertFalse(os.path.exists(os.path.join(tmp, "job-halt", "logs", "r1-build-retry.json")))
+                if os.path.exists(pid_file):
+                    cpid = int(open(pid_file, encoding="utf-8").read().strip())
+
+                    def _is_pid_alive(pid: int) -> bool:
+                        try:
+                            os.kill(pid, 0)
+                        except ProcessLookupError:
+                            return False
+                        if os.path.isdir("/proc"):
+                            try:
+                                with open(f"/proc/{pid}/stat", encoding="utf-8") as sf:
+                                    stat_text = sf.read()
+                            except OSError:
+                                return False
+                            rparen = stat_text.rfind(")")
+                            if rparen != -1 and stat_text[rparen + 2 : rparen + 3] == "Z":
+                                return False
+                        return True
+
+                    deadline = time.monotonic() + 1.0
+                    while time.monotonic() < deadline and _is_pid_alive(cpid):
+                        time.sleep(0.02)
+                    self.assertFalse(_is_pid_alive(cpid))
+
+                # Direct _invoke_agy_process with LeaseLostError
+                with self.assertRaises(LeaseLostError):
+                    _invoke_agy_process(
+                        [fake_agy],
+                        cwd=wt,
+                        env=None,
+                        hard_timeout_sec=30.0,
+                        idle_bg_grace_sec=30.0,
+                        abort_check=lambda: LeaseLostError("fencing token lost"),
+                    )
+            finally:
+                os.environ["PATH"] = old_path
+
 
 if __name__ == "__main__":
     unittest.main()

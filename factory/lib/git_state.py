@@ -32,6 +32,18 @@ _CHECKPOINT_TOP_FILES = (
     "qa-failure.md",
 )
 
+_CHECKPOINT_ROUND_PATTERNS = (
+    "round-*/slice-*-build.json",
+    "round-*/slice-*-build.md",
+    "round-*/build.json",
+    "round-*/build.md",
+    "round-*/checks.md",
+    "round-*/review-*.json",
+    "round-*/review-*.md",
+    "round-*/approve.json",
+    "round-*/approve.md",
+)
+
 
 class LeaseLostError(RuntimeError):
     """Raised when a worker loses its distributed job lease or fencing token."""
@@ -367,7 +379,7 @@ class GitStateStore:
                 with open(fpath, "rb") as f:
                     files[name] = f.read()
 
-        for pattern in ("round-*/slice-*-build.json", "round-*/review-*.json"):
+        for pattern in _CHECKPOINT_ROUND_PATTERNS:
             for fpath in sorted(glob.glob(os.path.join(jdir, pattern))):
                 if os.path.isfile(fpath):
                     rel = os.path.relpath(fpath, jdir).replace(os.sep, "/")

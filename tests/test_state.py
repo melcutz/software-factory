@@ -150,6 +150,89 @@ class StateTests(unittest.TestCase):
             self.assertEqual(updated["usage"]["cache_read_tokens"], 1000)
             self.assertAlmostEqual(updated["usage"]["cost_usd"], 0.2)
 
+    def test_create_or_resume_job_backfills_minimal_lease_stub(self):
+        import json
+        import os
+
+        with tempfile.TemporaryDirectory() as d:
+            jdir = os.path.join(d, "job-99")
+            os.makedirs(jdir, exist_ok=True)
+            with open(os.path.join(jdir, "job.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "id": "job-99",
+                        "issue": 99,
+                        "stage": "intake",
+                        "last_worker_id": "m1",
+                    },
+                    f,
+                )
+            issue = {"number": 99, "title": "Lease stub issue", "url": "https://x/99"}
+            job, action = create_or_resume_job(d, issue, max_rounds=4, max_qa_rounds=2)
+            self.assertEqual(action, "resume")
+            self.assertEqual(job["id"], "job-99")
+            self.assertEqual(job["issue"], 99)
+            self.assertEqual(job["issue_title"], "Lease stub issue")
+            self.assertEqual(job["issue_url"], "https://x/99")
+            self.assertEqual(job["branch"], "factory/job-99")
+            self.assertEqual(job["stage"], "intake")
+            self.assertEqual(job["round"], 0)
+            self.assertEqual(job["round_limit"], 4)
+            self.assertEqual(job["qa_round"], 0)
+            self.assertEqual(job["qa_round_limit"], 2)
+            self.assertEqual(job["risk"], "low")
+            self.assertEqual(job["surfaces"], [])
+            self.assertEqual(job["total_slices"], 0)
+            self.assertEqual(job["completed_slices"], 0)
+            self.assertIsNone(job["pr_number"])
+            self.assertIsNone(job["pr_url"])
+            self.assertEqual(job["prior_prs"], [])
+            self.assertIsNone(job["activity"])
+            self.assertIsNone(job["pid"])
+            self.assertIsNone(job["last_error"])
+            self.assertEqual(job["last_worker_id"], "m1")
+            self.assertTrue(job["created"])
+            self.assertTrue(job["updated"])
+            self.assertEqual(
+                job["usage"],
+                {
+                    "input_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 0,
+                    "thinking_tokens": 0,
+                    "total_tokens": 0,
+                    "duration_seconds": 0.0,
+                    "cost_usd": 0.0,
+                },
+            )
+
+    def test_collect_checkpoint_files_includes_round_artifacts(self):
+        import os
+        from factory.lib.git_state import GitStateStore
+
+        with tempfile.TemporaryDirectory() as d:
+            jdir = os.path.join(d, "job-5")
+            rdir = os.path.join(jdir, "round-1")
+            os.makedirs(rdir, exist_ok=True)
+            expected_rel = [
+                "round-1/slice-1-build.json",
+                "round-1/slice-1-build.md",
+                "round-1/build.json",
+                "round-1/build.md",
+                "round-1/checks.md",
+                "round-1/review-code.json",
+                "round-1/review-code.md",
+                "round-1/approve.json",
+                "round-1/approve.md",
+            ]
+            for rel in expected_rel:
+                with open(os.path.join(jdir, rel), "w", encoding="utf-8") as f:
+                    f.write(f"content of {rel}\n")
+            store = GitStateStore(d, "m1")
+            files = store._collect_checkpoint_files(jdir, {"id": "job-5", "stage": "review"})
+            for rel in expected_rel:
+                self.assertIn(rel, files)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -272,11 +272,42 @@ def create_or_resume_job(
             return _atomic_write_job(jobs_dir, job_id, job), "new"
 
         job = load_job(jobs_dir, job_id)
+        now = _now_iso()
+        job.setdefault("id", job_id)
+        job.setdefault("issue", issue_num)
+        job.setdefault("issue_url", issue.get("url", ""))
+        job.setdefault("issue_title", issue.get("title", ""))
+        job.setdefault("branch", f"factory/{job_id}")
+        if not job["branch"]:
+            job["branch"] = f"factory/{job_id}"
+        job.setdefault("stage", "intake")
+        job.setdefault("round", 0)
+        job.setdefault("round_limit", max_rounds)
         job.setdefault("qa_round", 0)
         job.setdefault("qa_round_limit", max_qa_rounds)
+        job.setdefault("risk", "low")
+        job.setdefault("surfaces", [])
+        job.setdefault("total_slices", 0)
+        job.setdefault("completed_slices", 0)
+        job.setdefault("pr_number", None)
+        job.setdefault("pr_url", None)
         job.setdefault("prior_prs", [])
         job.setdefault("activity", None)
         job.setdefault("pid", None)
+        usage = job.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+            job["usage"] = usage
+        usage.setdefault("input_tokens", 0)
+        usage.setdefault("cache_read_tokens", 0)
+        usage.setdefault("output_tokens", 0)
+        usage.setdefault("thinking_tokens", 0)
+        usage.setdefault("total_tokens", 0)
+        usage.setdefault("duration_seconds", 0.0)
+        usage.setdefault("cost_usd", 0.0)
+        job.setdefault("last_error", None)
+        job.setdefault("created", now)
+        job.setdefault("updated", now)
         if issue.get("title"):
             job["issue_title"] = issue["title"]
         if issue.get("url"):
