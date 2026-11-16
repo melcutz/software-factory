@@ -1,6 +1,7 @@
 """Headless `agy -p` JSON runner with schema validation, sandboxing, and retry."""
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 import os
 import re
@@ -269,9 +270,14 @@ def _invoke_agy_process(
     env: dict[str, str] | None,
     hard_timeout_sec: float,
     idle_bg_grace_sec: float,
+    abort_check: Callable[[], BaseException | None] | None = None,
 ) -> tuple[int, str, str, str | None]:
     """Spawn agy in its own process group and enforce hard + idle-background-task timeouts."""
     if subprocess.run is not _ORIG_SUBPROCESS_RUN:
+        if abort_check is not None:
+            abort_exc = abort_check()
+            if abort_exc is not None:
+                raise abort_exc
         try:
             res = subprocess.run(
                 cmd,
@@ -348,10 +354,22 @@ def _invoke_agy_process(
     hard_deadline = t0 + max(1.0, float(hard_timeout_sec))
     grace = max(0.1, float(idle_bg_grace_sec))
     killed_reason: str | None = None
+    last_abort_poll: float | None = None
 
     try:
         while proc.poll() is None:
             now = time.monotonic()
+            if abort_check is not None and (last_abort_poll is None or (now - last_abort_poll) >= 0.2):
+                last_abort_poll = now
+                try:
+                    abort_exc = abort_check()
+                except BaseException as exc:
+                    abort_exc = exc
+                if abort_exc is not None:
+                    with state_lock:
+                        extra = set(active_children)
+                    _terminate_process_group(proc, extra)
+                    raise abort_exc
             if now >= hard_deadline:
                 with state_lock:
                     extra = set(active_children)
@@ -428,6 +446,7 @@ def run_agent(
     extra_env: dict[str, str] | None = None,
     protect_head: bool = False,
     idle_bg_grace_sec: float | None = None,
+    abort_check: Callable[[], BaseException | None] | None = None,
 ) -> tuple[dict, dict, float]:
     """Run one headless `agy -p` turn with JSON Schema validation and 1 retry."""
     effective_idle_grace = _resolve_idle_bg_grace_sec(factory_dir, idle_bg_grace_sec)
@@ -459,6 +478,20 @@ def run_agent(
     initial_sha = head_sha(worktree) if guard_head else ""
     proc_env = {**os.environ, **extra_env} if extra_env is not None else None
     last_err: Exception | None = None
+    aborted_exc: BaseException | None = None
+
+    def _wrapped_abort_check() -> BaseException | None:
+        nonlocal aborted_exc
+        if abort_check is None:
+            return None
+        try:
+            exc = abort_check()
+        except BaseException as raised:
+            aborted_exc = raised
+            raise
+        if exc is not None:
+            aborted_exc = exc
+        return exc
 
     for attempt in (1, 2):
         t0 = time.monotonic()
@@ -470,6 +503,7 @@ def run_agent(
                     env=proc_env,
                     hard_timeout_sec=float(timeout_sec + _SUBPROCESS_TIMEOUT_GRACE_SEC),
                     idle_bg_grace_sec=effective_idle_grace,
+                    abort_check=_wrapped_abort_check if abort_check is not None else None,
                 )
             finally:
                 if guard_head:
@@ -481,9 +515,10 @@ def run_agent(
                             check=False,
                         )
                         reset_worktree_clean(worktree)
-                        raise AgentExecutionError(
-                            f"Read-only agent {agent_name} illegally moved HEAD ({initial_sha[:7]} -> {after_sha[:7]})"
-                        )
+                        if aborted_exc is None:
+                            raise AgentExecutionError(
+                                f"Read-only agent {agent_name} illegally moved HEAD ({initial_sha[:7]} -> {after_sha[:7]})"
+                            )
                     if clean_worktree and not is_worktree_clean(worktree):
                         reset_worktree_clean(worktree)
 
@@ -535,6 +570,10 @@ def run_agent(
 
         except Exception as exc:
             last_err = exc
+            if aborted_exc is not None and exc is aborted_exc:
+                raise
+            if type(exc).__name__ in {"JobHaltedError", "LeaseLostError"}:
+                raise
             if isinstance(exc, QuotaExhaustedError):
                 raise
             if isinstance(exc, AgentExecutionError) and "illegally moved HEAD" in str(exc):
