@@ -150,3 +150,24 @@ def test_fleet_update_runs_git_pull_on_all_machines(tmp_path, monkeypatch):
     lines = log_file.read_text().splitlines()
     assert any("run --on lenovo -- sh -lc" in ln and "pull --ff-only" in ln for ln in lines)
 
+
+def test_fleet_wake_is_idempotent_on_name_taken(tmp_path, monkeypatch):
+    fake_hc = tmp_path / "hc"
+    fake_hc.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "if sys.argv[1:3] == ['machine', 'ls']:\n"
+        "    print(json.dumps({'machines': [{'name': 'base-ubuntu', 'state': 'connected'}]}))\n"
+        "else:\n"
+        "    print(json.dumps({'error': {'kind': 'name_taken', 'message': 'already named'}}))\n"
+        "    sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    fake_hc.chmod(0o755)
+    monkeypatch.setenv("HC_BIN_PATH", str(fake_hc))
+    monkeypatch.setenv("FACTORY_HOST_DIR", str(tmp_path))
+
+    from factory.lib.fleet import fleet_wake
+    res = fleet_wake()
+    assert res == [("base-ubuntu", 0, "already running")]
+

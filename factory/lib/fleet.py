@@ -124,7 +124,10 @@ def fleet_wake() -> list[tuple[str, int, str]]:
             bg=True,
             name=f"factory-worker-{m['name']}",
         )
-        results.append((m["name"], rc, out))
+        if rc != 0 and '"name_taken"' in out:
+            results.append((m["name"], 0, "already running"))
+        else:
+            results.append((m["name"], rc, out))
     return results
 
 
