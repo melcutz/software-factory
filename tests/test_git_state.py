@@ -392,7 +392,8 @@ def test_peer_takeover_hydrates_before_init_across_needs_human_review_mid_slice_
     job102_steps = [s for (jid, s, _) in steps_called[steps_before:] if jid == "job-102"]
     assert job102_steps == ["build", "review"]
     wt1_102 = os.path.join(clones[1], ".worktrees", "job-102")
-    assert os.path.isfile(os.path.join(wt1_102, "s1.py"))
+    assert not os.path.exists(wt1_102)
+    assert subprocess.run(["git", "-C", clones[1], "cat-file", "-e", "factory/job-102:s1.py"]).returncode == 0
 
     # 3) Review stage takeover with custom branch name and remote branch fallback
     jdir_103 = os.path.join(clones[0], "factory", "jobs", "job-103")

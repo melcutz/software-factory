@@ -11,7 +11,7 @@ import sys
 from factory.lib.config import load_config
 from factory.lib.fleet import fleet_pause, fleet_remove, fleet_status, fleet_unpause, fleet_update, fleet_wake
 from factory.lib.gate_runner import run_gate
-from factory.lib.git_ops import GitHubClient
+from factory.lib.git_ops import GitHubClient, _run_git, remove_worktree
 from factory.lib.git_state import GitStateStore
 from factory.lib.pipeline import (
     factory_runner_status,
@@ -151,6 +151,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fleet.add_argument("action", choices=["status", "wake", "pause", "unpause", "update", "remove"], help="Fleet action")
     p_fleet.add_argument("machine", nargs="?", help="Optional target machine name")
     p_fleet.add_argument("--drain", action="store_true", help="Drain active jobs when pausing")
+
+    p_clean = sub.add_parser(
+        "clean",
+        parents=[repo_flags],
+        help="Remove worktrees for merged/rejected jobs and prune stale git worktrees",
+    )
+    p_clean.add_argument("--dry-run", action="store_true", help="Show worktrees that would be removed without deleting them")
 
     return parser
 
@@ -362,6 +369,40 @@ def main(argv: list[str] | None = None) -> int:
             for msg in messages:
                 print(msg)
         return 0 if all_ok else 1
+
+    if args.command == "clean":
+        for idx, repo in enumerate(repos):
+            if multi:
+                if idx > 0:
+                    print()
+                print(f"=== {os.path.basename(repo)} ({repo}) ===")
+            jobs_dir = os.path.join(repo, "factory", "jobs")
+            wt_root = os.path.join(repo, ".worktrees")
+            reclaimed: list[str] = []
+            if os.path.isdir(wt_root):
+                for entry in sorted(os.listdir(wt_root)):
+                    wt_path = os.path.join(wt_root, entry)
+                    job_file = os.path.join(jobs_dir, entry, "job.json")
+                    if not os.path.isfile(job_file):
+                        continue
+                    try:
+                        with open(job_file, "r", encoding="utf-8") as f:
+                            job_data = json.load(f)
+                    except (OSError, ValueError):
+                        continue
+                    if job_data.get("stage") in ("merged", "rejected"):
+                        reclaimed.append(wt_path)
+                        if not args.dry_run:
+                            remove_worktree(repo, wt_path)
+            if not args.dry_run:
+                _run_git(repo, "worktree", "prune", check=False)
+            if reclaimed:
+                verb = "[dry-run] would remove" if args.dry_run else "removed"
+                for path in reclaimed:
+                    print(f"{verb} {path}")
+            else:
+                print("Nothing to clean.")
+        return 0
 
     return 1
 

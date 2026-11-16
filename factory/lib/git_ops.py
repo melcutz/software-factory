@@ -5,6 +5,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 from typing import Callable
@@ -88,6 +89,18 @@ def ensure_worktree(
 def is_worktree_clean(worktree: str) -> bool:
     res = _run_git(worktree, "status", "--porcelain", "-uall")
     return res.stdout.strip() == ""
+
+
+def remove_worktree(repo_root: str, worktree_path: str) -> bool:
+    """Force-remove a git worktree and prune stale worktree metadata."""
+    existed = os.path.exists(worktree_path)
+    with repo_lock(repo_root):
+        if existed:
+            _run_git(repo_root, "worktree", "remove", "--force", worktree_path, check=False)
+            if os.path.exists(worktree_path):
+                shutil.rmtree(worktree_path, ignore_errors=True)
+        _run_git(repo_root, "worktree", "prune", check=False)
+    return existed and not os.path.exists(worktree_path)
 
 
 def reset_worktree_clean(worktree: str) -> None:

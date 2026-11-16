@@ -90,6 +90,48 @@ class MultiRepoCliTests(unittest.TestCase):
             self.assertIn("=== repo-a", out)
             self.assertIn("=== repo-b", out)
 
+    def test_clean_dry_run_and_live_execution(self):
+        import json
+        import subprocess
+        from factory.lib.git_ops import ensure_worktree
+
+        with tempfile.TemporaryDirectory() as tmp:
+            origin = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            subprocess.run(["git", "init", "--bare", "-b", "main", origin], check=True, capture_output=True)
+            subprocess.run(["git", "clone", origin, repo], check=True, capture_output=True)
+            os.makedirs(os.path.join(repo, "factory", "jobs"), exist_ok=True)
+            with open(os.path.join(repo, "README.md"), "w", encoding="utf-8") as f:
+                f.write("hi\n")
+            subprocess.run(["git", "-C", repo, "add", "."], check=True)
+            subprocess.run(["git", "-C", repo, "commit", "-m", "init"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo, "push", "-u", "origin", "main"], check=True, capture_output=True)
+
+            wt_merged, _ = ensure_worktree(repo, "job-1", "main")
+            wt_ready, _ = ensure_worktree(repo, "job-2", "main")
+            for jid, stage in [("job-1", "merged"), ("job-2", "ready")]:
+                jdir = os.path.join(repo, "factory", "jobs", jid)
+                os.makedirs(jdir, exist_ok=True)
+                with open(os.path.join(jdir, "job.json"), "w", encoding="utf-8") as f:
+                    json.dump({"job_id": jid, "stage": stage}, f)
+
+            buf_dry = io.StringIO()
+            with contextlib.redirect_stdout(buf_dry):
+                rc_dry = cli.main(["clean", "--repo", repo, "--dry-run"])
+            self.assertEqual(rc_dry, 0)
+            self.assertIn("job-1", buf_dry.getvalue())
+            self.assertNotIn("job-2", buf_dry.getvalue())
+            self.assertTrue(os.path.isdir(wt_merged))
+            self.assertTrue(os.path.isdir(wt_ready))
+
+            buf_live = io.StringIO()
+            with contextlib.redirect_stdout(buf_live):
+                rc_live = cli.main(["clean", "--repo", repo])
+            self.assertEqual(rc_live, 0)
+            self.assertIn("job-1", buf_live.getvalue())
+            self.assertFalse(os.path.exists(wt_merged))
+            self.assertTrue(os.path.isdir(wt_ready))
+
 
 if __name__ == "__main__":
     unittest.main()

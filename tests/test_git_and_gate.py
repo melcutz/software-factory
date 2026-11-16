@@ -11,6 +11,7 @@ from factory.lib.git_ops import (
     ensure_worktree,
     format_untrusted_issue_md,
     is_worktree_clean,
+    remove_worktree,
     sync_with_base,
 )
 
@@ -306,6 +307,53 @@ class GitAndGateTests(unittest.TestCase):
             }
             passed_self, md_self = run_gate(clone, "job-26", wt, 1, cfg_self)
             self.assertTrue(passed_self, md_self)
+
+    def test_remove_worktree_removes_directory_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, clone = self._init_origin_and_clone(tmp)
+            wt, _ = ensure_worktree(clone, "job-30", "main")
+            self.assertTrue(os.path.isdir(wt))
+            self.assertTrue(remove_worktree(clone, wt))
+            self.assertFalse(os.path.exists(wt))
+            # Calling again when already absent returns False without error
+            self.assertFalse(remove_worktree(clone, wt))
+
+    def test_cleanup_terminal_job_prunes_merged_and_rejected_only(self):
+        from factory.lib.pipeline import _cleanup_terminal_job
+
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, clone = self._init_origin_and_clone(tmp)
+            wt_merged, br_merged = ensure_worktree(clone, "job-31", "main")
+            subprocess.run(["git", "-C", wt_merged, "push", "-u", "origin", br_merged], check=True, capture_output=True)
+            # Also create a superseded QA branch on origin
+            subprocess.run(["git", "-C", wt_merged, "checkout", "-b", "factory/job-31-qa1"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", wt_merged, "push", "-u", "origin", "factory/job-31-qa1"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", wt_merged, "checkout", br_merged], check=True, capture_output=True)
+
+            _cleanup_terminal_job(
+                clone,
+                "job-31",
+                {
+                    "stage": "merged",
+                    "branch": br_merged,
+                    "prior_prs": [{"pr_number": 1, "branch": "factory/job-31-qa1"}],
+                },
+            )
+            self.assertFalse(os.path.exists(wt_merged))
+            rem = subprocess.run(
+                ["git", "--git-dir", origin, "branch", "--list", "factory/job-31*"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(rem.stdout.strip(), "")
+
+            # ready / needs-human jobs must preserve their worktrees
+            wt_ready, br_ready = ensure_worktree(clone, "job-32", "main")
+            _cleanup_terminal_job(clone, "job-32", {"stage": "ready", "branch": br_ready})
+            self.assertTrue(os.path.isdir(wt_ready))
+            _cleanup_terminal_job(clone, "job-32", {"stage": "needs-human", "branch": br_ready})
+            self.assertTrue(os.path.isdir(wt_ready))
 
 
 if __name__ == "__main__":

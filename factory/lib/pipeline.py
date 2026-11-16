@@ -58,6 +58,7 @@ from factory.lib.git_ops import (
     delete_remote_branch,
     diff_stat,
     ensure_worktree,
+    remove_worktree,
     head_sha,
     is_worktree_clean,
     merge_in_progress,
@@ -636,6 +637,8 @@ def _mark_ticket_merged(
     if os.path.isfile(qa_fail_file):
         os.remove(qa_fail_file)
     merged_job = advance_stage(jobs_dir, ticket.job_id, "merged")
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(jobs_dir)))
+    _cleanup_terminal_job(repo_root, ticket.job_id, merged_job)
     try:
         gh_client.edit_labels(ticket.issue_number, remove=[labels["queue"]])
         if qa_out is not None:
@@ -1775,6 +1778,31 @@ def _checkpoint_if_store(
         update_job(jobs_dir, job_id, **updates)
 
 
+def _cleanup_terminal_job(repo_root: str, job_id: str, job: dict) -> None:
+    """Remove worktree and superseded remote branches for terminal merged/rejected jobs."""
+    if job.get("stage") not in ("merged", "rejected"):
+        return
+    wt_path = os.path.join(repo_root, ".worktrees", job_id)
+    try:
+        remove_worktree(repo_root, wt_path)
+    except Exception:
+        pass
+    branches: list[str] = []
+    for item in job.get("prior_prs") or []:
+        if isinstance(item, dict) and item.get("branch"):
+            branches.append(str(item["branch"]))
+    if job.get("branch"):
+        branches.append(str(job["branch"]))
+    seen: set[str] = set()
+    for br in branches:
+        if br and br not in seen:
+            seen.add(br)
+            try:
+                delete_remote_branch(repo_root, br)
+            except Exception:
+                pass
+
+
 def _finalize_job_exit(
     state_store: GitStateStore | None,
     job_id: str,
@@ -1800,8 +1828,14 @@ def _finalize_job_exit(
         _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, worktree=wt_arg, release_lease=True)
         if st in TERMINAL_OR_READY_STAGES:
             state_store.delete_slice_checkpoint(job_id)
-        return load_job(jobs_dir, job_id)
-    return load_job(jobs_dir, job_id)
+    final_job = load_job(jobs_dir, job_id)
+    if final_job.get("stage") in ("merged", "rejected"):
+        if worktree and os.path.basename(os.path.dirname(os.path.abspath(worktree))) == ".worktrees":
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(worktree)))
+        else:
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(jobs_dir)))
+        _cleanup_terminal_job(repo_root, job_id, final_job)
+    return final_job
 
 
 def run_halt(repos: list[str], reason: str = "", force: bool = False) -> int:
