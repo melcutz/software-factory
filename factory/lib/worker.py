@@ -259,7 +259,7 @@ def exec_job_command(repo_root: str, issue_number: int) -> int:
         print(f"Worktree: {wt}")
         if job.get("last_error"):
             print(f"Reason: {job['last_error']}")
-        if sys.stdin.isatty() and os.path.isdir(wt):
+        if not bridge.enabled and os.environ.get("FACTORY_INTERACTIVE_SHELL") == "1" and sys.stdin.isatty() and os.path.isdir(wt):
             shell = os.environ.get("SHELL") or "/bin/bash"
             subprocess.run([shell], cwd=wt, check=False)
         return 2

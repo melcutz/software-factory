@@ -324,7 +324,14 @@ class GitStateStore:
 
         for ref in sorted(self._ls_remote("refs/factory/jobs/*")):
             jid = ref.rsplit("/", 1)[-1]
-            if jid in closed_job_ids:
+            prune_job_ref = jid in closed_job_ids
+            if not prune_job_ref and jid in terminal_job_ids:
+                commit_sha = self._fetch_ref(ref)
+                if commit_sha:
+                    data = self._read_json_from_commit(commit_sha, "job.json") or {}
+                    if str(data.get("stage") or "") not in ("merged", "rejected"):
+                        prune_job_ref = True
+            if prune_job_ref:
                 pruned.append(ref)
                 if not dry_run:
                     self._delete_remote_ref(ref)

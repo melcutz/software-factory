@@ -751,3 +751,15 @@ def test_train_ticket_refs_crud(tmp_path):
     assert s0.list_train_tickets() == []
 
 
+def test_reconcile_clean_refs_prunes_stale_non_terminal_job_refs(tmp_path):
+    _, clones = _init_bare_and_clones(tmp_path, n=1)
+    s0 = GitStateStore(clones[0], "m0")
+    assert s0.claim_job_lease("job-10", {"id": "job-10", "issue": 10, "stage": "needs-human"})[0]
+    assert s0.claim_job_lease("job-11", {"id": "job-11", "issue": 11, "stage": "merged"})[0]
+
+    pruned = s0.reconcile_clean_refs(terminal_job_ids={"job-10", "job-11"})
+    assert "refs/factory/jobs/job-10" in pruned
+    assert "refs/factory/jobs/job-11" not in pruned
+
+
+

@@ -557,4 +557,22 @@ def test_run_factory_spawns_hc_terminals(tmp_path, monkeypatch):
     assert any("wait t77" in ln for ln in spawn_lines)
 
 
+def test_exec_job_needs_human_does_not_hang_in_tty_shell(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / "factory").mkdir(parents=True)
+    wt = repo / ".worktrees" / "job-88"
+    wt.mkdir(parents=True)
+
+    monkeypatch.setattr("factory.lib.worker.process_job", lambda *a, **kw: {"id": "job-88", "stage": "needs-human", "last_error": "boom"})
+    monkeypatch.setattr("factory.lib.worker.sys.stdin.isatty", lambda: True)
+    shell_called = []
+    monkeypatch.setattr("factory.lib.worker.subprocess.run", lambda *a, **kw: shell_called.append(a))
+
+    from factory.lib.worker import exec_job_command
+    rc = exec_job_command(str(repo), 88)
+    assert rc == 2
+    assert shell_called == []
+
+
+
 
