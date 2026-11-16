@@ -31,8 +31,8 @@ class ConfigAndSchemaTests(unittest.TestCase):
         self.assertEqual(cfg["auto_merge"], "all")
         rev = resolve_reviewers(cfg, "high", ["ui", "security"])
         self.assertEqual(set(rev.keys()), {"code", "security", "ux", "ui"})
-        self.assertEqual(rev["code"], "gemini-3.8-flash-medium")
-        self.assertEqual(rev["security"], "gemini-4-argon-high")
+        self.assertEqual(rev["code"], "gemini-3.8-flash-low")
+        self.assertEqual(rev["security"], "gemini-3.8-flash-medium")
         rev_low = resolve_reviewers(cfg, "low", [])
         self.assertEqual(rev_low, {"code": "gemini-3.6-flash-low"})
 

@@ -720,7 +720,7 @@ class PipelineE2ETests(unittest.TestCase):
 
         out = buf.getvalue()
         self.assertRegex(out, r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[job-30\]")
-        self.assertIn("model=gemini-4-argon effort=high", out)
+        self.assertIn("model=gemini-3.8-flash effort=medium", out)
         self.assertIn("cache=200,000", out)
         self.assertIn("cost=$", out)
         self.assertIn("scope=slice", out)
