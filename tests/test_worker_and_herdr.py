@@ -120,9 +120,10 @@ def test_fleet_wake_uses_hc_machine_ls_and_hc_run_on(tmp_path, monkeypatch):
     from factory.lib.fleet import fleet_wake
 
     results = fleet_wake()
-    assert len(results) == 2
+    assert len(results) >= 2
     lines = log_file.read_text().splitlines()
     assert any(ln == "machine ls" for ln in lines)
+    assert any("run --bg --name factory-worker-" in ln and "exec factory worker --all" in ln for ln in lines)
     assert any("run --on ryzen-box --bg --name factory-worker-ryzen-box -- sh -lc" in ln and "exec factory worker --all" in ln for ln in lines)
     assert any("run --on wsl-node --bg --name factory-worker-wsl-node -- sh -lc" in ln and "exec factory worker --all" in ln for ln in lines)
 
@@ -169,5 +170,5 @@ def test_fleet_wake_is_idempotent_on_name_taken(tmp_path, monkeypatch):
 
     from factory.lib.fleet import fleet_wake
     res = fleet_wake()
-    assert res == [("base-ubuntu", 0, "already running")]
+    assert ("base-ubuntu", 0, "already running") in res
 

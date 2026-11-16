@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
-import sys
 
 from factory.lib.worker import host_config_dir, is_host_paused, set_host_paused
 
@@ -14,10 +14,23 @@ def _hc_bin() -> str:
     return (os.environ.get("HC_BIN_PATH") or shutil.which("hc") or "").strip()
 
 
-def discover_machines() -> list[dict]:
-    """Discover peer machines via `hc machine ls` plus optional fleet.json fallback."""
+def discover_machines(*, include_local: bool = True) -> list[dict]:
+    """Discover local + peer machines via `hc machine ls` plus optional fleet.json fallback."""
     machines: list[dict] = []
     seen: set[str] = set()
+    local_name = socket.gethostname().split(".")[0]
+    if include_local and local_name:
+        seen.add(local_name)
+        machines.append(
+            {
+                "name": local_name,
+                "via": "local",
+                "host": local_name,
+                "state": "paused" if is_host_paused() else "local",
+                "version": "",
+                "target": local_name,
+            }
+        )
     hc = _hc_bin()
     if hc:
         try:
@@ -81,6 +94,21 @@ def discover_machines() -> list[dict]:
 
 def _run_on_machine(machine: dict, cmd: list[str], *, bg: bool = False, name: str = "") -> tuple[int, str]:
     hc = _hc_bin()
+    if machine.get("via") == "local":
+        if bg and hc:
+            full = [hc, "run", "--bg"]
+            if name:
+                full.extend(["--name", name])
+            full.append("--")
+            full.extend(cmd)
+            res = subprocess.run(full, capture_output=True, text=True, timeout=15.0, check=False)
+            return res.returncode, (res.stdout or res.stderr or "").strip()
+        if bg:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return 0, "started (local background)"
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30.0, check=False)
+        return res.returncode, (res.stdout or res.stderr or "").strip()
+
     if machine.get("via") == "hc" and hc:
         full = [hc, "run", "--on", machine["name"]]
         if bg:
