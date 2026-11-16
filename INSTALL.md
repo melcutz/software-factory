@@ -1,4 +1,4 @@
-# Setup & Installation Guide (`software-factory-agy` v0.2.0)
+# Setup & Installation Guide (`software-factory-agy` v0.3.0)
 
 This guide walks you through installing `software-factory-agy` on one machine or across a multi-machine homelab/workstation fleet.
 
@@ -7,8 +7,9 @@ This guide walks you through installing `software-factory-agy` on one machine or
 ## Prerequisites
 
 - **Python 3.10+** (standard library only; zero third-party runtime dependencies)
-- **Git** and **GitHub CLI (`gh`)** authenticated (`gh auth status`) with repo push & PR permissions
+- **Git** and **GitHub CLI (`gh >= 2.67`)** authenticated (`gh auth status`) with repo push & PR permissions *(older `gh` versions such as `2.46.0` fail `gh pr edit` due to deprecated Projects classic `projectCards` GraphQL queries)*
 - **Antigravity CLI (`agy`)** installed and authenticated on `PATH`
+- **Tooling used by your target repo's `factory/checks.sh`** (e.g. `uv`, `node`, `ruff`, `pytest`) installed on `PATH` or in `~/.local/bin` (automatically prepended by `exec_job_command` in `hc` child terminals)
 - *(Optional, recommended for multi-machine fleets)* **[`herdr-app` + `herdr-core` (`hc`)](https://herdr.dev/)**:
   - macOS / Linux: `curl -fsSL https://releases.herdr.dev/app/install.sh | sh`
   - Windows: `irm https://releases.herdr.dev/app/install.ps1 | iex`
@@ -24,6 +25,8 @@ Clone this repository and install it in editable mode on each machine that will 
 git clone https://github.com/melcutz/software-factory-agy.git
 cd software-factory-agy
 pip install -e .
+# On Ubuntu 24.04+ / externally managed Python environments:
+# python3 -m pip install --user --break-system-packages --no-deps -e .
 ```
 
 Verify `factory` is on `PATH`:
@@ -38,7 +41,7 @@ factory --help
 
 ## 2. Configure Each Target Repository
 
-In each repository you want the factory to manage:
+In each repository you want the factory to manage, run `factory init --repo /path/to/your-repo` (to scaffold `factory/config.json`, `checks.sh`, `REPO_MAP.md`, and `.gitignore`) or configure manually:
 
 1. **Create `factory/checks.sh`** with your deterministic, non-interactive test/lint/typecheck suite and make it executable:
    ```bash
@@ -158,4 +161,6 @@ Open **`herdr-app`** (or run `hc ls` / `hc attach <name>` in a terminal) to see 
 | Emergency stop across the entire fleet | `factory halt --all --reason "lunch break"` |
 | Resume fleet after a halt | `factory resume --all` |
 | Pause new claims on just this machine | `factory pause` (`factory unpause` to resume) |
+| Clean up merged/rejected worktrees | `factory clean --repo /path/to/your-repo` |
+| View cost/throughput telemetry | `factory stats --repo /path/to/your-repo` |
 | Check / wake / pause peer machines | `factory fleet status` / `factory fleet wake` / `factory fleet pause <name>` |
