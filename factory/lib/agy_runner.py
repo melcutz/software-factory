@@ -123,13 +123,27 @@ def _load_self_host_prompt_note(factory_dir: str) -> str:
     )
 
 
+def load_pitfalls(factory_dir: str, max_lines: int = 60) -> str:
+    """Load optional factory/PITFALLS.md capped to `max_lines`."""
+    path = os.path.join(factory_dir, "PITFALLS.md")
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = [ln.rstrip("\n") for ln in f]
+    except OSError:
+        return ""
+    body = "\n".join(lines[:max_lines]).strip()
+    return body
+
+
 def build_agent_prompt(
     factory_dir: str,
     stage: str,
     agent_name: str,
     task_prompt: str,
 ) -> str:
-    """Assemble headless subagent prompt with optional REPO_MAP context."""
+    """Assemble headless subagent prompt with optional REPO_MAP and PITFALLS context."""
     instructions = load_agent_instructions(factory_dir, agent_name)
     parts = [f"{SUBAGENT_PREAMBLE}\n{instructions}"]
     if stage != "plan":
@@ -139,6 +153,9 @@ def build_agent_prompt(
         repo_map = load_repo_map(factory_dir)
         if repo_map:
             parts.append(f"## Repository Architecture Map\n\n{repo_map}")
+        pitfalls = load_pitfalls(factory_dir, max_lines=60)
+        if pitfalls:
+            parts.append(f"## Repository Pitfalls & Guardrails\n\n{pitfalls}")
     parts.append(f"## Stage Task\n\n{task_prompt}")
     return "\n\n---\n\n".join(parts)
 

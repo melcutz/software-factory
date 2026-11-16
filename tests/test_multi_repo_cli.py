@@ -132,6 +132,84 @@ class MultiRepoCliTests(unittest.TestCase):
             self.assertFalse(os.path.exists(wt_merged))
             self.assertTrue(os.path.isdir(wt_ready))
 
+    def test_init_map_and_learn_cli(self):
+        import json
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, "demo-app")
+            os.makedirs(os.path.join(repo, "src"), exist_ok=True)
+            os.makedirs(os.path.join(repo, "tests"), exist_ok=True)
+            with open(os.path.join(repo, "pyproject.toml"), "w", encoding="utf-8") as f:
+                f.write('[project]\nname = "demo-app"\n')
+            with open(os.path.join(repo, "src", "app.py"), "w", encoding="utf-8") as f:
+                f.write("def hi(): return 'ok'\n")
+            with open(os.path.join(repo, "tests", "test_app.py"), "w", encoding="utf-8") as f:
+                f.write("def test_hi(): assert True\n")
+            subprocess.run(["git", "init", "-b", "main", repo], check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo, "add", "."], check=True)
+
+            buf_map = io.StringIO()
+            with contextlib.redirect_stdout(buf_map):
+                rc_map = cli.main(["map", "--repo", repo, "--stdout"])
+            self.assertEqual(rc_map, 0)
+            map_out = buf_map.getvalue()
+            self.assertIn("pyproject.toml", map_out)
+            self.assertLess(len(map_out.splitlines()), 100)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_init = cli.main(["init", "--repo", repo])
+            self.assertEqual(rc_init, 0)
+            cfg_path = os.path.join(repo, "factory", "config.json")
+            checks_path = os.path.join(repo, "factory", "checks.sh")
+            gi_path = os.path.join(repo, ".gitignore")
+            self.assertTrue(os.path.isfile(cfg_path))
+            self.assertTrue(os.access(checks_path, os.X_OK))
+            self.assertTrue(os.path.isfile(os.path.join(repo, "factory", "REPO_MAP.md")))
+            with open(cfg_path, encoding="utf-8") as f:
+                self.assertFalse(json.load(f)["allow_self_host"])
+            with open(gi_path, encoding="utf-8") as f:
+                gi_txt = f.read()
+            self.assertIn("/factory/jobs/*", gi_txt)
+            self.assertIn("!/factory/jobs/.gitkeep", gi_txt)
+            self.assertIn("/.worktrees/", gi_txt)
+
+            # Preserves existing config without --force, overwrites with --force
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump({"allow_self_host": True}, f)
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli.main(["init", "--repo", repo])
+            with open(cfg_path, encoding="utf-8") as f:
+                self.assertTrue(json.load(f)["allow_self_host"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli.main(["init", "--repo", repo, "--force"])
+            with open(cfg_path, encoding="utf-8") as f:
+                self.assertFalse(json.load(f)["allow_self_host"])
+
+            # factory learn extracts & deduplicates PITFALLS.md
+            jdir = os.path.join(repo, "factory", "jobs", "job-10")
+            os.makedirs(os.path.join(jdir, "round-1"), exist_ok=True)
+            with open(os.path.join(jdir, "job.json"), "w", encoding="utf-8") as f:
+                json.dump({"id": "job-10", "issue": 10, "stage": "merged", "round": 2, "qa_round": 0}, f)
+            with open(os.path.join(jdir, "round-1", "review-code.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "verdict": "FAIL",
+                        "summary": ["Mutable default"],
+                        "findings": [{"severity": "high", "message": "Avoid mutable default arguments in helpers"}],
+                    },
+                    f,
+                )
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_learn1 = cli.main(["learn", "job-10", "--repo", repo])
+                rc_learn2 = cli.main(["learn", "job-10", "--repo", repo])
+            self.assertEqual(rc_learn1, 0)
+            self.assertEqual(rc_learn2, 0)
+            pitfalls_path = os.path.join(repo, "factory", "PITFALLS.md")
+            with open(pitfalls_path, encoding="utf-8") as f:
+                pit_txt = f.read()
+            self.assertEqual(pit_txt.count("Avoid mutable default arguments in helpers"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

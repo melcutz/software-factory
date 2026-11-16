@@ -12,6 +12,7 @@ from factory.lib.config import load_config
 from factory.lib.fleet import fleet_pause, fleet_remove, fleet_status, fleet_unpause, fleet_update, fleet_wake
 from factory.lib.gate_runner import run_gate
 from factory.lib.git_ops import GitHubClient, _run_git, remove_worktree
+from factory.lib.onboarding import generate_repo_map, init_repository, learn_from_jobs
 from factory.lib.git_state import GitStateStore
 from factory.lib.pipeline import (
     factory_runner_status,
@@ -158,6 +159,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Remove worktrees for merged/rejected jobs and prune stale git worktrees",
     )
     p_clean.add_argument("--dry-run", action="store_true", help="Show worktrees that would be removed without deleting them")
+
+    p_map = sub.add_parser(
+        "map",
+        parents=[repo_flags],
+        help="Generate factory/REPO_MAP.md from tracked repository layout",
+    )
+    p_map.add_argument("--stdout", action="store_true", help="Print generated map to stdout instead of writing file")
+
+    p_init = sub.add_parser(
+        "init",
+        parents=[repo_flags],
+        help="Scaffold factory/config.json, checks.sh, REPO_MAP.md, and .gitignore",
+    )
+    p_init.add_argument("--force", action="store_true", help="Overwrite existing factory files")
+
+    p_learn = sub.add_parser(
+        "learn",
+        parents=[repo_flags],
+        help="Distill guardrails from multi-round/QA jobs into factory/PITFALLS.md",
+    )
+    p_learn.add_argument("job_id", nargs="?", help="Optional specific job ID (e.g. job-12)")
+    p_learn.add_argument("--deterministic", action="store_true", help="Use deterministic extraction without LLM")
 
     return parser
 
@@ -402,6 +425,37 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{verb} {path}")
             else:
                 print("Nothing to clean.")
+        return 0
+
+    if args.command == "map":
+        for idx, repo in enumerate(repos):
+            content = generate_repo_map(repo)
+            if args.stdout:
+                if multi:
+                    print(f"=== {os.path.basename(repo)} ({repo}) ===")
+                print(content, end="")
+            else:
+                out_path = os.path.join(repo, "factory", "REPO_MAP.md")
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print(f"Wrote {out_path}")
+        return 0
+
+    if args.command == "init":
+        for repo in repos:
+            written = init_repository(repo, force=args.force)
+            print(f"Initialized {repo} ({len(written)} files updated)")
+        return 0
+
+    if args.command == "learn":
+        for repo in repos:
+            added = learn_from_jobs(repo, job_id=args.job_id)
+            if added:
+                for b in added:
+                    print(f"+ {b}")
+            else:
+                print("No new pitfalls distilled.")
         return 0
 
     return 1

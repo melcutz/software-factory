@@ -389,6 +389,29 @@ class ReliabilityAndEfficiencyTests(unittest.TestCase):
             self.assertEqual(calls, [])
             self.assertIn("0.50", res42.get("last_error") or "")
 
+    def test_build_agent_prompt_injects_pitfalls_capped_at_60_lines(self) -> None:
+        from factory.lib.agy_runner import build_agent_prompt
+
+        with tempfile.TemporaryDirectory() as d:
+            fdir = os.path.join(d, "factory")
+            adir = os.path.join(fdir, "agents")
+            os.makedirs(adir, exist_ok=True)
+            with open(os.path.join(adir, "builder.md"), "w", encoding="utf-8") as f:
+                f.write("Builder instructions")
+            with open(os.path.join(adir, "planner.md"), "w", encoding="utf-8") as f:
+                f.write("Planner instructions")
+            with open(os.path.join(fdir, "PITFALLS.md"), "w", encoding="utf-8") as f:
+                f.write("\n".join(f"- Pitfall line {i}" for i in range(1, 81)) + "\n")
+
+            build_prompt = build_agent_prompt(fdir, "build", "builder", "Do task")
+            self.assertIn("## Repository Pitfalls & Guardrails", build_prompt)
+            self.assertIn("- Pitfall line 1", build_prompt)
+            self.assertIn("- Pitfall line 60", build_prompt)
+            self.assertNotIn("- Pitfall line 61", build_prompt)
+
+            plan_prompt = build_agent_prompt(fdir, "plan", "planner", "Plan task")
+            self.assertNotIn("## Repository Pitfalls & Guardrails", plan_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
