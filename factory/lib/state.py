@@ -16,7 +16,7 @@ TRANSITIONS: dict[str, list[str]] = {
     "gate": ["review", "build", "needs-human"],
     "review": ["approve", "build", "needs-human"],
     "approve": ["merging", "ready", "needs-human"],
-    "merging": ["staging_qa", "merged", "needs-human"],
+    "merging": ["staging_qa", "merged", "build", "needs-human"],
     "staging_qa": ["merged", "merging", "build", "needs-human"],
     "needs-human": ["intake", "spec", "build", "merging", "staging_qa", "rejected"],
     "ready": ["merged", "merging", "build", "needs-human"],

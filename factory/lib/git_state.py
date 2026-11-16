@@ -415,6 +415,30 @@ class GitStateStore:
                 return True, job_data
             return False, None
 
+    def renew_job_lease(self, job_id: str, *, now_ts: float | None = None) -> bool:
+        """Extend an active job lease owned by this machine so long runs stay claimed."""
+        ts = time.time() if now_ts is None else now_ts
+        ref = f"refs/factory/jobs/{job_id}"
+        with self._repo_lock():
+            old_sha = self._fetch_ref(ref)
+            if not old_sha:
+                return False
+            job_data = self._read_json_from_commit(old_sha, "job.json")
+            if not isinstance(job_data, dict):
+                return False
+            lease = job_data.get("lease")
+            if not isinstance(lease, dict) or lease.get("worker_id") != self.machine_id:
+                return False
+            lease["expires_at_ts"] = ts + WORKER_TTL_SEC
+            job_data["lease"] = lease
+            return self._push_json_ref(
+                ref,
+                "job.json",
+                job_data,
+                f"renew lease {job_id} by {self.machine_id}",
+                old_sha,
+            )
+
     def _collect_checkpoint_files(self, jdir: str, job_payload: dict) -> dict[str, bytes]:
         files: dict[str, bytes] = {
             "job.json": json.dumps(job_payload, indent=2).encode("utf-8"),

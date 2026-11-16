@@ -234,7 +234,23 @@ def exec_job_command(repo_root: str, issue_number: int) -> int:
     store = GitStateStore(repo_root, host_cfg.machine_id)
     bridge.emit_status("working", progress=5)
 
-    job = process_job(repo_root, issue_number, state_store=store)
+    job_id = f"job-{issue_number}"
+    lease_stop = threading.Event()
+
+    def _lease_heartbeat() -> None:
+        while not lease_stop.wait(120.0):
+            try:
+                store.renew_job_lease(job_id)
+            except Exception:
+                pass
+
+    hb_thread = threading.Thread(target=_lease_heartbeat, daemon=True)
+    hb_thread.start()
+    try:
+        job = process_job(repo_root, issue_number, state_store=store)
+    finally:
+        lease_stop.set()
+        hb_thread.join(timeout=1.0)
     stage = str(job.get("stage") or "")
     if stage == "needs-human":
         bridge.emit_status("blocked", kind="question")

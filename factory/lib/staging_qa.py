@@ -403,10 +403,18 @@ def revert_commit_on_base(deploy_wt: str, base_branch: str, merged_sha: str) -> 
     rev_line = _run_git(deploy_wt, "rev-list", "--parents", "-n", "1", merged_sha).stdout.strip()
     tokens = rev_line.split()
     parent_count = max(0, len(tokens) - 1)
-    if parent_count >= 2:
-        _run_git(deploy_wt, "revert", "--no-edit", "-m", "1", merged_sha)
-    else:
-        _run_git(deploy_wt, "revert", "--no-edit", merged_sha)
+    cmd = (
+        ["revert", "--no-edit", "-m", "1", merged_sha]
+        if parent_count >= 2
+        else ["revert", "--no-edit", merged_sha]
+    )
+    res = _run_git(deploy_wt, *cmd, check=False)
+    if res.returncode != 0:
+        detail = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
+        _run_git(deploy_wt, "revert", "--abort", check=False)
+        if "nothing to commit" in detail.lower() or "working tree clean" in detail.lower():
+            return head_sha(deploy_wt)
+        raise subprocess.CalledProcessError(res.returncode, res.args, output=res.stdout, stderr=res.stderr)
 
     revert_sha = head_sha(deploy_wt)
     _run_git(deploy_wt, "push", "origin", f"HEAD:{base_branch}")
@@ -441,6 +449,9 @@ def try_revert_commits_on_base(
         if res.returncode != 0:
             detail = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
             _run_git(deploy_wt, "revert", "--abort", check=False)
+            if "nothing to commit" in detail.lower() or "working tree clean" in detail.lower():
+                revert_map[sha] = head_sha(deploy_wt)
+                continue
             _run_git(deploy_wt, "reset", "--hard", f"origin/{base_branch}", check=False)
             _run_git(deploy_wt, "clean", "-fd", check=False)
             return False, {}, detail
