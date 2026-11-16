@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from unittest.mock import patch
 
 from factory import cli
 from factory.lib.agy_runner import ENGINE_FACTORY_DIR, load_agent_instructions, resolve_agent_path
+from factory.lib.pipeline import run_doctor
 
 
 class MultiRepoCliTests(unittest.TestCase):
@@ -318,6 +320,146 @@ class MultiRepoCliTests(unittest.TestCase):
                 self.assertEqual(rc_pl, 0)
                 self.assertTrue(any("[patrol:new-1]" in body for _, body, _ in created_issues))
                 self.assertFalse(any("[patrol:dup-1]" in body for _, body, _ in created_issues))
+
+    def _setup_doctor_repo(self, root: str, checks_content: str = "#!/usr/bin/env bash\npython3 -m pytest\n") -> str:
+        repo = os.path.join(root, "repo")
+        fdir = os.path.join(repo, "factory")
+        os.makedirs(fdir, exist_ok=True)
+        with open(os.path.join(fdir, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"auto_merge": "low", "concurrency": 1}, f)
+        checks_path = os.path.join(fdir, "checks.sh")
+        with open(checks_path, "w", encoding="utf-8") as f:
+            f.write(checks_content)
+        os.chmod(checks_path, 0o755)
+        with open(os.path.join(repo, ".gitignore"), "w", encoding="utf-8") as f:
+            f.write("/factory/jobs/*\n/.worktrees/\n")
+        return repo
+
+    def _make_subprocess_mock(self, user_name: str | None = "Ada Lovelace", user_email: str | None = "ada@example.com", pytest_code: int = 0):
+        def fake_run(cmd, *args, **kwargs):
+            cmd_list = [str(c) for c in cmd]
+            if cmd_list[:2] == ["git", "--version"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="git version 2.40\n", stderr="")
+            if cmd_list[:3] == ["gh", "auth", "status"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="Logged in\n", stderr="")
+            if cmd_list[:2] == ["agy", "--version"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="agy 2.0\n", stderr="")
+            if "remote" in cmd_list and "get-url" in cmd_list:
+                return subprocess.CompletedProcess(cmd, 0, stdout="https://github.com/org/repo.git\n", stderr="")
+            if "config" in cmd_list and "user.name" in cmd_list:
+                if user_name is None:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="error: key not found")
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{user_name}\n", stderr="")
+            if "config" in cmd_list and "user.email" in cmd_list:
+                if user_email is None:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="error: key not found")
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{user_email}\n", stderr="")
+            if "check-ignore" in cmd_list:
+                return subprocess.CompletedProcess(cmd, 0, stdout="factory/jobs/probe-job\n.worktrees/probe-job\n", stderr="")
+            if cmd_list == ["python3", "-m", "pytest", "--version"]:
+                if pytest_code == 0:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="pytest 9.0.1\n", stderr="")
+                return subprocess.CompletedProcess(cmd, pytest_code, stdout="", stderr="pytest not found")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return fake_run
+
+    def test_doctor_all_checks_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._setup_doctor_repo(tmp)
+            fake_run = self._make_subprocess_mock()
+            with patch("shutil.which", return_value="/usr/bin/mock"), patch("subprocess.run", side_effect=fake_run):
+                ok, messages = run_doctor(repo)
+                self.assertTrue(ok)
+                self.assertTrue(any(m.startswith("OK: git user.name -> Ada Lovelace") for m in messages))
+                self.assertTrue(any(m.startswith("OK: git user.email -> ada@example.com") for m in messages))
+                self.assertTrue(any(m.startswith("OK: python3 -m pytest") for m in messages))
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.main(["doctor", "--repo", repo])
+                self.assertEqual(rc, 0)
+                out = buf.getvalue()
+                self.assertIn("OK: git user.name", out)
+                self.assertIn("OK: git user.email", out)
+                self.assertIn("OK: python3 -m pytest", out)
+
+    def test_doctor_missing_user_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._setup_doctor_repo(tmp)
+            # Scenario A: git config returns non-zero exit code
+            fake_run_none = self._make_subprocess_mock(user_name=None)
+            with patch("shutil.which", return_value="/usr/bin/mock"), patch("subprocess.run", side_effect=fake_run_none):
+                ok, messages = run_doctor(repo)
+                self.assertFalse(ok)
+                self.assertTrue(any(m.startswith("MISSING: git config user.name") for m in messages))
+                self.assertTrue(any(m.startswith("OK: git user.email") for m in messages))
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.main(["doctor", "--repo", repo])
+                self.assertEqual(rc, 1)
+                self.assertIn("MISSING: git config user.name", buf.getvalue())
+
+            # Scenario B: git config returns empty string
+            fake_run_empty = self._make_subprocess_mock(user_name="")
+            with patch("shutil.which", return_value="/usr/bin/mock"), patch("subprocess.run", side_effect=fake_run_empty):
+                ok, messages = run_doctor(repo)
+                self.assertFalse(ok)
+                self.assertTrue(any(m.startswith("MISSING: git config user.name") for m in messages))
+
+    def test_doctor_missing_user_email(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._setup_doctor_repo(tmp)
+            # Scenario A: git config returns non-zero exit code
+            fake_run_none = self._make_subprocess_mock(user_email=None)
+            with patch("shutil.which", return_value="/usr/bin/mock"), patch("subprocess.run", side_effect=fake_run_none):
+                ok, messages = run_doctor(repo)
+                self.assertFalse(ok)
+                self.assertTrue(any(m.startswith("OK: git user.name") for m in messages))
+                self.assertTrue(any(m.startswith("MISSING: git config user.email") for m in messages))
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.main(["doctor", "--repo", repo])
+                self.assertEqual(rc, 1)
+                self.assertIn("MISSING: git config user.email", buf.getvalue())
+
+            # Scenario B: git config returns empty string
+            fake_run_empty = self._make_subprocess_mock(user_email="")
+            with patch("shutil.which", return_value="/usr/bin/mock"), patch("subprocess.run", side_effect=fake_run_empty):
+                ok, messages = run_doctor(repo)
+                self.assertFalse(ok)
+                self.assertTrue(any(m.startswith("MISSING: git config user.email") for m in messages))
+
+    def test_doctor_pytest_version_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._setup_doctor_repo(tmp)
+            fake_run = self._make_subprocess_mock(pytest_code=1)
+            with patch("shutil.which", return_value="/usr/bin/mock"), patch("subprocess.run", side_effect=fake_run):
+                ok, messages = run_doctor(repo)
+                self.assertFalse(ok)
+                self.assertTrue(any(m.startswith("MISSING: python3 -m pytest") for m in messages))
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.main(["doctor", "--repo", repo])
+                self.assertEqual(rc, 1)
+                self.assertIn("MISSING: python3 -m pytest", buf.getvalue())
+
+    def test_doctor_checks_sh_without_pytest_skips_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._setup_doctor_repo(tmp, checks_content="#!/usr/bin/env bash\necho ok\n")
+            fake_run = self._make_subprocess_mock(pytest_code=1)  # Even if pytest would fail, it shouldn't be called
+            with patch("shutil.which", return_value="/usr/bin/mock"), patch("subprocess.run", side_effect=fake_run):
+                ok, messages = run_doctor(repo)
+                self.assertTrue(ok)
+                self.assertFalse(any("python3 -m pytest" in m for m in messages))
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.main(["doctor", "--repo", repo])
+                self.assertEqual(rc, 0)
+                self.assertNotIn("python3 -m pytest", buf.getvalue())
 
 
 if __name__ == "__main__":
