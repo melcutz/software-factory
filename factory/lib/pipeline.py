@@ -952,6 +952,151 @@ def _distributed_staging_lock(
         state_store.release_staging_lock()
 
 
+def _run_distributed_staging_train(
+    *,
+    repo_root: str,
+    factory_dir: str,
+    jobs_dir: str,
+    cfg: dict,
+    gh_client: GitHubClient,
+    state_store: GitStateStore,
+    job_id: str,
+    issue_number: int,
+    jdir: str,
+    worktree: str,
+    branch: str,
+    issue_md: str,
+    initial_stage: str,
+    solo: bool,
+) -> TrainOutcome:
+    """Coordinate multi-worker/multi-machine staging train batches via refs/factory/train/*."""
+    staging_cfg = cfg.get("staging_qa") or {}
+    base_branch = cfg["base_branch"]
+    max_batch_size = max(1, int(staging_cfg.get("max_batch_size", 4)))
+    coalesce_window_sec = max(0.0, float(staging_cfg.get("coalesce_window_sec", 15)))
+
+    state_store.put_train_ticket(
+        job_id,
+        {
+            "job_id": job_id,
+            "issue_number": issue_number,
+            "branch": branch,
+            "solo": solo,
+            "initial_stage": initial_stage,
+        },
+    )
+    _checkpoint_if_store(state_store, job_id, jdir, jobs_dir)
+
+    while True:
+        if state_store.acquire_staging_lock([job_id]):
+            try:
+                if not solo and coalesce_window_sec > 0.0 and max_batch_size > 1:
+                    deadline = time.monotonic() + coalesce_window_sec
+                    while time.monotonic() < deadline:
+                        tickets = state_store.list_train_tickets()
+                        non_solo = [t for t in tickets if not t.get("solo")]
+                        if len(non_solo) >= max_batch_size:
+                            break
+                        peers_near = any(
+                            rj.get("id") != job_id and rj.get("stage") in {"review", "approve", "merging"}
+                            for rj in state_store.list_remote_jobs()
+                        )
+                        if not peers_near:
+                            break
+                        time.sleep(min(0.2, max(0.05, deadline - time.monotonic())))
+
+                raw_tickets = state_store.list_train_tickets()
+                if not any(t.get("job_id") == job_id for t in raw_tickets):
+                    raw_tickets.insert(
+                        0,
+                        {
+                            "job_id": job_id,
+                            "issue_number": issue_number,
+                            "branch": branch,
+                            "solo": solo,
+                            "initial_stage": initial_stage,
+                        },
+                    )
+                if solo or raw_tickets[0].get("solo"):
+                    lead_id = raw_tickets[0]["job_id"] if raw_tickets[0].get("solo") else job_id
+                    selected = [t for t in raw_tickets if t.get("job_id") == lead_id][:1]
+                else:
+                    selected = [t for t in raw_tickets if not t.get("solo")][:max_batch_size]
+
+                batch: list[TrainTicket] = []
+                for t_data in selected:
+                    tid = str(t_data["job_id"])
+                    t_issue = int(t_data["issue_number"])
+                    t_branch = str(t_data.get("branch") or f"factory/{tid}")
+                    t_jdir = os.path.join(jobs_dir, tid)
+                    if tid == job_id:
+                        t_wt = worktree
+                        t_issue_md = issue_md
+                    else:
+                        state_store.hydrate_job(tid, t_jdir)
+                        t_wt, t_branch = ensure_worktree(repo_root, tid, base_branch, branch=t_branch)
+                        try:
+                            _, t_issue_md = gh_client.fetch_issue(t_issue)
+                        except Exception:
+                            t_issue_md = _read_text(os.path.join(t_jdir, "issue.md"))
+                    batch.append(
+                        TrainTicket(
+                            job_id=tid,
+                            issue_number=t_issue,
+                            jdir=t_jdir,
+                            worktree=t_wt,
+                            branch=t_branch,
+                            issue_md=t_issue_md,
+                            initial_stage=str(t_data.get("initial_stage") or "merging"),
+                            solo=bool(t_data.get("solo")),
+                        )
+                    )
+
+                _execute_staging_train_batch(
+                    batch,
+                    repo_root=repo_root,
+                    factory_dir=factory_dir,
+                    jobs_dir=jobs_dir,
+                    cfg=cfg,
+                    gh_client=gh_client,
+                    state_store=state_store,
+                    manage_distributed_lock=False,
+                )
+
+                for t in batch:
+                    _checkpoint_if_store(
+                        state_store,
+                        t.job_id,
+                        t.jdir,
+                        jobs_dir,
+                        release_lease=(t.job_id != job_id),
+                    )
+                    state_store.delete_train_ticket(t.job_id)
+
+                if any(t.job_id == job_id for t in batch):
+                    updated = load_job(jobs_dir, job_id)
+                    if updated["stage"] == "build" or (
+                        updated["stage"] == "staging_qa" and updated.get("solo_staging_qa")
+                    ):
+                        return TrainOutcome(action="continue")
+                    return TrainOutcome(action="exit", job=updated)
+            finally:
+                state_store.release_staging_lock()
+        else:
+            # Non-leader: wait until leader processes and deletes our ticket, or lock frees up.
+            while True:
+                if not state_store._ls_remote_one(f"refs/factory/train/{job_id}"):
+                    hydrated = state_store.hydrate_job(job_id, jdir) or load_job(jobs_dir, job_id)
+                    if hydrated["stage"] == "build" or (
+                        hydrated["stage"] == "staging_qa" and hydrated.get("solo_staging_qa")
+                    ):
+                        return TrainOutcome(action="continue")
+                    return TrainOutcome(action="exit", job=hydrated)
+                if not state_store._ls_remote_one("refs/factory/locks/staging"):
+                    break
+                time.sleep(0.2)
+
+
 def _execute_staging_train_batch(
     batch: list[TrainTicket],
     *,
@@ -961,6 +1106,7 @@ def _execute_staging_train_batch(
     cfg: dict,
     gh_client: GitHubClient,
     state_store: GitStateStore | None = None,
+    manage_distributed_lock: bool = True,
 ) -> None:
     staging_cfg = cfg.get("staging_qa") or {}
     labels = cfg["labels"]
@@ -970,7 +1116,12 @@ def _execute_staging_train_batch(
     for t in batch:
         _set_activity(jobs_dir, t.job_id, "waiting:staging_lock")
 
-    with _distributed_staging_lock(state_store, repo_root, batch), staging_lock(jobs_dir):
+    dist_ctx = (
+        _distributed_staging_lock(state_store, repo_root, batch)
+        if manage_distributed_lock
+        else contextlib.nullcontext()
+    )
+    with dist_ctx, staging_lock(jobs_dir):
         secrets = load_staging_secrets(staging_cfg.get("env_files") or [], repo_root=repo_root)
         merged_tickets: list[TrainTicket] = []
         train_base_sha = ""
@@ -2879,32 +3030,50 @@ def process_job(
                         print(f"[{job_id}] warning: post-merge label cleanup failed: {exc}", file=sys.stderr)
                     return _finalize_job_exit(state_store, job_id, jdir, jobs_dir, merged_job)
 
-                active_coord = train_coordinator or StagingTrainCoordinator(
-                    max_batch_size=1,
-                    coalesce_window_sec=0.0,
-                )
-                ticket = TrainTicket(
-                    job_id=job_id,
-                    issue_number=issue_number,
-                    jdir=jdir,
-                    worktree=worktree,
-                    branch=branch,
-                    issue_md=issue_md,
-                    initial_stage=stage,
-                    solo=bool(job.get("solo_staging_qa")),
-                )
-                outcome = active_coord.run_ticket(
-                    ticket,
-                    lambda batch: _execute_staging_train_batch(
-                        batch,
+                if train_coordinator is None and state_store is not None:
+                    outcome = _run_distributed_staging_train(
                         repo_root=repo_root,
                         factory_dir=factory_dir,
                         jobs_dir=jobs_dir,
                         cfg=cfg,
                         gh_client=gh_client,
                         state_store=state_store,
-                    ),
-                )
+                        job_id=job_id,
+                        issue_number=issue_number,
+                        jdir=jdir,
+                        worktree=worktree,
+                        branch=branch,
+                        issue_md=issue_md,
+                        initial_stage=stage,
+                        solo=bool(job.get("solo_staging_qa")),
+                    )
+                else:
+                    active_coord = train_coordinator or StagingTrainCoordinator(
+                        max_batch_size=1,
+                        coalesce_window_sec=0.0,
+                    )
+                    ticket = TrainTicket(
+                        job_id=job_id,
+                        issue_number=issue_number,
+                        jdir=jdir,
+                        worktree=worktree,
+                        branch=branch,
+                        issue_md=issue_md,
+                        initial_stage=stage,
+                        solo=bool(job.get("solo_staging_qa")),
+                    )
+                    outcome = active_coord.run_ticket(
+                        ticket,
+                        lambda batch: _execute_staging_train_batch(
+                            batch,
+                            repo_root=repo_root,
+                            factory_dir=factory_dir,
+                            jobs_dir=jobs_dir,
+                            cfg=cfg,
+                            gh_client=gh_client,
+                            state_store=state_store,
+                        ),
+                    )
                 if outcome.action == "continue":
                     continue
                 assert outcome.job is not None

@@ -188,3 +188,118 @@ def rollback_staging(deploy_wt, deploy_env, snapshot):
     ok, log = rollback_staging(str(tmp_path), {}, {"web": "v1"}, repo_root=str(tmp_path))
     assert ok is True
     assert "rolled back v1" in log
+
+
+def test_distributed_staging_train_coalesces_across_two_workers(tmp_path, monkeypatch):
+    import subprocess
+    from factory.lib.git_ops import ensure_worktree
+    from factory.lib.git_state import GitStateStore
+    from factory.lib.pipeline import process_job
+    from factory.lib.state import load_job, update_job
+
+    bare = str(tmp_path / "origin.git")
+    c0 = str(tmp_path / "w0")
+    c1 = str(tmp_path / "w1")
+    subprocess.run(["git", "init", "--bare", "-b", "main", bare], check=True, capture_output=True)
+    for c in (c0, c1):
+        subprocess.run(["git", "clone", bare, c], check=True, capture_output=True)
+        subprocess.run(["git", "-C", c, "config", "user.email", "t@e.com"], check=True)
+        subprocess.run(["git", "-C", c, "config", "user.name", "T"], check=True)
+
+    f0 = os.path.join(c0, "factory")
+    os.makedirs(f0, exist_ok=True)
+    with open(os.path.join(f0, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "auto_merge": "all",
+                "staging_qa": {
+                    "enabled": True,
+                    "max_batch_size": 4,
+                    "coalesce_window_sec": 1,
+                    "base_url": "https://staging.example.com",
+                },
+            },
+            f,
+        )
+    with open(os.path.join(f0, "checks.sh"), "w", encoding="utf-8") as f:
+        f.write("#!/usr/bin/env bash\nexit 0\n")
+    os.chmod(os.path.join(f0, "checks.sh"), 0o755)
+    subprocess.run(["git", "-C", c0, "add", "."], check=True)
+    subprocess.run(["git", "-C", c0, "commit", "-m", "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", c0, "push", "-u", "origin", "main"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", c1, "pull", "--rebase", "origin", "main"], check=True, capture_output=True)
+
+    s0 = GitStateStore(c0, "m0")
+    s1 = GitStateStore(c1, "m1")
+
+    for c, store, num in [(c0, s0, 11), (c1, s1, 12)]:
+        jid = f"job-{num}"
+        jdir = os.path.join(c, "factory", "jobs")
+        create_or_resume_job(jdir, {"number": num, "title": f"T{num}", "url": f"https://x/{num}"}, 3)
+        wt, br = ensure_worktree(c, jid, "main")
+        with open(os.path.join(wt, f"f{num}.py"), "w", encoding="utf-8") as f:
+            f.write(f"X = {num}\n")
+        subprocess.run(["git", "-C", wt, "add", f"f{num}.py"], check=True)
+        subprocess.run(["git", "-C", wt, "commit", "-m", f"feat {num}"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", wt, "push", "-u", "origin", br], check=True, capture_output=True)
+        update_job(jdir, jid, pr_number=100 + num, pr_url=f"https://x/pr/{100 + num}", round=1)
+        advance_stage(jdir, jid, "spec")
+        advance_stage(jdir, jid, "build")
+        advance_stage(jdir, jid, "gate")
+        advance_stage(jdir, jid, "review")
+        advance_stage(jdir, jid, "approve")
+        advance_stage(jdir, jid, "merging")
+        store.checkpoint_job(jid, os.path.join(jdir, jid), load_job(jdir, jid), release_lease=False)
+
+    deploy_calls = []
+
+    class _FakeGH:
+        def __init__(self):
+            self.merged_prs = set()
+        def fetch_issue(self, num):
+            return {"number": num, "title": f"T{num}", "url": f"https://x/{num}", "body": "b", "comments": [], "labels": []}, f"# Issue #{num}\nb\n"
+        def get_pr_merge_commit(self, pr_num):
+            return f"sha-{pr_num}" if pr_num in self.merged_prs else None
+        def merge_pr(self, pr_num, *_a, **_kw):
+            self.merged_prs.add(pr_num)
+            return f"sha-{pr_num}"
+        def mark_pr_ready(self, pr_num):
+            pass
+        def comment_issue(self, *a, **kw):
+            pass
+        def edit_labels(self, *a, **kw):
+            pass
+
+    gh = _FakeGH()
+    monkeypatch.setattr("factory.lib.pipeline.ProjectBoardSync.discover", lambda *a, **kw: None)
+    monkeypatch.setattr("factory.lib.pipeline.run_gate", lambda *a, **kw: (True, "VERDICT: PASS\n"))
+    monkeypatch.setattr(
+        "factory.lib.pipeline.plan_staging_deploy",
+        lambda changed_files, repo_root=None: type("P", (), {"skip_non_runtime": False, "extra_args": [], "reason": "runtime"})(),
+    )
+    def fake_deploy(wt, env, timeout_sec=900):
+        deploy_calls.append(wt)
+        return True, "deployed"
+
+    monkeypatch.setattr("factory.lib.pipeline.deploy_to_staging", fake_deploy)
+    monkeypatch.setattr(
+        "factory.lib.pipeline.run_agent",
+        lambda *_a, **_kw: ({"verdict": "PASS", "summary": ["ok"], "scenarios_tested": ["s"], "personas_used": ["p"], "failures": [], "reproduction_steps": []}, {"total_tokens": 10}, 0.01),
+    )
+
+    # Pre-publish job-12's train ticket to simulate near-simultaneous arrival across separate workers
+    s1.put_train_ticket("job-12", {"job_id": "job-12", "issue_number": 12, "branch": "factory/job-12", "solo": False, "initial_stage": "merging"})
+
+    res_holder = {}
+    t1 = threading.Thread(target=lambda: res_holder.setdefault("11", process_job(c0, 11, gh=gh, state_store=s0)))
+    t2 = threading.Thread(target=lambda: res_holder.setdefault("12", process_job(c1, 12, gh=gh, state_store=s1)))
+    t1.start()
+    time.sleep(0.05)
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+
+    assert len(deploy_calls) == 1
+    assert res_holder["11"]["stage"] == "merged"
+    assert res_holder["12"]["stage"] == "merged"
+    assert s0.list_train_tickets() == []

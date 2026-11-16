@@ -733,3 +733,20 @@ def test_run_factory_coordinates_leases_with_origin_and_skips_active_peer_lease(
     assert remote_201["lease"]["worker_id"] == "peer-a"
 
 
+def test_train_ticket_refs_crud(tmp_path):
+    _, clones = _init_bare_and_clones(tmp_path, n=2)
+    s0 = GitStateStore(clones[0], "m0")
+    s1 = GitStateStore(clones[1], "m1")
+
+    assert s0.put_train_ticket("job-1", {"job_id": "job-1", "issue_number": 1, "branch": "factory/job-1", "solo": False})
+    assert s1.put_train_ticket("job-2", {"job_id": "job-2", "issue_number": 2, "branch": "factory/job-2", "solo": False})
+
+    tickets = s0.list_train_tickets()
+    assert [t["job_id"] for t in tickets] == ["job-1", "job-2"]
+
+    s0.delete_train_ticket("job-1")
+    assert [t["job_id"] for t in s1.list_train_tickets()] == ["job-2"]
+    s1.delete_train_ticket("job-2")
+    assert s0.list_train_tickets() == []
+
+

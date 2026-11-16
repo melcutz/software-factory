@@ -502,6 +502,35 @@ class GitStateStore:
         self._delete_remote_ref(f"refs/factory/checkpoints/{job_id}")
 
     # ------------------------------------------------------------------
+    # Distributed staging train tickets
+    # ------------------------------------------------------------------
+
+    def put_train_ticket(self, job_id: str, payload: dict) -> bool:
+        ref = f"refs/factory/train/{job_id}"
+        old_sha = self._ls_remote_one(ref)
+        data = dict(payload)
+        data.setdefault("job_id", job_id)
+        data.setdefault("machine_id", self.machine_id)
+        data.setdefault("created_ts", time.time())
+        return self._push_json_ref(ref, "ticket.json", data, f"train ticket {job_id}", old_sha)
+
+    def list_train_tickets(self) -> list[dict]:
+        refs = self._ls_remote("refs/factory/train/*")
+        tickets: list[dict] = []
+        for ref in sorted(refs):
+            commit_sha = self._fetch_ref(ref)
+            if not commit_sha:
+                continue
+            data = self._read_json_from_commit(commit_sha, "ticket.json")
+            if data:
+                tickets.append(data)
+        tickets.sort(key=lambda t: (float(t.get("created_ts") or 0.0), str(t.get("job_id") or "")))
+        return tickets
+
+    def delete_train_ticket(self, job_id: str) -> None:
+        self._delete_remote_ref(f"refs/factory/train/{job_id}")
+
+    # ------------------------------------------------------------------
     # Distributed staging lock
     # ------------------------------------------------------------------
 
