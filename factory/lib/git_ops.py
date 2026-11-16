@@ -330,6 +330,60 @@ class GitHubClient:
         issue = json.loads(out)
         return issue, format_untrusted_issue_md(issue)
 
+    def fetch_pr_review_state(self, pr_number: int) -> dict:
+        out = self._runner(
+            [
+                "pr",
+                "view",
+                str(pr_number),
+                "--json",
+                "state,mergeCommit,reviewDecision,reviews,comments,labels",
+            ],
+            self.repo_root,
+        )
+        data = json.loads(out) if out and out.strip() else {}
+        if not isinstance(data, dict):
+            data = {}
+        state = str(data.get("state") or "")
+        merged = bool(data.get("mergeCommit")) or state == "MERGED"
+        review_decision = str(data.get("reviewDecision") or "")
+        labels = [
+            str(lbl.get("name") if isinstance(lbl, dict) else lbl)
+            for lbl in (data.get("labels") or [])
+            if lbl
+        ]
+        reviews = [r for r in (data.get("reviews") or []) if isinstance(r, dict)]
+        comments = [c for c in (data.get("comments") or []) if isinstance(c, dict)]
+        latest_review_id = ""
+        feedback_lines: list[str] = []
+        for idx, rev in enumerate(reviews, start=1):
+            rid = str(rev.get("id") or rev.get("submittedAt") or f"rev-{idx}")
+            latest_review_id = rid
+            body = str(rev.get("body") or "").strip()
+            if body:
+                author = str(((rev.get("author") or {}).get("login")) or "reviewer")
+                feedback_lines.append(
+                    f"### Review {idx} (@{_escape_untrusted(author)}, {rev.get('state') or ''})\n{_escape_untrusted(body)}"
+                )
+        for idx, c in enumerate(comments, start=1):
+            body = str(c.get("body") or "").strip()
+            if body:
+                author = str(((c.get("author") or {}).get("login")) or "commenter")
+                feedback_lines.append(
+                    f"### Comment {idx} (@{_escape_untrusted(author)})\n{_escape_untrusted(body)}"
+                )
+        feedback_md = ""
+        if feedback_lines:
+            feedback_md = "<untrusted_issue_data>\n" + "\n\n".join(feedback_lines) + "\n</untrusted_issue_data>"
+        return {
+            "state": state,
+            "merged": merged,
+            "review_decision": review_decision,
+            "latest_review_id": latest_review_id,
+            "feedback_md": feedback_md,
+            "labels": labels,
+        }
+
     def comment_issue(self, issue_number: int, body: str) -> None:
         self._runner(["issue", "comment", str(issue_number), "--body", body], self.repo_root)
 

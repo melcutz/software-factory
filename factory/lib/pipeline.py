@@ -3057,6 +3057,82 @@ def _plan_queue_batch(
     return order_deps, hard_deps
 
 
+def reconcile_ready_jobs(
+    repo_root: str,
+    cfg: dict | None = None,
+    gh: GitHubClient | None = None,
+    *,
+    state_store: GitStateStore | None = None,
+    process_fn=None,
+) -> list[dict]:
+    """Poll open stage='ready' PRs for merge, CHANGES_REQUESTED fix rounds, or APPROVED/factory:ship."""
+    repo_root = os.path.abspath(repo_root)
+    factory_dir = os.path.join(repo_root, "factory")
+    jobs_dir = os.path.join(factory_dir, "jobs")
+    if not os.path.isdir(jobs_dir):
+        return []
+    config = cfg or load_config(factory_dir)
+    gh_client = gh or GitHubClient(repo_root)
+    runner_fn = process_fn or process_job
+    labels_cfg = config.get("labels") or {}
+    ship_label = str(labels_cfg.get("ship") or "factory:ship")
+
+    jobs_by_id = {j.get("id"): j for j in list_jobs(jobs_dir) if j.get("id")}
+    if state_store is not None:
+        try:
+            for rj in state_store.list_remote_jobs():
+                rid = rj.get("id")
+                if rid and rj.get("stage") == "ready" and rid not in jobs_by_id:
+                    hydrated = state_store.hydrate_job(rid, os.path.join(jobs_dir, rid))
+                    if hydrated:
+                        jobs_by_id[rid] = hydrated
+        except Exception:
+            pass
+
+    results: list[dict] = []
+    for job_id in sorted(jobs_by_id):
+        job = jobs_by_id[job_id]
+        if job.get("stage") != "ready" or not job.get("pr_number"):
+            continue
+        pr_num = int(job["pr_number"])
+        issue_num = int(job["issue"])
+        try:
+            pr_state = gh_client.fetch_pr_review_state(pr_num)
+        except Exception as exc:
+            _log(job_id, f"reconcile_ready_jobs warning pr=#{pr_num}: {exc}")
+            continue
+
+        if pr_state.get("merged"):
+            merged_job = advance_stage(jobs_dir, job_id, "merged")
+            _cleanup_terminal_job(repo_root, job_id, merged_job)
+            results.append(merged_job)
+            continue
+
+        decision = str(pr_state.get("review_decision") or "")
+        latest_id = str(pr_state.get("latest_review_id") or "")
+        pr_labels = set(pr_state.get("labels") or [])
+
+        if decision == "CHANGES_REQUESTED" and latest_id and latest_id != str(job.get("last_human_review_id") or ""):
+            feedback = str(pr_state.get("feedback_md") or "Human reviewer requested changes on PR.")
+            update_job(jobs_dir, job_id, last_human_review_id=latest_id)
+            advance_stage(
+                jobs_dir,
+                job_id,
+                "build",
+                last_error=f"Human PR review requested changes:\n{feedback}",
+                expand_round_by=1,
+            )
+            results.append(runner_fn(repo_root, issue_num, config=config, gh=gh_client))
+            continue
+
+        if decision == "APPROVED" or ship_label in pr_labels:
+            advance_stage(jobs_dir, job_id, "merging")
+            results.append(runner_fn(repo_root, issue_num, config=config, gh=gh_client))
+            continue
+
+    return results
+
+
 def run_factory(
     repo_root: str,
     issue_number: int | None = None,
@@ -3103,6 +3179,8 @@ def run_factory(
                     _ensure_lease_released(state_store, jobs_dir, jdir, job_id)
             return [process_job(repo_root, num, config=cfg, gh=gh, board=board)]
 
+        if not explicit_nums:
+            reconcile_ready_jobs(repo_root, cfg, gh, state_store=state_store)
         sqa_cfg = cfg.get("staging_qa") or {}
         train_coord: StagingTrainCoordinator | None = None
         if bool(sqa_cfg.get("enabled")):

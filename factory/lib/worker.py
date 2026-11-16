@@ -349,6 +349,12 @@ def run_worker(
             store = stores[repo]
             if store.get_control_state().get("halted"):
                 continue
+            try:
+                from factory.lib.pipeline import reconcile_ready_jobs
+
+                reconcile_ready_jobs(repo, state_store=store)
+            except Exception:
+                pass
 
             cfg = load_config(os.path.join(repo, "factory"))
             try:
