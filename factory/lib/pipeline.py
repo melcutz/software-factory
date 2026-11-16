@@ -139,6 +139,23 @@ def _fmt_model_tag(model_spec: str) -> str:
     return f"model={base_model} effort={effort}"
 
 
+def _clear_quota_cooldown_if_needed(
+    state_store: GitStateStore | None,
+    model_spec: str,
+) -> None:
+    if state_store is None:
+        return
+    raw_spec = (model_spec or "").strip()
+    if not raw_spec:
+        return
+    base_model = split_model_and_effort(raw_spec)[0].split(":", 1)[0].split()[0]
+    if not base_model:
+        return
+    models = state_store.get_quota_state().get("models")
+    if isinstance(models, dict) and base_model in models:
+        state_store.clear_quota_cooldown(base_model)
+
+
 def _record_and_format_step(
     jobs_dir: str,
     job_id: str,
@@ -354,6 +371,8 @@ def _sync_pr_with_base(
     base_branch: str,
     round_num: int,
     cfg: dict,
+    *,
+    state_store: GitStateStore | None = None,
 ) -> tuple[bool, str]:
     """Sync branch with origin/<base_branch>, using builder to resolve conflicts before pre-merge gate."""
     pre_sync_head = head_sha(worktree)
@@ -417,6 +436,7 @@ def _sync_pr_with_base(
                     f"Merge conflict resolution failed while syncing `{branch}` with `origin/{base_branch}`: {exc}",
                 )
 
+            _clear_quota_cooldown_if_needed(state_store, builder_model)
             metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
             _log(job_id, f"merge-conflict resolve verdict={resolve_out['verdict']} ({metrics_str})")
 
@@ -1029,6 +1049,7 @@ def _execute_staging_train_batch(
                     base_branch,
                     round_num,
                     cfg,
+                    state_store=state_store,
                 )
                 if not sync_ok:
                     esc_job = _escalate_to_human(
@@ -1244,6 +1265,7 @@ def _execute_staging_train_batch(
                             extra_env=qa_env,
                             protect_head=True,
                         )
+                        _clear_quota_cooldown_if_needed(state_store, qa_model)
                         metrics_str = _record_and_format_step(
                             jobs_dir, t.job_id, qa_model, usage, dur, cfg
                         )
@@ -1701,6 +1723,7 @@ def process_job(
                     sandbox=True,
                     log_name="intake",
                 )
+                _clear_quota_cooldown_if_needed(state_store, intake_model)
                 metrics_str = _record_and_format_step(jobs_dir, job_id, intake_model, usage, dur, cfg)
                 _log(job_id, f"intake done decision={intake_out['decision']} ({metrics_str})")
                 _write_json(os.path.join(jdir, "intake.json"), intake_out)
@@ -1752,6 +1775,7 @@ def process_job(
                     sandbox=True,
                     log_name="spec",
                 )
+                _clear_quota_cooldown_if_needed(state_store, spec_model)
                 metrics_str = _record_and_format_step(jobs_dir, job_id, spec_model, usage, dur, cfg)
                 _log(job_id, f"spec done slices={len(spec_out['slices'])} ({metrics_str})")
                 _write_json(os.path.join(jdir, "spec.json"), spec_out)
@@ -1835,6 +1859,7 @@ def process_job(
                                 sandbox=False,
                                 log_name=f"r{round_num}-slice-{slice_num}-a{attempt + 1}",
                             )
+                            _clear_quota_cooldown_if_needed(state_store, builder_model)
                             metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
                             _log(
                                 job_id,
@@ -1972,6 +1997,7 @@ def process_job(
                         sandbox=False,
                         log_name=f"r{round_num}-fix-build",
                     )
+                    _clear_quota_cooldown_if_needed(state_store, builder_model)
                     metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
                     _log(job_id, f"build fix-round={round_num} verdict={build_out['verdict']} ({metrics_str})")
                     if build_out["verdict"] == "BLOCKED":
@@ -2060,6 +2086,7 @@ def process_job(
                         sandbox=False,
                         log_name=f"r{round_num}-gate-fix-{attempt + 1}",
                     )
+                    _clear_quota_cooldown_if_needed(state_store, builder_model)
                     metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
                     _log(job_id, f"gate-fix attempt={attempt + 1} verdict={fix_out['verdict']} ({metrics_str})")
                     if fix_out["verdict"] == "BLOCKED":
@@ -2151,6 +2178,7 @@ def process_job(
                         clean_worktree=False,
                         log_name=f"r{round_num}-review-{rev_name}",
                     )
+                    _clear_quota_cooldown_if_needed(state_store, rev_model)
                     metrics_str = _record_and_format_step(jobs_dir, job_id, rev_model, u, d, cfg)
                     _write_json(os.path.join(round_dir, f"review-{rev_name}.json"), out)
                     _write_text(
@@ -2257,6 +2285,7 @@ def process_job(
                         sandbox=True,
                         log_name=f"r{round_num}-approve",
                     )
+                    _clear_quota_cooldown_if_needed(state_store, approver_model)
                     metrics_str = _record_and_format_step(jobs_dir, job_id, approver_model, usage, dur, cfg)
                     _log(job_id, f"approve decision={approve_out['decision']} ({metrics_str})")
                 _write_json(os.path.join(round_dir, "approve.json"), approve_out)
@@ -2322,6 +2351,7 @@ def process_job(
                                 base_branch,
                                 round_num,
                                 cfg,
+                                state_store=state_store,
                             )
                             if not sync_ok:
                                 return _escalate_to_human(
@@ -2476,6 +2506,7 @@ def _plan_queue_batch(
                 clean_worktree=False,
                 log_name="queue-plan",
             )
+            _clear_quota_cooldown_if_needed(state_store, planner_model)
             return out
         except Exception as exc:
             print(f"[factory] warning: queue planner failed, using explicit dependencies only: {exc}", file=sys.stderr)

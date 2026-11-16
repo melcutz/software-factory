@@ -336,8 +336,16 @@ def run_worker(
                 from factory.lib.governor import is_model_in_cooldown
 
                 quota_state = store.get_quota_state()
-                intake_model, _ = split_model_and_effort((cfg.get("models") or {}).get("intake", ""))
-                in_cd, _ = is_model_in_cooldown(quota_state, intake_model) if intake_model else (False, 0.0)
+                models_cfg = cfg.get("models") or {}
+                in_cd = False
+                for role in ("intake", "spec_writer", "builder"):
+                    raw_spec = str(models_cfg.get(role) or "").strip()
+                    if not raw_spec:
+                        continue
+                    base_model = split_model_and_effort(raw_spec)[0].split(":", 1)[0].split()[0]
+                    if base_model and is_model_in_cooldown(quota_state, base_model)[0]:
+                        in_cd = True
+                        break
                 if in_cd:
                     continue
             except Exception:

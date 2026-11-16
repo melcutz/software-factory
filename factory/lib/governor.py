@@ -92,6 +92,17 @@ def check_host_admission(
     return True, ""
 
 
+def normalize_base_model(model_spec: str) -> str:
+    """Normalize a model spec (e.g. 'gemini-4-argon-high' or 'gemini-4-argon:medium') to its base model name."""
+    from factory.lib.config import split_model_and_effort
+
+    spec = (model_spec or "").strip()
+    if not spec:
+        return ""
+    base, _ = split_model_and_effort(spec)
+    return base.split(":", 1)[0].split()[0] if base else ""
+
+
 def is_model_in_cooldown(
     quota_state: dict,
     base_model: str,
@@ -100,7 +111,9 @@ def is_model_in_cooldown(
 ) -> tuple[bool, float]:
     """Return (in_cooldown, remaining_sec) for base_model from refs/factory/quota."""
     ts = time.time() if now_ts is None else now_ts
-    entry = (quota_state.get("models") or {}).get(base_model)
+    models = quota_state.get("models") or {}
+    norm = normalize_base_model(base_model)
+    entry = models.get(base_model) or (models.get(norm) if norm else None)
     if not isinstance(entry, dict):
         return False, 0.0
     until = float(entry.get("cooldown_until_ts") or 0.0)
