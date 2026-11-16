@@ -134,6 +134,81 @@ class MultiRepoCliTests(unittest.TestCase):
             self.assertFalse(os.path.exists(wt_merged))
             self.assertTrue(os.path.isdir(wt_ready))
 
+    def test_clean_reconciles_closed_stubs_preserves_logs_and_prunes_stale_refs(self):
+        import json
+        import subprocess
+        from unittest.mock import MagicMock
+        from factory.lib.git_state import GitStateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            origin = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            subprocess.run(["git", "init", "--bare", "-b", "main", origin], check=True, capture_output=True)
+            subprocess.run(["git", "clone", origin, repo], check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo, "config", "user.name", "T"], check=True)
+            subprocess.run(["git", "-C", repo, "config", "user.email", "t@e.com"], check=True)
+            os.makedirs(os.path.join(repo, "factory", "jobs"), exist_ok=True)
+            with open(os.path.join(repo, "README.md"), "w", encoding="utf-8") as f:
+                f.write("hi\n")
+            subprocess.run(["git", "-C", repo, "add", "."], check=True)
+            subprocess.run(["git", "-C", repo, "commit", "-m", "init"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo, "push", "-u", "origin", "main"], check=True, capture_output=True)
+
+            # Empty closed stub job-4 (should be removed)
+            j4 = os.path.join(repo, "factory", "jobs", "job-4")
+            os.makedirs(j4)
+            with open(os.path.join(j4, "job.json"), "w", encoding="utf-8") as f:
+                json.dump({"id": "job-4", "issue": 4, "stage": "queued"}, f)
+
+            # Closed job-5 WITH logs (logs must be preserved; stage marked rejected)
+            j5 = os.path.join(repo, "factory", "jobs", "job-5")
+            os.makedirs(os.path.join(j5, "logs"))
+            log_file = os.path.join(j5, "logs", "build.log")
+            with open(log_file, "w", encoding="utf-8") as f:
+                f.write("important log\n")
+            with open(os.path.join(j5, "job.json"), "w", encoding="utf-8") as f:
+                json.dump({"id": "job-5", "issue": 5, "stage": "build"}, f)
+
+            # Open job-6 (must remain queued)
+            j6 = os.path.join(repo, "factory", "jobs", "job-6")
+            os.makedirs(j6)
+            with open(os.path.join(j6, "job.json"), "w", encoding="utf-8") as f:
+                json.dump({"id": "job-6", "issue": 6, "stage": "queued"}, f)
+
+            # Expired worker heartbeat ref & stale checkpoint/dag refs
+            store = GitStateStore(repo, "dead-worker")
+            store.write_worker_heartbeat(0, 2, False)
+            # Backdate heartbeat commit by writing an old updated_at/ts payload directly
+            old_sha = store._ls_remote_one("refs/factory/workers/dead-worker")
+            store._push_json_ref(
+                "refs/factory/workers/dead-worker",
+                "worker.json",
+                {"worker_id": "dead-worker", "ts": 1.0, "updated_ts": 1.0},
+                "old hb",
+                old_sha,
+                force=True,
+            )
+            store._push_json_ref("refs/factory/checkpoints/job-4", "meta.json", {"issue": 4}, "cp", None, force=True)
+
+            fake_gh = MagicMock()
+            fake_gh.fetch_issue.side_effect = lambda num: (
+                {"number": num, "state": "OPEN" if num == 6 else "CLOSED"},
+                "",
+            )
+            with patch.object(cli, "GitHubClient", return_value=fake_gh):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.main(["clean", "--repo", repo])
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(j4))
+            self.assertTrue(os.path.isfile(log_file))
+            with open(os.path.join(j5, "job.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["stage"], "rejected")
+            with open(os.path.join(j6, "job.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["stage"], "queued")
+            self.assertEqual(store.list_worker_heartbeats(), {})
+            self.assertIsNone(store._ls_remote_one("refs/factory/checkpoints/job-4"))
+
     def test_init_map_and_learn_cli(self):
         import json
         import subprocess

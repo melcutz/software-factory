@@ -453,6 +453,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if all_ok else 1
 
     if args.command == "clean":
+        import shutil
+        from factory.lib.state import _atomic_write_job
+
         for idx, repo in enumerate(repos):
             if multi:
                 if idx > 0:
@@ -461,6 +464,9 @@ def main(argv: list[str] | None = None) -> int:
             jobs_dir = os.path.join(repo, "factory", "jobs")
             wt_root = os.path.join(repo, ".worktrees")
             reclaimed: list[str] = []
+            terminal_ids: set[str] = set()
+            closed_stub_ids: set[str] = set()
+
             if os.path.isdir(wt_root):
                 for entry in sorted(os.listdir(wt_root)):
                     wt_path = os.path.join(wt_root, entry)
@@ -476,10 +482,71 @@ def main(argv: list[str] | None = None) -> int:
                         reclaimed.append(wt_path)
                         if not args.dry_run:
                             remove_worktree(repo, wt_path)
+
+            if os.path.isdir(jobs_dir):
+                gh = GitHubClient(repo)
+                for entry in sorted(os.listdir(jobs_dir)):
+                    if entry == "_planner":
+                        planner_dir = os.path.join(jobs_dir, entry)
+                        reclaimed.append(planner_dir)
+                        if not args.dry_run:
+                            shutil.rmtree(planner_dir, ignore_errors=True)
+                        continue
+                    jdir = os.path.join(jobs_dir, entry)
+                    job_file = os.path.join(jdir, "job.json")
+                    if not os.path.isfile(job_file):
+                        continue
+                    try:
+                        with open(job_file, "r", encoding="utf-8") as f:
+                            job_data = json.load(f)
+                    except (OSError, ValueError):
+                        continue
+                    stage = job_data.get("stage")
+                    if stage in ("merged", "rejected"):
+                        terminal_ids.add(entry)
+                        continue
+                    inum = job_data.get("issue")
+                    if not isinstance(inum, int):
+                        continue
+                    try:
+                        iss, _ = gh.fetch_issue(inum)
+                    except Exception:
+                        continue
+                    if str(iss.get("state") or "").upper() != "CLOSED":
+                        continue
+                    has_logs = os.path.isdir(os.path.join(jdir, "logs")) or any(
+                        d.startswith("round-") for d in os.listdir(jdir)
+                    )
+                    if stage == "queued" and not has_logs:
+                        reclaimed.append(jdir)
+                        closed_stub_ids.add(entry)
+                        if not args.dry_run:
+                            shutil.rmtree(jdir, ignore_errors=True)
+                    else:
+                        reclaimed.append(f"{entry} (mark rejected, logs preserved)")
+                        terminal_ids.add(entry)
+                        if not args.dry_run:
+                            job_data["stage"] = "rejected"
+                            _atomic_write_job(jobs_dir, entry, job_data)
+
             if not args.dry_run:
                 _run_git(repo, "worktree", "prune", check=False)
+
+            remote_check = _run_git(repo, "remote", "get-url", "origin", check=False)
+            if remote_check.returncode == 0:
+                try:
+                    store = GitStateStore(repo, "cleaner")
+                    pruned_refs = store.reconcile_clean_refs(
+                        terminal_job_ids=terminal_ids,
+                        closed_job_ids=closed_stub_ids,
+                        dry_run=args.dry_run,
+                    )
+                    reclaimed.extend(pruned_refs)
+                except Exception:
+                    pass
+
             if reclaimed:
-                verb = "[dry-run] would remove" if args.dry_run else "removed"
+                verb = "[dry-run] would clean" if args.dry_run else "cleaned"
                 for path in reclaimed:
                     print(f"{verb} {path}")
             else:

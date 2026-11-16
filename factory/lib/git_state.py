@@ -287,6 +287,55 @@ class GitStateStore:
                 workers[wid] = data
         return workers
 
+    def reconcile_clean_refs(
+        self,
+        *,
+        terminal_job_ids: set[str] | frozenset[str] = frozenset(),
+        closed_job_ids: set[str] | frozenset[str] = frozenset(),
+        dry_run: bool = False,
+        now_ts: float | None = None,
+    ) -> list[str]:
+        """Delete expired worker heartbeats, stale DAG snapshots, and terminal checkpoints."""
+        now = time.time() if now_ts is None else now_ts
+        pruned: list[str] = []
+
+        for ref in sorted(self._ls_remote("refs/factory/workers/*")):
+            commit_sha = self._fetch_ref(ref)
+            expired = True
+            if commit_sha:
+                data = self._read_json_from_commit(commit_sha, "worker.json") or {}
+                exp = data.get("expires_at_ts")
+                hb = data.get("heartbeat_ts") or data.get("ts")
+                if exp is not None:
+                    expired = now > float(exp)
+                elif hb is not None:
+                    expired = (now - float(hb)) > WORKER_TTL_SEC
+            if expired:
+                pruned.append(ref)
+                if not dry_run:
+                    self._delete_remote_ref(ref)
+
+        for ref in sorted(self._ls_remote("refs/factory/checkpoints/*")):
+            jid = ref.rsplit("/", 1)[-1]
+            if jid in terminal_job_ids or jid in closed_job_ids:
+                pruned.append(ref)
+                if not dry_run:
+                    self._delete_remote_ref(ref)
+
+        for ref in sorted(self._ls_remote("refs/factory/jobs/*")):
+            jid = ref.rsplit("/", 1)[-1]
+            if jid in closed_job_ids:
+                pruned.append(ref)
+                if not dry_run:
+                    self._delete_remote_ref(ref)
+
+        for ref in sorted(self._ls_remote("refs/factory/dag/*")):
+            pruned.append(ref)
+            if not dry_run:
+                self._delete_remote_ref(ref)
+
+        return pruned
+
     # ------------------------------------------------------------------
     # Job leases & checkpoints
     # ------------------------------------------------------------------
