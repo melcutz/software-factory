@@ -867,7 +867,9 @@ class PipelineE2ETests(unittest.TestCase):
         self.assertTrue(ok)
 
         def _trigger_halt():
-            time.sleep(0.3)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not os.path.exists(self.agy_state_path):
+                time.sleep(0.02)
             with open(os.path.join(host_dir, "halt.signal"), "w", encoding="utf-8") as f:
                 json.dump({"halted": True, "reason": "test halt"}, f)
 

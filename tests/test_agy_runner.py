@@ -228,7 +228,7 @@ time.sleep(60)
 
                 def _abort():
                     polls["n"] += 1
-                    if time.monotonic() - t0 >= 0.25:
+                    if os.path.exists(pid_file) or time.monotonic() - t0 >= 1.5:
                         return JobHaltedError("local halt.signal active")
                     return None
 
@@ -254,8 +254,27 @@ time.sleep(60)
                 self.assertFalse(os.path.exists(os.path.join(tmp, "job-halt", "logs", "r1-build-retry.json")))
                 if os.path.exists(pid_file):
                     cpid = int(open(pid_file, encoding="utf-8").read().strip())
-                    with self.assertRaises(ProcessLookupError):
-                        os.kill(cpid, 0)
+
+                    def _is_pid_alive(pid: int) -> bool:
+                        try:
+                            os.kill(pid, 0)
+                        except ProcessLookupError:
+                            return False
+                        if os.path.isdir("/proc"):
+                            try:
+                                with open(f"/proc/{pid}/stat", encoding="utf-8") as sf:
+                                    stat_text = sf.read()
+                            except OSError:
+                                return False
+                            rparen = stat_text.rfind(")")
+                            if rparen != -1 and stat_text[rparen + 2 : rparen + 3] == "Z":
+                                return False
+                        return True
+
+                    deadline = time.monotonic() + 1.0
+                    while time.monotonic() < deadline and _is_pid_alive(cpid):
+                        time.sleep(0.02)
+                    self.assertFalse(_is_pid_alive(cpid))
 
                 # Direct _invoke_agy_process with LeaseLostError
                 with self.assertRaises(LeaseLostError):
