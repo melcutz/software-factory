@@ -10,6 +10,7 @@ import statistics
 import subprocess
 import sys
 
+from factory.lib.batch import format_batch_plan, triage_and_plan_queue
 from factory.lib.config import load_config
 from factory.lib.fleet import fleet_pause, fleet_remove, fleet_status, fleet_unpause, fleet_update, fleet_wake
 from factory.lib.gate_runner import run_gate
@@ -111,6 +112,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("issues", nargs="*", type=int, help="Optional GitHub issue numbers (default: drain all queued)")
 
     sub.add_parser("queue", parents=[repo_flags], help="List open eligible factory-labeled GitHub issues")
+
+    p_plan = sub.add_parser(
+        "plan",
+        parents=[repo_flags],
+        help="Dry-run smart batch triage and print the planned parallel/sequential Batch-DAG",
+    )
+    p_plan.add_argument("issues", nargs="*", type=int, help="Optional GitHub issue numbers (default: all queued)")
 
     p_status = sub.add_parser(
         "status",
@@ -314,6 +322,25 @@ def main(argv: list[str] | None = None) -> int:
             prefix = f"{os.path.basename(repo)}\t" if multi else ""
             for iss in gh.list_queue_issues(cfg):
                 print(f"{prefix}{iss['number']}\t{iss['title']}\t{iss['url']}")
+        return 0
+
+    if args.command == "plan":
+        if multi and args.issues:
+            print("Error: explicit issue numbers cannot be combined with multiple repos.", file=sys.stderr)
+            return 1
+        for idx, repo in enumerate(repos):
+            cfg = load_config(os.path.join(repo, "factory"))
+            gh = GitHubClient(repo)
+            if args.issues:
+                issues = [gh.fetch_issue(int(n))[0] for n in args.issues]
+            else:
+                issues = gh.list_queue_issues(cfg)
+            plan = triage_and_plan_queue(repo, issues, config=cfg, gh=gh, dry_run=True)
+            if multi:
+                if idx > 0:
+                    print()
+                print(f"=== {os.path.basename(repo)} ({repo}) ===")
+            print(format_batch_plan(plan))
         return 0
 
     if args.command == "status":
