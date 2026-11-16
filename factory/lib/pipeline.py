@@ -17,6 +17,8 @@ from datetime import datetime
 
 import factory.lib.governor as _governor
 from factory.lib.agy_runner import AgentExecutionError, QuotaExhaustedError, resolve_agent_path, run_agent
+
+_ORIG_RUN_AGENT = run_agent
 from factory.lib.config import (
     estimate_usage_cost_usd,
     load_config,
@@ -30,6 +32,7 @@ from factory.lib.gate_runner import (
     select_pre_merge_gate_scope,
 )
 from factory.lib.git_state import GitStateStore, LeaseLostError
+from factory.lib.herdr_bridge import HerdrBridge
 from factory.lib.planner import plan_dependency_dag
 from factory.lib.project_board import ProjectBoardSync
 
@@ -2034,6 +2037,23 @@ def _finalize_job_exit(
         if st in TERMINAL_OR_READY_STAGES:
             state_store.delete_slice_checkpoint(job_id)
     final_job = load_job(jobs_dir, job_id)
+    herdr = HerdrBridge.from_env()
+    if herdr.enabled:
+        st_final = str(final_job.get("stage") or "")
+        cost_val = float((final_job.get("usage") or {}).get("cost_usd") or 0.0)
+        herdr.set_labels(
+            {
+                "issue": str(final_job.get("issue") or ""),
+                "stage": st_final,
+                "round": str(final_job.get("round") or 0),
+                "slice": f"{int(final_job.get('completed_slices') or 0)}/{int(final_job.get('total_slices') or 0)}",
+                "cost": f"${cost_val:.4f}",
+            }
+        )
+        if st_final in {"needs-info", "needs-human"}:
+            herdr.emit_status("blocked", kind="question")
+        elif st_final in TERMINAL_OR_READY_STAGES:
+            herdr.emit_status("idle")
     if final_job.get("stage") in ("merged", "rejected"):
         if worktree and os.path.basename(os.path.dirname(os.path.abspath(worktree))) == ".worktrees":
             repo_root = os.path.dirname(os.path.dirname(os.path.abspath(worktree)))
@@ -2148,6 +2168,41 @@ def process_job(
                             text=True,
                         )
 
+        herdr = HerdrBridge.from_env()
+        _STAGE_PROGRESS = {
+            "intake": 10,
+            "spec": 25,
+            "build": 40,
+            "gate": 75,
+            "review": 85,
+            "approve": 90,
+            "merging": 95,
+            "staging_qa": 95,
+        }
+
+        def _emit_herdr_stage(stage_name: str, job_data: dict, *, slice_num: int = 0) -> None:
+            if not herdr.enabled:
+                return
+            total_sl = int(job_data.get("total_slices") or 0)
+            pct = _STAGE_PROGRESS.get(stage_name, 50)
+            if stage_name == "build" and total_sl > 0 and slice_num > 0:
+                pct = 40 + int(30 * (slice_num / total_sl))
+            cost_val = float((job_data.get("usage") or {}).get("cost_usd") or 0.0)
+            lbls = {
+                "issue": str(issue_number),
+                "stage": stage_name,
+                "round": str(job_data.get("round") or 0),
+                "slice": f"{slice_num}/{total_sl}",
+                "cost": f"${cost_val:.4f}",
+            }
+            if stage_name in {"needs-info", "needs-human"}:
+                herdr.emit_status("blocked", kind="question")
+            elif stage_name in TERMINAL_OR_READY_STAGES:
+                herdr.emit_status("idle")
+            else:
+                herdr.emit_status("working", progress=pct)
+            herdr.set_labels(lbls)
+
         last_checkpointed_stage = ""
         while True:
             check_halt_or_lease(repo_root, job_id, state_store)
@@ -2159,6 +2214,7 @@ def process_job(
                 last_checkpointed_stage = stage
             if board_sync:
                 board_sync.sync_stage(issue_url, stage)
+            _emit_herdr_stage(stage, job, slice_num=int(job.get("completed_slices") or 0))
             if stage in TERMINAL_OR_READY_STAGES or stage in {"needs-info", "needs-human"}:
                 return _finalize_job_exit(state_store, job_id, jdir, jobs_dir, job)
 
@@ -3232,6 +3288,9 @@ def _plan_queue_batch(
     return order_deps, hard_deps
 
 
+_ORIG_PROCESS_JOB_REF = process_job
+
+
 def reconcile_ready_jobs(
     repo_root: str,
     cfg: dict | None = None,
@@ -3381,9 +3440,33 @@ def run_factory(
                 has_near_merge_peers=_has_near_merge_peers,
             )
 
+        _ORIG_PROCESS_JOB = globals().get("_ORIG_PROCESS_JOB_REF") or process_job
+        herdr_bridge = HerdrBridge.from_env()
+        factory_bin = os.path.join(repo_root, "factory", "bin", "factory")
+        factory_cmd = [factory_bin] if os.path.isfile(factory_bin) and os.access(factory_bin, os.X_OK) else [sys.executable, "-m", "factory.cli"]
+
         def _safe_worker(num: int) -> dict | None:
             job_id = f"job-{num}"
             jdir = os.path.join(jobs_dir, job_id)
+            if (
+                herdr_bridge.enabled
+                and len(explicit_nums) != 1
+                and process_job is _ORIG_PROCESS_JOB
+                and run_agent is _ORIG_RUN_AGENT
+                and (not os.environ.get("PYTEST_CURRENT_TEST") or bool(os.environ.get("HC_BIN_PATH")))
+            ):
+                tid = herdr_bridge.spawn_job_terminal(
+                    job_id,
+                    repo_root,
+                    [*factory_cmd, "_exec-job", "--repo", repo_root, str(num)],
+                    labels={"issue": str(num), "stage": "queued"},
+                )
+                if tid:
+                    herdr_bridge.wait_terminal(tid)
+                    try:
+                        return load_job(jobs_dir, job_id)
+                    except FileNotFoundError:
+                        return None
             if state_store is not None:
                 initial = _build_initial_lease_stub(jobs_dir, job_id, num, state_store.machine_id)
                 ok, _ = state_store.claim_job_lease(job_id, initial)

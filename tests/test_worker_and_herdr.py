@@ -428,3 +428,133 @@ def test_run_worker_enforces_repo_concurrency_cap(tmp_path, monkeypatch):
     assert len(spawned) == 1
 
 
+def test_herdr_bridge_labels_wait_and_live(tmp_path, monkeypatch):
+    from factory.lib.herdr_bridge import HerdrBridge
+
+    hc_log = tmp_path / "hc_calls.log"
+    fake_hc = tmp_path / "hc"
+    fake_hc.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"with open({str(hc_log)!r}, 'a') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1:2] == ['run']:\n"
+        "    print('t99')\n"
+        "elif sys.argv[1:3] == ['ls', '--json']:\n"
+        "    print(json.dumps({'terminals': [{'id': 't99', 'name': 'job-1', 'state': 'live'}]}))\n",
+        encoding="utf-8",
+    )
+    fake_hc.chmod(0o755)
+    monkeypatch.setenv("HC_TERMINAL_ID", "t1")
+    monkeypatch.setenv("HC_BIN_PATH", str(fake_hc))
+
+    bridge = HerdrBridge.from_env()
+    tid = bridge.spawn_job_terminal("job-1", str(tmp_path), ["echo", "hi"], labels={"issue": "1", "stage": "queued"})
+    assert tid == "t99"
+    assert bridge.set_labels({"stage": "build", "round": "1"}) is True
+    assert bridge.is_terminal_live("t99") is True
+    assert bridge.wait_terminal("t99", timeout_sec=5.0) == 0
+
+    lines = hc_log.read_text(encoding="utf-8").splitlines()
+    assert any("--label issue=1 --label stage=queued" in ln for ln in lines)
+    assert "label t1 stage=build round=1" in lines
+    assert "wait t99" in lines
+
+
+def test_run_factory_spawns_hc_terminals_and_process_job_emits_progress(tmp_path, monkeypatch):
+    import io
+    import json
+    from factory.lib.herdr_bridge import HerdrBridge
+    from factory.lib.pipeline import process_job, run_factory
+    from factory.lib.state import create_or_resume_job
+
+    repo = _init_repo_with_origin(tmp_path, "herdr-pipe")
+    (repo / "factory" / "checks.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (repo / "factory" / "checks.sh").chmod(0o755)
+
+    hc_log = tmp_path / "hc_pipe.log"
+    fake_hc = tmp_path / "hc"
+    fake_hc.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        f"with open({str(hc_log)!r}, 'a') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1:2] == ['run']:\n"
+        "    print('t77')\n",
+        encoding="utf-8",
+    )
+    fake_hc.chmod(0o755)
+    monkeypatch.setenv("HC_TERMINAL_ID", "t10")
+    monkeypatch.setenv("HC_BIN_PATH", str(fake_hc))
+
+    # 1) process_job emits OSC 7501 progress + hc label updates
+    osc_buf = io.StringIO()
+    orig_from_env = HerdrBridge.from_env
+    monkeypatch.setattr(
+        "factory.lib.pipeline.HerdrBridge.from_env",
+        classmethod(lambda cls: orig_from_env(stream=osc_buf)),
+    )
+    monkeypatch.setattr("factory.lib.pipeline.ProjectBoardSync.discover", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        "factory.lib.pipeline.GitHubClient.fetch_issue",
+        lambda self, num: ({"number": num, "title": f"Issue {num}", "url": f"https://x/{num}", "body": "b", "comments": [], "labels": []}, f"# Issue #{num}\nb\n"),
+    )
+    monkeypatch.setattr("factory.lib.pipeline.GitHubClient.comment_issue", lambda *a, **kw: None)
+    monkeypatch.setattr("factory.lib.pipeline.GitHubClient.edit_labels", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        "factory.lib.pipeline.run_agent",
+        lambda *_a, **_kw: (
+            {"decision": "REJECT", "risk": "low", "surfaces": [], "summary": ["no"], "scope_in": "", "scope_out": "", "questions": [], "reasoning": "no"},
+            {"total_tokens": 10},
+            0.01,
+        ),
+    )
+
+    res = process_job(str(repo), 70)
+    assert res["stage"] == "needs-human"
+    osc_out = osc_buf.getvalue()
+    assert "\033]7501;state=working:progress=10\033\\" in osc_out
+    assert "\033]7501;state=blocked:kind=question\033\\" in osc_out
+    lines = hc_log.read_text(encoding="utf-8").splitlines()
+    assert any(ln.startswith("label t10 ") and "stage=intake" in ln for ln in lines)
+
+
+def test_run_factory_spawns_hc_terminals(tmp_path, monkeypatch):
+    from factory.lib.pipeline import run_factory
+    from factory.lib.state import create_or_resume_job
+
+    repo = _init_repo_with_origin(tmp_path, "herdr-run-factory")
+    (repo / "factory" / "checks.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (repo / "factory" / "checks.sh").chmod(0o755)
+
+    hc_log = tmp_path / "hc_pipe.log"
+    fake_hc = tmp_path / "hc"
+    fake_hc.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        f"with open({str(hc_log)!r}, 'a') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1:2] == ['run']:\n"
+        "    print('t77')\n",
+        encoding="utf-8",
+    )
+    fake_hc.chmod(0o755)
+    monkeypatch.setenv("HC_TERMINAL_ID", "t10")
+    monkeypatch.setenv("HC_BIN_PATH", str(fake_hc))
+    monkeypatch.setattr("factory.lib.pipeline.ProjectBoardSync.discover", lambda *a, **kw: None)
+
+    jobs_dir = str(repo / "factory" / "jobs")
+    create_or_resume_job(jobs_dir, {"number": 71, "title": "Queued", "url": "https://x/71"}, 3)
+    monkeypatch.setattr(
+        "factory.lib.pipeline.GitHubClient.list_queue_issues",
+        lambda self, cfg: [{"number": 71, "title": "Queued", "url": "https://x/71", "body": ""}],
+    )
+    monkeypatch.setattr("factory.lib.pipeline._plan_queue_batch", lambda *a, **kw: ({71: []}, {}))
+    out_jobs = run_factory(str(repo))
+    assert len(out_jobs) == 1
+    spawn_lines = hc_log.read_text(encoding="utf-8").splitlines()
+    assert any("run --bg" in ln and "_exec-job" in ln and "71" in ln for ln in spawn_lines)
+    assert any("wait t77" in ln for ln in spawn_lines)
+
+
+

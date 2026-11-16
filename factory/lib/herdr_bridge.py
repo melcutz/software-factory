@@ -66,12 +66,23 @@ class HerdrBridge:
             except (OSError, ValueError):
                 pass
 
-    def spawn_job_terminal(self, name: str, cwd: str, cmd: list[str]) -> str | None:
+    def spawn_job_terminal(
+        self,
+        name: str,
+        cwd: str,
+        cmd: list[str],
+        *,
+        labels: dict[str, str] | None = None,
+    ) -> str | None:
         """Spawn a background child terminal via `hc run --bg` when inside herdr-core."""
         if not self.enabled or not self.hc_bin:
             return None
         safe_name = sanitize_hc_name(name)
-        full_cmd = [self.hc_bin, "run", "--bg", "--name", safe_name, "--cwd", cwd, "--", *cmd]
+        full_cmd = [self.hc_bin, "run", "--bg", "--name", safe_name, "--cwd", cwd]
+        for k, v in (labels or {}).items():
+            if k:
+                full_cmd.extend(["--label", f"{k}={v}"])
+        full_cmd.extend(["--", *cmd])
         try:
             res = subprocess.run(
                 full_cmd,
@@ -86,6 +97,69 @@ class HerdrBridge:
             return None
         out = (res.stdout or "").strip()
         return out.splitlines()[-1].strip() if out else name
+
+    def set_labels(self, labels: dict[str, str], terminal_id: str | None = None) -> bool:
+        """Update key=value metadata labels on a Herdr terminal via `hc label`."""
+        tid = terminal_id or self.terminal_id
+        if not self.enabled or not self.hc_bin or not tid or not labels:
+            return False
+        kv = [f"{k}={v}" for k, v in labels.items() if k]
+        if not kv:
+            return False
+        try:
+            res = subprocess.run(
+                [self.hc_bin, "label", tid, *kv],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+            return res.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def wait_terminal(self, terminal_id: str, timeout_sec: float | None = None) -> int | None:
+        """Wait for a Herdr terminal to exit via `hc wait <tid>`."""
+        if not self.hc_bin or not terminal_id:
+            return None
+        try:
+            res = subprocess.run(
+                [self.hc_bin, "wait", terminal_id],
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+            )
+            return res.returncode
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def is_terminal_live(self, terminal_id: str) -> bool:
+        """Return True if `terminal_id` (id or name) is live in `hc ls --json`."""
+        if not self.hc_bin or not terminal_id:
+            return False
+        try:
+            res = subprocess.run(
+                [self.hc_bin, "ls", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if res.returncode != 0:
+            return False
+        try:
+            data = json.loads(res.stdout or "{}")
+        except ValueError:
+            return False
+        return any(
+            isinstance(t, dict)
+            and t.get("state") == "live"
+            and (t.get("id") == terminal_id or t.get("name") == terminal_id)
+            for t in (data.get("terminals") or [])
+        )
 
     def list_terminals(self) -> list[str]:
         """Return lines from `hc ls`, or [] if hc is unavailable."""
