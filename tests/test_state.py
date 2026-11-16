@@ -249,6 +249,16 @@ class StateTests(unittest.TestCase):
             self.assertAlmostEqual(job["metrics"]["gate_duration_seconds"], 30.0)
             self.assertAlmostEqual(job["metrics"]["deploy_duration_seconds"], 50.0)
 
+    def test_intake_can_transition_directly_to_build(self):
+        from factory.lib.state import enqueue_job
+
+        with tempfile.TemporaryDirectory() as d:
+            issue = {"number": 91, "title": "Batch direct", "body": "", "url": ""}
+            enqueue_job(d, issue, max_rounds=3)
+            advance_stage(d, "job-91", "intake")
+            job = advance_stage(d, "job-91", "build")
+            self.assertEqual(job["stage"], "build")
+
 
 if __name__ == "__main__":
     unittest.main()

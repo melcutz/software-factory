@@ -47,6 +47,7 @@ DEFAULT_CONFIG: dict = {
         "intake": "gemini-3.8-flash-low",
         "spec_writer": "gemini-3.8-flash-medium",
         "builder": "gemini-3.8-flash-medium",
+        "batch_builder": "gemini-3.8-flash-medium",
         "builder_low": None,
         "approver": "gemini-3.8-flash-medium",
         "qa": "gemini-3.8-flash-medium",
@@ -59,6 +60,13 @@ DEFAULT_CONFIG: dict = {
     },
     "model_pricing": copy.deepcopy(DEFAULT_MODEL_PRICING),
     "max_job_cost_usd": 0.0,
+    "batch": {
+        "enabled": True,
+        "max_batch_issues": 5,
+        "max_batch_weight": 6,
+        "max_parallel_batches": 2,
+        "refresh_repo_map": True,
+    },
     "staging_qa": {
         "enabled": False,
         "max_batch_size": 4,
@@ -142,10 +150,11 @@ def load_config(factory_dir: str) -> dict:
         if not isinstance(raw, dict):
             raise ValueError("config.json root must be a JSON object")
         for key, value in raw.items():
-            if key in {"labels", "models", "model_pricing", "staging_qa"} and isinstance(value, dict):
+            if key in {"labels", "models", "model_pricing", "batch", "staging_qa"} and isinstance(value, dict):
                 cfg[key].update(value)
             else:
                 cfg[key] = value
+    cfg["models"].setdefault("batch_builder", cfg["models"]["builder"])
 
     if cfg["merge_method"] not in VALID_MERGE_METHODS:
         raise ValueError(f"Invalid merge_method: {cfg['merge_method']!r}")
@@ -174,6 +183,17 @@ def load_config(factory_dir: str) -> dict:
         raise ValueError("base_branch must be a non-empty string")
     if not isinstance(cfg.get("protected_paths"), list):
         raise ValueError("protected_paths must be a list of path patterns")
+
+    batch_cfg = cfg.get("batch")
+    if not isinstance(batch_cfg, dict):
+        raise ValueError("batch must be a JSON object")
+    for bkey in ("enabled", "refresh_repo_map"):
+        if not isinstance(batch_cfg.get(bkey), bool):
+            raise ValueError(f"batch.{bkey} must be a boolean")
+    for ikey, hi in (("max_batch_issues", 10), ("max_batch_weight", 20), ("max_parallel_batches", 8)):
+        ival = batch_cfg.get(ikey)
+        if not isinstance(ival, int) or isinstance(ival, bool) or not (1 <= ival <= hi):
+            raise ValueError(f"batch.{ikey} must be an integer in 1..{hi}, got {ival!r}")
 
     sqa = cfg.get("staging_qa")
     if not isinstance(sqa, dict):

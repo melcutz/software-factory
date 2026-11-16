@@ -218,6 +218,28 @@ class ConfigAndSchemaTests(unittest.TestCase):
             # 0.5 * 2.0 + 0.2 * 0.5 + 0.05 * 8.0 = 1.0 + 0.1 + 0.4 = 1.5
             self.assertAlmostEqual(custom_cost, 1.5)
 
+    def test_batch_config_defaults_and_validation(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            cfg = load_config(d)
+            self.assertEqual(
+                cfg["batch"],
+                {
+                    "enabled": True,
+                    "max_batch_issues": 5,
+                    "max_batch_weight": 6,
+                    "max_parallel_batches": 2,
+                    "refresh_repo_map": True,
+                },
+            )
+            self.assertEqual(cfg["models"]["batch_builder"], "gemini-3.8-flash-medium")
+
+            with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+                json.dump({"batch": {"max_batch_issues": 0}}, f)
+            with self.assertRaisesRegex(ValueError, "max_batch_issues"):
+                load_config(d)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 TRANSITIONS: dict[str, list[str]] = {
     "queued": ["intake", "rejected"],
-    "intake": ["spec", "needs-info", "rejected", "needs-human"],
+    "intake": ["spec", "build", "needs-info", "rejected", "needs-human"],
     "needs-info": ["intake", "rejected"],
     "spec": ["build", "needs-human"],
     "build": ["gate", "needs-human"],
