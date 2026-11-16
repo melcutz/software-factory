@@ -276,6 +276,119 @@ class ReliabilityAndEfficiencyTests(unittest.TestCase):
             self.assertTrue(try_resolve_generated_asset_conflicts(wt))
             self.assertFalse(auto_polish_worktree(wt, "main", ["factory/"]))
 
+    def test_config_max_job_cost_usd_validation(self) -> None:
+        from factory.lib.config import DEFAULT_CONFIG, load_config
+
+        self.assertEqual(DEFAULT_CONFIG.get("max_job_cost_usd"), 0.0)
+        with tempfile.TemporaryDirectory() as d:
+            cfg_path = os.path.join(d, "config.json")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                f.write('{"max_job_cost_usd": 2.5}')
+            loaded = load_config(d)
+            self.assertEqual(loaded["max_job_cost_usd"], 2.5)
+            for bad in ('{"max_job_cost_usd": -0.5}', '{"max_job_cost_usd": true}', '{"max_job_cost_usd": "1"}'):
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    f.write(bad)
+                with self.assertRaises(ValueError):
+                    load_config(d)
+
+    def test_select_builder_model_tiering(self) -> None:
+        from factory.lib.pipeline import select_builder_model
+
+        cfg = {"models": {"builder": "gemini-3.8-flash-medium", "builder_low": "gemini-3.8-flash-low"}}
+        low_job = {"risk": "low"}
+        med_job = {"risk": "medium"}
+        self.assertEqual(select_builder_model(cfg, low_job, attempt=0), "gemini-3.8-flash-low")
+        self.assertEqual(select_builder_model(cfg, low_job, attempt=1), "gemini-3.8-flash-medium")
+        self.assertEqual(select_builder_model(cfg, low_job, attempt=0, is_fix_round=True), "gemini-3.8-flash-medium")
+        self.assertEqual(select_builder_model(cfg, low_job, attempt=0, is_conflict=True), "gemini-3.8-flash-medium")
+        self.assertEqual(select_builder_model(cfg, med_job, attempt=0), "gemini-3.8-flash-medium")
+        cfg_no_low = {"models": {"builder": "gemini-3.8-flash-medium"}}
+        self.assertEqual(select_builder_model(cfg_no_low, low_job, attempt=0), "gemini-3.8-flash-medium")
+
+    def test_spec_protected_path_check_and_cost_circuit_breaker(self) -> None:
+        from unittest.mock import patch
+        from factory.lib.pipeline import process_job
+
+        with tempfile.TemporaryDirectory() as d:
+            bare = os.path.join(d, "origin.git")
+            repo = os.path.join(d, "repo")
+            subprocess.run(["git", "init", "--bare", "-b", "main", bare], check=True, capture_output=True)
+            subprocess.run(["git", "clone", bare, repo], check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo, "config", "user.email", "t@e.com"], check=True)
+            subprocess.run(["git", "-C", repo, "config", "user.name", "T"], check=True)
+            os.makedirs(os.path.join(repo, "factory"), exist_ok=True)
+            with open(os.path.join(repo, "factory", "config.json"), "w", encoding="utf-8") as f:
+                f.write(
+                    '{"allow_self_host": true, "protected_paths": ["factory/checks.sh"], '
+                    '"max_job_cost_usd": 0.50}'
+                )
+            with open(os.path.join(repo, "factory", "checks.sh"), "w", encoding="utf-8") as f:
+                f.write("#!/usr/bin/env bash\nexit 0\n")
+            os.chmod(os.path.join(repo, "factory", "checks.sh"), 0o755)
+            subprocess.run(["git", "-C", repo, "add", "."], check=True)
+            subprocess.run(["git", "-C", repo, "commit", "-m", "init"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", repo, "push", "-u", "origin", "main"], check=True, capture_output=True)
+
+            class _FakeGH:
+                def __init__(self):
+                    self.comments = []
+                def fetch_issue(self, num):
+                    return (
+                        {"number": num, "title": "T", "url": f"https://x/{num}", "body": "b", "comments": [], "labels": []},
+                        f"# Issue #{num}\nb\n",
+                    )
+                def comment_issue(self, num, body):
+                    self.comments.append(body)
+                def edit_labels(self, *a, **kw):
+                    pass
+
+            gh = _FakeGH()
+            calls = []
+
+            def fake_agent(_fdir, _jdir, _wt, step, _role, _model, prompt, *_a, **_kw):
+                calls.append((step, prompt))
+                usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+                if step == "intake":
+                    return ({"decision": "ACCEPT", "risk": "low", "surfaces": [], "summary": ["ok"], "scope_in": "in", "scope_out": "out", "questions": [], "reasoning": "ok"}, usage, 0.01)
+                if step == "spec":
+                    return (
+                        {
+                            "summary": ["s"], "problem": "p", "solution": "s", "user_stories": ["u"],
+                            "implementation_decisions": ["d"], "testing_decisions": ["t"],
+                            "glossary_updates": [], "out_of_scope": [],
+                            "slices": [{"id": "s1", "title": "S1", "goal": "g", "files": ["factory/checks.sh"], "test_seams": ["t"], "acceptance_criteria": ["a"]}],
+                        },
+                        usage,
+                        0.01,
+                    )
+                raise AssertionError(f"unexpected step {step}")
+
+            with patch("factory.lib.pipeline.run_agent", side_effect=fake_agent), \
+                 patch("factory.lib.pipeline.ProjectBoardSync.discover", return_value=None):
+                res = process_job(repo, 41, gh=gh)
+            self.assertEqual(res["stage"], "needs-human")
+            spec_calls = [p for s, p in calls if s == "spec"]
+            self.assertEqual(len(spec_calls), 2)
+            self.assertIn("factory/checks.sh", spec_calls[1])
+            self.assertFalse(any(s == "build" for s, _ in calls))
+
+            # Now test max_job_cost_usd circuit breaker before launching a new agent step
+            from factory.lib.state import create_or_resume_job, record_usage
+            create_or_resume_job(
+                os.path.join(repo, "factory", "jobs"),
+                {"number": 42, "title": "Cost test", "url": "https://x/42"},
+                3,
+            )
+            record_usage(os.path.join(repo, "factory", "jobs"), "job-42", {"total_tokens": 100}, 1.0, cost_usd=0.50)
+            calls.clear()
+            with patch("factory.lib.pipeline.run_agent", side_effect=fake_agent), \
+                 patch("factory.lib.pipeline.ProjectBoardSync.discover", return_value=None):
+                res42 = process_job(repo, 42, gh=gh)
+            self.assertEqual(res42["stage"], "needs-human")
+            self.assertEqual(calls, [])
+            self.assertIn("0.50", res42.get("last_error") or "")
+
 
 if __name__ == "__main__":
     unittest.main()

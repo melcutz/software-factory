@@ -25,6 +25,7 @@ from factory.lib.config import (
 )
 from factory.lib.gate_runner import (
     auto_polish_worktree,
+    find_protected_violations,
     run_gate,
     select_pre_merge_gate_scope,
 )
@@ -1778,6 +1779,55 @@ def _checkpoint_if_store(
         update_job(jobs_dir, job_id, **updates)
 
 
+def select_builder_model(
+    cfg: dict,
+    job: dict,
+    *,
+    attempt: int,
+    is_fix_round: bool = False,
+    is_conflict: bool = False,
+) -> str:
+    """Select fast builder_low on clean low-risk attempt 0, otherwise escalate to models['builder']."""
+    models = cfg.get("models") or {}
+    low_model = models.get("builder_low")
+    if (
+        isinstance(low_model, str)
+        and low_model.strip()
+        and (job.get("risk") or "") == "low"
+        and attempt == 0
+        and not is_fix_round
+        and not is_conflict
+    ):
+        return low_model.strip()
+    return models["builder"]
+
+
+def _check_cost_budget(
+    jobs_dir: str,
+    job_id: str,
+    job: dict,
+    cfg: dict,
+    gh_client: GitHubClient,
+    issue_number: int,
+    labels: dict,
+) -> dict | None:
+    """Escalate to needs-human if max_job_cost_usd > 0 and job spend reached the cap."""
+    max_cost = float(cfg.get("max_job_cost_usd") or 0.0)
+    if max_cost <= 0.0:
+        return None
+    spent = float((job.get("usage") or {}).get("cost_usd") or 0.0)
+    if spent >= max_cost:
+        return _escalate_to_human(
+            jobs_dir,
+            job_id,
+            issue_number,
+            gh_client,
+            cfg,
+            f"Job cost cap exceeded: spent ${spent:.4f} >= max_job_cost_usd ${max_cost:.2f}",
+        )
+    return None
+
+
 def _cleanup_terminal_job(repo_root: str, job_id: str, job: dict) -> None:
     """Remove worktree and superseded remote branches for terminal merged/rejected jobs."""
     if job.get("stage") not in ("merged", "rejected"):
@@ -1957,6 +2007,13 @@ def process_job(
             if stage in TERMINAL_OR_READY_STAGES or stage in {"needs-info", "needs-human"}:
                 return _finalize_job_exit(state_store, job_id, jdir, jobs_dir, job)
 
+            if stage in {"intake", "spec", "build", "review", "approve"}:
+                budget_esc = _check_cost_budget(jobs_dir, job_id, job, cfg, gh_client, issue_number, labels)
+                if budget_esc is not None:
+                    return _finalize_job_exit(
+                        state_store, job_id, jdir, jobs_dir, budget_esc, worktree=worktree, base_branch=base_branch
+                    )
+
             _log(job_id, f"stage={stage} round={job['round']}")
 
             if stage == "intake":
@@ -2046,6 +2103,72 @@ def process_job(
                 _clear_quota_cooldown_if_needed(state_store, spec_model)
                 metrics_str = _record_and_format_step(jobs_dir, job_id, spec_model, usage, dur, cfg)
                 _log(job_id, f"spec done slices={len(spec_out['slices'])} ({metrics_str})")
+
+                allow_self_host = bool(cfg.get("allow_self_host", False))
+                planned_files = [
+                    str(f)
+                    for sl in (spec_out.get("slices") or [])
+                    for f in (sl.get("files") or [])
+                ]
+                violations = find_protected_violations(
+                    planned_files,
+                    cfg.get("protected_paths", []),
+                    allow_self_host=allow_self_host,
+                )
+                if violations:
+                    budget_esc = _check_cost_budget(
+                        jobs_dir, job_id, load_job(jobs_dir, job_id), cfg, gh_client, issue_number, labels
+                    )
+                    if budget_esc is not None:
+                        return _finalize_job_exit(
+                            state_store, job_id, jdir, jobs_dir, budget_esc, worktree=worktree, base_branch=base_branch
+                        )
+                    _log(job_id, f"spec protected_paths violation={violations}; retrying spec-writer once")
+                    retry_prompt = (
+                        f"{prompt}\n\n## Protected Path Violation (Required Fix)\n"
+                        f"Your previous spec planned edits to protected paths: {', '.join(violations)}.\n"
+                        "Revise `slices[*].files` so NO slice touches any protected path."
+                    )
+                    spec_out, usage, dur = _call_run_agent(
+                        factory_dir,
+                        jdir,
+                        worktree,
+                        "spec",
+                        "spec-writer",
+                        spec_model,
+                        retry_prompt,
+                        SCHEMAS["spec"],
+                        timeout_sec,
+                        sandbox=True,
+                        log_name="spec-retry",
+                        abort_check=abort_check,
+                    )
+                    _clear_quota_cooldown_if_needed(state_store, spec_model)
+                    metrics_str = _record_and_format_step(jobs_dir, job_id, spec_model, usage, dur, cfg)
+                    _log(job_id, f"spec retry done slices={len(spec_out['slices'])} ({metrics_str})")
+                    planned_files = [
+                        str(f)
+                        for sl in (spec_out.get("slices") or [])
+                        for f in (sl.get("files") or [])
+                    ]
+                    violations = find_protected_violations(
+                        planned_files,
+                        cfg.get("protected_paths", []),
+                        allow_self_host=allow_self_host,
+                    )
+                    if violations:
+                        esc_job = _escalate_to_human(
+                            jobs_dir,
+                            job_id,
+                            issue_number,
+                            gh_client,
+                            cfg,
+                            f"Spec planned protected paths that cannot be modified: {', '.join(violations)}",
+                        )
+                        return _finalize_job_exit(
+                            state_store, job_id, jdir, jobs_dir, esc_job, worktree=worktree, base_branch=base_branch
+                        )
+
                 _write_json(os.path.join(jdir, "spec.json"), spec_out)
                 _write_json(os.path.join(jdir, "plan.json"), {"slices": spec_out["slices"]})
                 _write_text(os.path.join(jdir, "spec.md"), render_spec_md(spec_out))
@@ -2068,7 +2191,7 @@ def process_job(
                 slices = plan_data.get("slices", [])
                 total_slices = len(slices)
                 prior_escalation = job.get("last_error") or ""
-                builder_model = cfg["models"]["builder"]
+                is_fix_round = round_num > 1 or bool(qa_failure_md.strip()) or bool(prior_escalation.strip())
 
                 if job["completed_slices"] < total_slices:
                     for idx in range(job["completed_slices"], total_slices):
@@ -2079,6 +2202,19 @@ def process_job(
                         _, prior_slices_md = _aggregate_slice_builds(jdir, idx)
 
                         for attempt in range(cfg["max_slice_retries"] + 1):
+                            budget_esc = _check_cost_budget(
+                                jobs_dir, job_id, load_job(jobs_dir, job_id), cfg, gh_client, issue_number, labels
+                            )
+                            if budget_esc is not None:
+                                return _finalize_job_exit(
+                                    state_store, job_id, jdir, jobs_dir, budget_esc, worktree=worktree, base_branch=base_branch
+                                )
+                            builder_model = select_builder_model(
+                                cfg,
+                                job,
+                                attempt=attempt,
+                                is_fix_round=is_fix_round,
+                            )
                             if attempt == 0 and not is_worktree_clean(worktree):
                                 _log(
                                     job_id,
@@ -2292,6 +2428,7 @@ def process_job(
                             spec_md,
                         ]
                     )
+                    builder_model = select_builder_model(cfg, job, attempt=0, is_fix_round=True)
                     _set_activity(jobs_dir, job_id, f"running:fix-round-{round_num}")
                     _log(job_id, f"build fix-round={round_num} start ({_fmt_model_tag(builder_model)})")
                     build_out, usage, dur = _call_run_agent(

@@ -47,6 +47,7 @@ DEFAULT_CONFIG: dict = {
         "intake": "gemini-3.8-flash-low",
         "spec_writer": "gemini-3.8-flash-medium",
         "builder": "gemini-3.8-flash-medium",
+        "builder_low": None,
         "approver": "gemini-3.8-flash-medium",
         "qa": "gemini-3.8-flash-medium",
         "code_low": "gemini-3.6-flash-low",
@@ -57,6 +58,7 @@ DEFAULT_CONFIG: dict = {
         "ui": "gemini-3.6-flash-low",
     },
     "model_pricing": copy.deepcopy(DEFAULT_MODEL_PRICING),
+    "max_job_cost_usd": 0.0,
     "staging_qa": {
         "enabled": False,
         "max_batch_size": 4,
@@ -163,6 +165,10 @@ def load_config(factory_dir: str) -> dict:
         bval = cfg.get(bool_key)
         if not isinstance(bval, bool):
             raise ValueError(f"{bool_key} must be a boolean, got {bval!r}")
+
+    max_cost = cfg.get("max_job_cost_usd", 0.0)
+    if not isinstance(max_cost, (int, float)) or isinstance(max_cost, bool) or max_cost < 0:
+        raise ValueError(f"max_job_cost_usd must be a non-negative number, got {max_cost!r}")
 
     if not isinstance(cfg.get("base_branch"), str) or not cfg["base_branch"].strip():
         raise ValueError("base_branch must be a non-empty string")
