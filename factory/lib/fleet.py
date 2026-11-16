@@ -189,7 +189,8 @@ def fleet_update(machine: str | None = None) -> list[tuple[str, int, str]]:
     """Pull latest software-factory-agy on all (or one) fleet machine(s)."""
     update_script = (
         'DIR=$(python3 -c "import os,factory; print(os.path.dirname(list(factory.__path__)[0]))" 2>/dev/null || echo "$HOME/work/software-factory-agy"); '
-        'git -C "$DIR" pull --ff-only'
+        'BRANCH=$(git -C "$DIR" symbolic-ref --short HEAD 2>/dev/null || echo main); '
+        'git -C "$DIR" pull --ff-only origin "$BRANCH"'
     )
     machines = discover_machines()
     if machine:

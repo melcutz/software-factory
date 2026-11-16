@@ -158,7 +158,7 @@ def test_fleet_update_runs_git_pull_on_all_machines(tmp_path, monkeypatch):
     from factory import cli
     assert cli.main(["fleet", "update"]) == 0
     lines = log_file.read_text().splitlines()
-    assert any("run --on lenovo -- sh -lc" in ln and "pull --ff-only" in ln for ln in lines)
+    assert any("run --on lenovo -- sh -lc" in ln and "pull --ff-only origin" in ln for ln in lines)
 
 
 def test_fleet_wake_is_idempotent_on_name_taken(tmp_path, monkeypatch):
