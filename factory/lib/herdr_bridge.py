@@ -1,6 +1,7 @@
 """Bridge to herdr-core (hc) background child terminals and OSC 7501 status protocol."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -103,3 +104,29 @@ class HerdrBridge:
         if res.returncode != 0:
             return []
         return [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
+
+    def list_live_terminal_names(self) -> set[str]:
+        """Return names of currently live `hc` terminals via `hc ls --json`, or empty set."""
+        if not self.hc_bin:
+            return set()
+        try:
+            res = subprocess.run(
+                [self.hc_bin, "ls", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return set()
+        if res.returncode != 0:
+            return set()
+        try:
+            data = json.loads(res.stdout or "{}")
+        except ValueError:
+            return set()
+        return {
+            str(t["name"])
+            for t in (data.get("terminals") or [])
+            if isinstance(t, dict) and t.get("state") == "live" and t.get("name")
+        }

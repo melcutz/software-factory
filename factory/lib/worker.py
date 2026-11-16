@@ -266,6 +266,7 @@ def run_worker(
 
     stores = {r: GitStateStore(r, host_cfg.machine_id) for r in healthy_repos}
     active_threads: list[tuple[str, int, threading.Thread]] = []
+    active_hc_terminals: dict[tuple[str, int], str] = {}
 
     def _handle_sig(_signum, _frame):
         stop_event.set()
@@ -298,7 +299,14 @@ def run_worker(
     last_prune: float | None = None
     while not stop_event.is_set():
         active_threads = [(r, i, t) for (r, i, t) in active_threads if t.is_alive()]
+        if bridge.enabled and active_hc_terminals:
+            live_names = bridge.list_live_terminal_names()
+            active_hc_terminals = {
+                k: name for k, name in active_hc_terminals.items() if name in live_names
+            }
         active_local_jobs = _collect_active_local_jobs(host_cfg.machine_id, stores, active_threads)
+        for repo_key, issue_key in active_hc_terminals:
+            active_local_jobs.add((repo_key, f"job-{issue_key}"))
         now = time.monotonic()
 
         if last_hb is None or now - last_hb >= 120.0:
@@ -402,7 +410,24 @@ def run_worker(
                 )
             ]
 
-            cand = select_next_candidate(host_cfg.machine_id, remote_jobs, ready, workers, now_ts=now_ts)
+            local_running_issues = {
+                i for (r, i, t) in active_threads if r == repo and t.is_alive()
+            } | {
+                i for (r, i) in active_hc_terminals if r == repo
+            }
+            filtered_remote_jobs = [
+                j for j in remote_jobs if int(j.get("issue") or -1) not in local_running_issues
+            ]
+            filtered_ready = [
+                iss for iss in ready if int(iss["number"]) not in local_running_issues
+            ]
+            cand = select_next_candidate(
+                host_cfg.machine_id,
+                filtered_remote_jobs,
+                filtered_ready,
+                workers,
+                now_ts=now_ts,
+            )
             if not cand:
                 continue
 
@@ -429,6 +454,9 @@ def run_worker(
                     [sys.executable, "-m", "factory.cli", "_exec-job", "--repo", repo, str(issue_num)],
                 )
                 if tid:
+                    from factory.lib.herdr_bridge import sanitize_hc_name
+
+                    active_hc_terminals[(repo, issue_num)] = sanitize_hc_name(name)
                     continue
 
             t = threading.Thread(target=exec_job_command, args=(repo, issue_num), daemon=True)
