@@ -155,6 +155,28 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _format_fleet_result(name: str, rc: int, out: str) -> str:
+    text = (out or "").strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                if "error" in data and isinstance(data["error"], dict):
+                    err = data["error"]
+                    msg = str(err.get("message") or "command failed")
+                    hint = str(err.get("hint") or "")
+                    suffix = f" ({hint})" if hint else ""
+                    return f"{name}: FAILED - {msg}{suffix}"
+                if "address" in data:
+                    state = str(data.get("state") or "live")
+                    return f"{name}: started ({data['address']}, {state})"
+        except ValueError:
+            pass
+    if rc == 0:
+        return f"{name}: {text or 'ok'}"
+    return f"{name}: FAILED (rc={rc}) {text}".strip()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -199,19 +221,19 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.action == "wake":
             for name, rc, out in fleet_wake():
-                print(f"{name}: rc={rc} {out}".strip())
+                print(_format_fleet_result(name, rc, out))
             return 0
         if args.action == "pause":
             for name, rc, out in fleet_pause(args.machine, drain=args.drain):
-                print(f"{name}: rc={rc} {out}".strip())
+                print(_format_fleet_result(name, rc, out))
             return 0
         if args.action == "unpause":
             for name, rc, out in fleet_unpause(args.machine):
-                print(f"{name}: rc={rc} {out}".strip())
+                print(_format_fleet_result(name, rc, out))
             return 0
         if args.action == "update":
             for name, rc, out in fleet_update(args.machine):
-                print(f"{name}: rc={rc} {out}".strip())
+                print(_format_fleet_result(name, rc, out))
             return 0
         return 1
 

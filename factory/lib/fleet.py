@@ -7,6 +7,7 @@ import shutil
 import socket
 import subprocess
 
+from factory.lib.herdr_bridge import sanitize_hc_name
 from factory.lib.worker import host_config_dir, is_host_paused, set_host_paused
 
 
@@ -150,7 +151,7 @@ def fleet_wake() -> list[tuple[str, int, str]]:
             m,
             _factory_shell_cmd("worker", "--all"),
             bg=True,
-            name=f"factory-worker-{m['name']}",
+            name=sanitize_hc_name(f"factory-worker-{m['name']}"),
         )
         if rc != 0 and '"name_taken"' in out:
             results.append((m["name"], 0, "already running"))

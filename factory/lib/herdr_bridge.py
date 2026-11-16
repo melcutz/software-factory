@@ -2,11 +2,18 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 from typing import TextIO
+
+
+def sanitize_hc_name(raw: str) -> str:
+    """Sanitize a terminal name to hc's required 1-32 chars of [a-z0-9._-]."""
+    cleaned = re.sub(r"[^a-z0-9._-]+", "-", raw.lower()).strip("-._")
+    return (cleaned or "worker")[:32]
 
 
 class HerdrBridge:
@@ -62,7 +69,8 @@ class HerdrBridge:
         """Spawn a background child terminal via `hc run --bg` when inside herdr-core."""
         if not self.enabled or not self.hc_bin:
             return None
-        full_cmd = [self.hc_bin, "run", "--bg", "--name", name, "--cwd", cwd, "--", *cmd]
+        safe_name = sanitize_hc_name(name)
+        full_cmd = [self.hc_bin, "run", "--bg", "--name", safe_name, "--cwd", cwd, "--", *cmd]
         try:
             res = subprocess.run(
                 full_cmd,

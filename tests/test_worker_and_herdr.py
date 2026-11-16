@@ -172,3 +172,17 @@ def test_fleet_wake_is_idempotent_on_name_taken(tmp_path, monkeypatch):
     res = fleet_wake()
     assert ("base-ubuntu", 0, "already running") in res
 
+
+def test_sanitize_hc_name_and_human_readable_fleet_output():
+    from factory.cli import _format_fleet_result
+    from factory.lib.herdr_bridge import sanitize_hc_name
+
+    assert sanitize_hc_name("factory-worker-Rocket") == "factory-worker-rocket"
+    assert sanitize_hc_name("My Repo#42!") == "my-repo-42"
+
+    started = _format_fleet_result("lenovo", 0, '{"address":"lenovo/t11","state":"live"}')
+    assert started == "lenovo: started (lenovo/t11, live)"
+
+    failed = _format_fleet_result("Rocket", 6, '{"error":{"message":"bad name","hint":"lowercase only"}}')
+    assert failed == "Rocket: FAILED - bad name (lowercase only)"
+
