@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import datetime
 
+import factory.lib.governor as _governor
 from factory.lib.agy_runner import AgentExecutionError, QuotaExhaustedError, resolve_agent_path, run_agent
 from factory.lib.config import (
     estimate_usage_cost_usd,
@@ -30,6 +31,24 @@ from factory.lib.gate_runner import (
 from factory.lib.git_state import GitStateStore, LeaseLostError
 from factory.lib.planner import plan_dependency_dag
 from factory.lib.project_board import ProjectBoardSync
+
+
+def load_host_config():
+    """Load local worker host configuration lazily to avoid circular imports."""
+    from factory.lib.worker import load_host_config as _worker_load_host_config
+
+    return _worker_load_host_config()
+
+
+def is_host_draining() -> bool:
+    """Return True if host is in `pause --drain` state."""
+    from factory.lib import worker as _worker
+
+    return _worker.is_host_draining()
+
+
+_ORIG_CHECK_HOST_ADMISSION = _governor.check_host_admission
+check_host_admission = _governor.check_host_admission
 from factory.lib.git_ops import (
     GitHubClient,
     _run_git,
@@ -1561,7 +1580,12 @@ class JobHaltedError(RuntimeError):
 
 
 def _default_machine_id() -> str:
-    return socket.gethostname()
+    try:
+        from factory.lib.worker import load_host_config
+
+        return load_host_config().machine_id
+    except Exception:
+        return socket.gethostname()
 
 
 def _halt_signal_path() -> str:
@@ -1573,14 +1597,159 @@ def is_local_halted() -> bool:
     return os.path.isfile(_halt_signal_path())
 
 
+def _check_remote_lease_and_control(
+    jobs_dir: str,
+    job_id: str,
+    store: GitStateStore,
+) -> BaseException | None:
+    ctrl = store.get_control_state()
+    if ctrl.get("halted"):
+        return JobHaltedError(f"fleet halted: {ctrl.get('reason') or 'operator halt'}")
+    commit_sha = store._fetch_ref(f"refs/factory/jobs/{job_id}")
+    if commit_sha:
+        remote_job = store._read_json_from_commit(commit_sha, "job.json")
+        if isinstance(remote_job, dict):
+            remote_lease = remote_job.get("lease")
+            try:
+                local_job = load_job(jobs_dir, job_id)
+            except FileNotFoundError:
+                local_job = {}
+            local_lease = local_job.get("lease") or {}
+            local_token = int(local_lease.get("fencing_token") or local_job.get("_last_fencing_token") or 0)
+            if isinstance(remote_lease, dict):
+                remote_owner = remote_lease.get("worker_id") or remote_lease.get("holder")
+                remote_token = int(remote_lease.get("fencing_token") or 0)
+                if remote_owner and remote_owner != store.machine_id:
+                    return LeaseLostError(f"{job_id} lease owned by {remote_owner}")
+                if local_token and remote_token > local_token:
+                    return LeaseLostError(f"{job_id} fencing token advanced ({remote_token} > {local_token})")
+    return None
+
+
 def check_halt_or_lease(repo_root: str, job_id: str, store: GitStateStore | None) -> None:
-    """Raise JobHaltedError if local or fleet-wide halt is active."""
+    """Raise JobHaltedError or LeaseLostError if local/fleet halt is active or lease is lost."""
     if is_local_halted():
         raise JobHaltedError("local halt.signal active")
     if store is not None:
-        ctrl = store.get_control_state()
-        if ctrl.get("halted"):
-            raise JobHaltedError(f"fleet halted: {ctrl.get('reason') or 'operator halt'}")
+        jobs_dir = os.path.join(repo_root, "factory", "jobs")
+        exc = _check_remote_lease_and_control(jobs_dir, job_id, store)
+        if exc is not None:
+            raise exc
+
+
+def _has_origin_remote(repo_root: str) -> bool:
+    """Return True if the repository has a configured `origin` git remote."""
+    try:
+        res = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return res.returncode == 0 and bool((res.stdout or "").strip())
+    except Exception:
+        return False
+
+
+def _build_initial_lease_stub(jobs_dir: str, job_id: str, issue_num: int, machine_id: str) -> dict:
+    try:
+        return load_job(jobs_dir, job_id)
+    except FileNotFoundError:
+        return {
+            "id": job_id,
+            "issue": issue_num,
+            "issue_number": issue_num,
+            "stage": "queued",
+            "branch": f"factory/{job_id}",
+            "worker_id": machine_id,
+            "last_worker_id": machine_id,
+        }
+
+
+def _ensure_lease_released(
+    state_store: GitStateStore | None,
+    jobs_dir: str,
+    jdir: str,
+    job_id: str,
+) -> None:
+    """Release remote lease if `process_job` was mocked or exited without releasing it."""
+    if state_store is None:
+        return
+    try:
+        remote_sha = state_store._fetch_ref(f"refs/factory/jobs/{job_id}")
+        if not remote_sha:
+            return
+        remote_job = state_store._read_json_from_commit(remote_sha, "job.json")
+        if not isinstance(remote_job, dict):
+            return
+        lease = remote_job.get("lease")
+        if not isinstance(lease, dict):
+            return
+        owner = lease.get("worker_id") or lease.get("holder")
+        if owner != state_store.machine_id:
+            return
+        try:
+            local_job = load_job(jobs_dir, job_id)
+        except FileNotFoundError:
+            local_job = remote_job
+        state_store.checkpoint_job(job_id, jdir, local_job, release_lease=True)
+        try:
+            token = int(lease.get("fencing_token") or local_job.get("_last_fencing_token") or 0)
+            updates: dict = {"lease": None}
+            if token:
+                updates["_last_fencing_token"] = token
+            update_job(jobs_dir, job_id, **updates)
+        except FileNotFoundError:
+            pass
+    except Exception:
+        pass
+
+
+def _make_abort_check(
+    repo_root: str,
+    job_id: str,
+    jobs_dir: str,
+    store: GitStateStore | None,
+    *,
+    remote_interval_sec: float = 15.0,
+):
+    """Build a lightweight `abort_check` hook for `run_agent()`.
+
+    Checks local `halt.signal` on every watchdog tick (~0.2s) and throttles
+    remote `refs/factory/control` and lease fencing-token checks to once every
+    `remote_interval_sec` seconds so git remotes are not spammed.
+    """
+    last_remote_check = time.monotonic()
+
+    def _check() -> BaseException | None:
+        nonlocal last_remote_check
+        if is_local_halted():
+            return JobHaltedError("local halt.signal active")
+        if store is not None:
+            now = time.monotonic()
+            if (now - last_remote_check) >= remote_interval_sec:
+                last_remote_check = now
+                try:
+                    return _check_remote_lease_and_control(jobs_dir, job_id, store)
+                except Exception:
+                    pass
+        return None
+
+    return _check
+
+
+def _call_run_agent(*args, abort_check=None, **kwargs):
+    """Invoke `run_agent`, passing `abort_check` when accepted by the callable."""
+    try:
+        sig = inspect.signature(run_agent)
+        if "abort_check" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        ):
+            return run_agent(*args, abort_check=abort_check, **kwargs)
+    except (ValueError, TypeError):
+        pass
+    return run_agent(*args, **kwargs)
 
 
 def _checkpoint_if_store(
@@ -1598,6 +1767,41 @@ def _checkpoint_if_store(
         store.push_slice_checkpoint(job_id, worktree)
     job_data = load_job(jobs_dir, job_id)
     store.checkpoint_job(job_id, jdir, job_data, release_lease=release_lease)
+    if release_lease:
+        token = int((job_data.get("lease") or {}).get("fencing_token") or job_data.get("_last_fencing_token") or 0)
+        updates: dict = {"lease": None}
+        if token:
+            updates["_last_fencing_token"] = token
+        update_job(jobs_dir, job_id, **updates)
+
+
+def _finalize_job_exit(
+    state_store: GitStateStore | None,
+    job_id: str,
+    jdir: str,
+    jobs_dir: str,
+    job: dict,
+    *,
+    worktree: str | None = None,
+    base_branch: str = "main",
+) -> dict:
+    """Checkpoint final/paused job state and release lease when exiting `process_job`."""
+    _set_activity(jobs_dir, job_id, None)
+    if state_store is not None:
+        st = job.get("stage")
+        wt_arg = None
+        if (
+            st not in TERMINAL_OR_READY_STAGES
+            and worktree
+            and os.path.isdir(worktree)
+            and commits_ahead(worktree, base_branch) > 0
+        ):
+            wt_arg = worktree
+        _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, worktree=wt_arg, release_lease=True)
+        if st in TERMINAL_OR_READY_STAGES:
+            state_store.delete_slice_checkpoint(job_id)
+        return load_job(jobs_dir, job_id)
+    return load_job(jobs_dir, job_id)
 
 
 def run_halt(repos: list[str], reason: str = "", force: bool = False) -> int:
@@ -1655,7 +1859,13 @@ def process_job(
     staging_cfg = cfg.get("staging_qa") or {}
     max_qa_rounds = int(staging_cfg.get("max_qa_rounds", 3))
 
+    pre_job_id = f"job-{int(issue_number)}"
+    pre_jdir = os.path.join(jobs_dir, pre_job_id)
+    if state_store is not None:
+        state_store.hydrate_job(pre_job_id, pre_jdir)
+
     issue_data, issue_md = gh_client.fetch_issue(issue_number)
+
     job, action = create_or_resume_job(
         jobs_dir,
         issue_data,
@@ -1674,16 +1884,30 @@ def process_job(
             gh_client.edit_labels(issue_number, remove=[labels["queue"]])
         except Exception as exc:
             print(f"[{job_id}] warning: failed to remove queue label on skipped job: {exc}", file=sys.stderr)
-        return job
+        return _finalize_job_exit(state_store, job_id, jdir, jobs_dir, job)
 
     worktree = ""
     halted_cleanly = False
+    abort_check = _make_abort_check(repo_root, job_id, jobs_dir, state_store)
     try:
         worktree, branch = ensure_worktree(repo_root, job_id, base_branch, branch=job.get("branch"))
         if state_store is not None:
-            remote_job = state_store.hydrate_job(job_id, jdir)
-            if remote_job and int(remote_job.get("completed_slices") or 0) > 0:
-                state_store.fetch_slice_checkpoint(job_id, worktree)
+            if int(job.get("completed_slices") or 0) > 0 or int(job.get("round") or 0) > 0:
+                fetched_ckpt = state_store.fetch_slice_checkpoint(job_id, worktree)
+                if not fetched_ckpt:
+                    res_br = subprocess.run(
+                        ["git", "fetch", state_store.remote, f"refs/heads/{branch}"],
+                        cwd=worktree,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if res_br.returncode == 0:
+                        subprocess.run(
+                            ["git", "reset", "--hard", "FETCH_HEAD"],
+                            cwd=worktree,
+                            capture_output=True,
+                            text=True,
+                        )
 
         last_checkpointed_stage = ""
         while True:
@@ -1697,11 +1921,7 @@ def process_job(
             if board_sync:
                 board_sync.sync_stage(issue_url, stage)
             if stage in TERMINAL_OR_READY_STAGES or stage in {"needs-info", "needs-human"}:
-                if state_store is not None:
-                    _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, release_lease=True)
-                    if stage in TERMINAL_OR_READY_STAGES:
-                        state_store.delete_slice_checkpoint(job_id)
-                return job
+                return _finalize_job_exit(state_store, job_id, jdir, jobs_dir, job)
 
             _log(job_id, f"stage={stage} round={job['round']}")
 
@@ -1710,7 +1930,7 @@ def process_job(
                 _set_activity(jobs_dir, job_id, "running:intake")
                 _log(job_id, f"intake start ({_fmt_model_tag(intake_model)})")
                 prompt = f"JOB_ID: {job_id}\nBASE_BRANCH: {base_branch}\n\n{issue_md}"
-                intake_out, usage, dur = run_agent(
+                intake_out, usage, dur = _call_run_agent(
                     factory_dir,
                     jdir,
                     worktree,
@@ -1722,6 +1942,7 @@ def process_job(
                     timeout_sec,
                     sandbox=True,
                     log_name="intake",
+                    abort_check=abort_check,
                 )
                 _clear_quota_cooldown_if_needed(state_store, intake_model)
                 metrics_str = _record_and_format_step(jobs_dir, job_id, intake_model, usage, dur, cfg)
@@ -1738,7 +1959,13 @@ def process_job(
                         f"Reply here and swap label `{labels['needs_info']}` back to `{labels['queue']}` to continue.",
                     )
                     gh_client.edit_labels(issue_number, add=[labels["needs_info"]], remove=[labels["queue"]])
-                    return advance_stage(jobs_dir, job_id, "needs-info")
+                    return _finalize_job_exit(
+                        state_store,
+                        job_id,
+                        jdir,
+                        jobs_dir,
+                        advance_stage(jobs_dir, job_id, "needs-info"),
+                    )
 
                 if decision == "REJECT":
                     gh_client.comment_issue(
@@ -1747,7 +1974,13 @@ def process_job(
                     )
                     gh_client.edit_labels(issue_number, remove=[labels["queue"]])
                     gh_client.close_issue(issue_number)
-                    return advance_stage(jobs_dir, job_id, "rejected")
+                    return _finalize_job_exit(
+                        state_store,
+                        job_id,
+                        jdir,
+                        jobs_dir,
+                        advance_stage(jobs_dir, job_id, "rejected"),
+                    )
 
                 update_job(jobs_dir, job_id, risk=intake_out["risk"], surfaces=intake_out["surfaces"])
                 advance_stage(jobs_dir, job_id, "spec")
@@ -1762,7 +1995,7 @@ def process_job(
                     f"JOB_ID: {job_id}\nBASE_BRANCH: {base_branch}\n\n"
                     f"## Intake\n{intake_md}\n\n## Issue\n{issue_md}"
                 )
-                spec_out, usage, dur = run_agent(
+                spec_out, usage, dur = _call_run_agent(
                     factory_dir,
                     jdir,
                     worktree,
@@ -1774,6 +2007,7 @@ def process_job(
                     timeout_sec,
                     sandbox=True,
                     log_name="spec",
+                    abort_check=abort_check,
                 )
                 _clear_quota_cooldown_if_needed(state_store, spec_model)
                 metrics_str = _record_and_format_step(jobs_dir, job_id, spec_model, usage, dur, cfg)
@@ -1846,7 +2080,7 @@ def process_job(
                             if retry_feedback:
                                 prompt_parts.extend(["", "## Previous Attempt Failure (Must Fix)", retry_feedback])
 
-                            build_out, usage, dur = run_agent(
+                            build_out, usage, dur = _call_run_agent(
                                 factory_dir,
                                 jdir,
                                 worktree,
@@ -1858,6 +2092,7 @@ def process_job(
                                 timeout_sec,
                                 sandbox=False,
                                 log_name=f"r{round_num}-slice-{slice_num}-a{attempt + 1}",
+                                abort_check=abort_check,
                             )
                             _clear_quota_cooldown_if_needed(state_store, builder_model)
                             metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
@@ -1867,13 +2102,22 @@ def process_job(
                             )
 
                             if build_out["verdict"] == "BLOCKED":
-                                return _escalate_to_human(
+                                esc_job = _escalate_to_human(
                                     jobs_dir,
                                     job_id,
                                     issue_number,
                                     gh_client,
                                     cfg,
                                     f"Builder blocked on slice {slice_num}/{total_slices}: {build_out['blocked_reason']}",
+                                )
+                                return _finalize_job_exit(
+                                    state_store,
+                                    job_id,
+                                    jdir,
+                                    jobs_dir,
+                                    esc_job,
+                                    worktree=worktree,
+                                    base_branch=base_branch,
                                 )
 
                             if not is_worktree_clean(worktree):
@@ -1930,15 +2174,38 @@ def process_job(
                                 if gate_scope == "full":
                                     update_fields["verified_gate_sha"] = head_sha(worktree)
                                 update_job(jobs_dir, job_id, **update_fields)
-                                _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, worktree=worktree)
                                 check_halt_or_lease(repo_root, job_id, state_store)
+                                if state_store is not None and slice_num < total_slices:
+                                    draining = is_host_draining()
+                                    admitted = True
+                                    if not draining:
+                                        check_fn = (
+                                            check_host_admission
+                                            if check_host_admission is not _ORIG_CHECK_HOST_ADMISSION
+                                            else _governor.check_host_admission
+                                        )
+                                        admitted, _ = check_fn(load_host_config())
+                                    if draining or not admitted:
+                                        yield_activity = "paused: draining" if draining else "yielded: host busy"
+                                        halted_cleanly = True
+                                        _set_activity(jobs_dir, job_id, yield_activity)
+                                        _checkpoint_if_store(
+                                            state_store,
+                                            job_id,
+                                            jdir,
+                                            jobs_dir,
+                                            worktree=worktree,
+                                            release_lease=True,
+                                        )
+                                        return load_job(jobs_dir, job_id)
+                                _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, worktree=worktree)
                                 slice_done = True
                                 break
 
                             retry_feedback = f"Deterministic gate failed after slice {slice_num}:\n\n{slice_checks_md}"
 
                         if not slice_done:
-                            return _escalate_to_human(
+                            esc_job = _escalate_to_human(
                                 jobs_dir,
                                 job_id,
                                 issue_number,
@@ -1946,6 +2213,15 @@ def process_job(
                                 cfg,
                                 f"Slice {slice_num}/{total_slices} (`{sl['title']}`) failed deterministic gate after "
                                 f"{cfg['max_slice_retries'] + 1} attempts.\n\n{retry_feedback[:1500]}",
+                            )
+                            return _finalize_job_exit(
+                                state_store,
+                                job_id,
+                                jdir,
+                                jobs_dir,
+                                esc_job,
+                                worktree=worktree,
+                                base_branch=base_branch,
                             )
                 else:
                     prev_round_dir = os.path.join(jdir, f"round-{max(1, round_num - 1)}")
@@ -1984,7 +2260,7 @@ def process_job(
                     )
                     _set_activity(jobs_dir, job_id, f"running:fix-round-{round_num}")
                     _log(job_id, f"build fix-round={round_num} start ({_fmt_model_tag(builder_model)})")
-                    build_out, usage, dur = run_agent(
+                    build_out, usage, dur = _call_run_agent(
                         factory_dir,
                         jdir,
                         worktree,
@@ -1996,18 +2272,28 @@ def process_job(
                         timeout_sec,
                         sandbox=False,
                         log_name=f"r{round_num}-fix-build",
+                        abort_check=abort_check,
                     )
                     _clear_quota_cooldown_if_needed(state_store, builder_model)
                     metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
                     _log(job_id, f"build fix-round={round_num} verdict={build_out['verdict']} ({metrics_str})")
                     if build_out["verdict"] == "BLOCKED":
-                        return _escalate_to_human(
+                        esc_job = _escalate_to_human(
                             jobs_dir,
                             job_id,
                             issue_number,
                             gh_client,
                             cfg,
                             f"Builder blocked in round {round_num}: {build_out['blocked_reason']}",
+                        )
+                        return _finalize_job_exit(
+                            state_store,
+                            job_id,
+                            jdir,
+                            jobs_dir,
+                            esc_job,
+                            worktree=worktree,
+                            base_branch=base_branch,
                         )
                     _write_json(os.path.join(round_dir, "build.json"), build_out)
                     _write_text(os.path.join(round_dir, "build.md"), render_build_md(build_out))
@@ -2073,7 +2359,7 @@ def process_job(
                     )
                     _set_activity(jobs_dir, job_id, f"running:gate-fix-{attempt + 1}")
                     _log(job_id, f"gate-fix attempt={attempt + 1} start ({_fmt_model_tag(builder_model)})")
-                    fix_out, usage, dur = run_agent(
+                    fix_out, usage, dur = _call_run_agent(
                         factory_dir,
                         jdir,
                         worktree,
@@ -2085,12 +2371,13 @@ def process_job(
                         timeout_sec,
                         sandbox=False,
                         log_name=f"r{round_num}-gate-fix-{attempt + 1}",
+                        abort_check=abort_check,
                     )
                     _clear_quota_cooldown_if_needed(state_store, builder_model)
                     metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
                     _log(job_id, f"gate-fix attempt={attempt + 1} verdict={fix_out['verdict']} ({metrics_str})")
                     if fix_out["verdict"] == "BLOCKED":
-                        return _escalate_to_human(
+                        esc_job = _escalate_to_human(
                             jobs_dir,
                             job_id,
                             issue_number,
@@ -2098,18 +2385,36 @@ def process_job(
                             cfg,
                             f"Builder blocked while fixing gate in round {round_num}: {fix_out['blocked_reason']}",
                         )
+                        return _finalize_job_exit(
+                            state_store,
+                            job_id,
+                            jdir,
+                            jobs_dir,
+                            esc_job,
+                            worktree=worktree,
+                            base_branch=base_branch,
+                        )
 
                 if not passed:
                     if job["round"] < job["round_limit"]:
                         advance_stage(jobs_dir, job_id, "build", preserve_last_error=bool(job.get("last_error")))
                         continue
-                    return _escalate_to_human(
+                    esc_job = _escalate_to_human(
                         jobs_dir,
                         job_id,
                         issue_number,
                         gh_client,
                         cfg,
                         f"Deterministic gate failed after {job['round']} round(s):\n\n{checks_md[:1500]}",
+                    )
+                    return _finalize_job_exit(
+                        state_store,
+                        job_id,
+                        jdir,
+                        jobs_dir,
+                        esc_job,
+                        worktree=worktree,
+                        base_branch=base_branch,
                     )
 
                 push_branch(worktree, branch)
@@ -2164,7 +2469,7 @@ def process_job(
                     rev_name, rev_model = item
                     agent_file = f"reviewer-{rev_name}"
                     _log(job_id, f"review={rev_name} start ({_fmt_model_tag(rev_model)})")
-                    out, u, d = run_agent(
+                    out, u, d = _call_run_agent(
                         factory_dir,
                         jdir,
                         worktree,
@@ -2177,6 +2482,7 @@ def process_job(
                         sandbox=True,
                         clean_worktree=False,
                         log_name=f"r{round_num}-review-{rev_name}",
+                        abort_check=_make_abort_check(repo_root, job_id, jobs_dir, state_store),
                     )
                     _clear_quota_cooldown_if_needed(state_store, rev_model)
                     metrics_str = _record_and_format_step(jobs_dir, job_id, rev_model, u, d, cfg)
@@ -2201,13 +2507,22 @@ def process_job(
                         advance_stage(jobs_dir, job_id, "build", preserve_last_error=bool(job.get("last_error")))
                         continue
                     unresolved = _collect_actionable_review_findings(round_dir)
-                    return _escalate_to_human(
+                    esc_job = _escalate_to_human(
                         jobs_dir,
                         job_id,
                         issue_number,
                         gh_client,
                         cfg,
                         f"Reviewers still requested changes after {job['round']} round(s):\n\n{unresolved}",
+                    )
+                    return _finalize_job_exit(
+                        state_store,
+                        job_id,
+                        jdir,
+                        jobs_dir,
+                        esc_job,
+                        worktree=worktree,
+                        base_branch=base_branch,
                     )
 
                 advance_stage(jobs_dir, job_id, "approve", preserve_last_error=bool(job.get("last_error")))
@@ -2272,7 +2587,7 @@ def process_job(
                     approver_model = cfg["models"]["approver"]
                     _set_activity(jobs_dir, job_id, "running:approve")
                     _log(job_id, f"approve start ({_fmt_model_tag(approver_model)})")
-                    approve_out, usage, dur = run_agent(
+                    approve_out, usage, dur = _call_run_agent(
                         factory_dir,
                         jdir,
                         worktree,
@@ -2284,6 +2599,7 @@ def process_job(
                         timeout_sec,
                         sandbox=True,
                         log_name=f"r{round_num}-approve",
+                        abort_check=abort_check,
                     )
                     _clear_quota_cooldown_if_needed(state_store, approver_model)
                     metrics_str = _record_and_format_step(jobs_dir, job_id, approver_model, usage, dur, cfg)
@@ -2292,13 +2608,22 @@ def process_job(
                 _write_text(os.path.join(round_dir, "approve.md"), render_approve_md(approve_out))
 
                 if approve_out["decision"] == "ESCALATE":
-                    return _escalate_to_human(
+                    esc_job = _escalate_to_human(
                         jobs_dir,
                         job_id,
                         issue_number,
                         gh_client,
                         cfg,
                         f"Approver requested human review:\n\n**Question:** {approve_out['question']}\n\n{approve_out['reasoning']}",
+                    )
+                    return _finalize_job_exit(
+                        state_store,
+                        job_id,
+                        jdir,
+                        jobs_dir,
+                        esc_job,
+                        worktree=worktree,
+                        base_branch=base_branch,
                     )
 
                 job = load_job(jobs_dir, job_id)
@@ -2328,7 +2653,7 @@ def process_job(
                     )
                 except Exception as exc:
                     print(f"[{job_id}] warning: post-ready issue update failed: {exc}", file=sys.stderr)
-                return ready_job
+                return _finalize_job_exit(state_store, job_id, jdir, jobs_dir, ready_job)
 
             if stage in {"merging", "staging_qa"}:
                 sqa_enabled = bool(staging_cfg.get("enabled"))
@@ -2354,13 +2679,22 @@ def process_job(
                                 state_store=state_store,
                             )
                             if not sync_ok:
-                                return _escalate_to_human(
+                                esc_job = _escalate_to_human(
                                     jobs_dir,
                                     job_id,
                                     issue_number,
                                     gh_client,
                                     cfg,
                                     sync_err,
+                                )
+                                return _finalize_job_exit(
+                                    state_store,
+                                    job_id,
+                                    jdir,
+                                    jobs_dir,
+                                    esc_job,
+                                    worktree=worktree,
+                                    base_branch=base_branch,
                                 )
 
                             gh_client.mark_pr_ready(pr_num)
@@ -2372,7 +2706,7 @@ def process_job(
                         gh_client.edit_labels(issue_number, remove=[labels["queue"]])
                     except Exception as exc:
                         print(f"[{job_id}] warning: post-merge label cleanup failed: {exc}", file=sys.stderr)
-                    return merged_job
+                    return _finalize_job_exit(state_store, job_id, jdir, jobs_dir, merged_job)
 
                 active_coord = train_coordinator or StagingTrainCoordinator(
                     max_batch_size=1,
@@ -2403,7 +2737,15 @@ def process_job(
                 if outcome.action == "continue":
                     continue
                 assert outcome.job is not None
-                return outcome.job
+                return _finalize_job_exit(
+                    state_store,
+                    job_id,
+                    jdir,
+                    jobs_dir,
+                    outcome.job,
+                    worktree=worktree,
+                    base_branch=base_branch,
+                )
 
             raise RuntimeError(f"Unhandled stage {stage!r} for {job_id}")
 
@@ -2413,7 +2755,14 @@ def process_job(
             reset_worktree_clean(worktree)
         _set_activity(jobs_dir, job_id, "halted")
         if state_store is not None:
-            _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, release_lease=True)
+            wt_arg = (
+                worktree
+                if worktree and os.path.isdir(worktree) and commits_ahead(worktree, base_branch) > 0
+                else None
+            )
+            _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, worktree=wt_arg, release_lease=True)
+        else:
+            update_job(jobs_dir, job_id, lease=None)
         return load_job(jobs_dir, job_id)
     except QuotaExhaustedError as exc:
         halted_cleanly = True
@@ -2433,13 +2782,22 @@ def process_job(
     except (AgentExecutionError, subprocess.CalledProcessError, RuntimeError, ValueError) as exc:
         cur = load_job(jobs_dir, job_id)
         if cur["stage"] not in TERMINAL_OR_READY_STAGES and cur["stage"] not in {"needs-info", "needs-human"}:
-            return _escalate_to_human(
+            esc_job = _escalate_to_human(
                 jobs_dir,
                 job_id,
                 issue_number,
                 gh_client,
                 cfg,
                 f"Pipeline error during `{cur['stage']}`: {exc}",
+            )
+            return _finalize_job_exit(
+                state_store,
+                job_id,
+                jdir,
+                jobs_dir,
+                esc_job,
+                worktree=worktree,
+                base_branch=base_branch,
             )
         raise
     finally:
@@ -2550,9 +2908,29 @@ def run_factory(
         explicit_nums = [int(n) for n in issue_numbers]
 
     _write_text(pid_path, f"{os.getpid()}\n")
+    state_store: GitStateStore | None = None
+    if _has_origin_remote(repo_root):
+        state_store = GitStateStore(repo_root, _default_machine_id())
     try:
         if len(explicit_nums) == 1:
-            return [process_job(repo_root, explicit_nums[0], config=cfg, gh=gh, board=board)]
+            num = explicit_nums[0]
+            job_id = f"job-{num}"
+            jdir = os.path.join(jobs_dir, job_id)
+            if state_store is not None:
+                initial = _build_initial_lease_stub(jobs_dir, job_id, num, state_store.machine_id)
+                ok, _ = state_store.claim_job_lease(job_id, initial)
+                if not ok:
+                    return []
+                try:
+                    sig_params = inspect.signature(process_job).parameters
+                    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
+                    call_kwargs: dict = {"config": cfg, "gh": gh, "board": board}
+                    if "state_store" in sig_params or accepts_var_kw:
+                        call_kwargs["state_store"] = state_store
+                    return [process_job(repo_root, num, **call_kwargs)]
+                finally:
+                    _ensure_lease_released(state_store, jobs_dir, jdir, job_id)
+            return [process_job(repo_root, num, config=cfg, gh=gh, board=board)]
 
         sqa_cfg = cfg.get("staging_qa") or {}
         train_coord: StagingTrainCoordinator | None = None
@@ -2580,23 +2958,32 @@ def run_factory(
             )
 
         def _safe_worker(num: int) -> dict | None:
+            job_id = f"job-{num}"
+            jdir = os.path.join(jobs_dir, job_id)
+            if state_store is not None:
+                initial = _build_initial_lease_stub(jobs_dir, job_id, num, state_store.machine_id)
+                ok, _ = state_store.claim_job_lease(job_id, initial)
+                if not ok:
+                    try:
+                        if load_job(jobs_dir, job_id).get("stage") == "queued":
+                            shutil.rmtree(jdir, ignore_errors=True)
+                    except FileNotFoundError:
+                        pass
+                    return None
             try:
-                if (
-                    train_coord is not None
-                    and "train_coordinator" in inspect.signature(process_job).parameters
-                ):
-                    return process_job(
-                        repo_root,
-                        num,
-                        config=cfg,
-                        gh=gh,
-                        train_coordinator=train_coord,
-                        board=board,
-                    )
-                return process_job(repo_root, num, config=cfg, gh=gh, board=board)
+                sig_params = inspect.signature(process_job).parameters
+                accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
+                call_kwargs: dict = {"config": cfg, "gh": gh, "board": board}
+                if train_coord is not None and ("train_coordinator" in sig_params or accepts_var_kw):
+                    call_kwargs["train_coordinator"] = train_coord
+                if state_store is not None and ("state_store" in sig_params or accepts_var_kw):
+                    call_kwargs["state_store"] = state_store
+                return process_job(repo_root, num, **call_kwargs)
             except Exception as exc:
                 print(f"[issue-{num}] error before job state could escalate: {exc}", file=sys.stderr)
                 return None
+            finally:
+                _ensure_lease_released(state_store, jobs_dir, jdir, job_id)
 
         max_workers = max(1, int(cfg["concurrency"]))
         results: list[dict] = []

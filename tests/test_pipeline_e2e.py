@@ -223,6 +223,9 @@ def respond(obj):
 
 if "# Role: Factory Intake" in prompt:
     c, _ = bump(f"{job_id}:intake")
+    if os.environ.get("SLEEP_ON_JOB_80") == "1" and job_id == "job-80":
+        import time
+        time.sleep(30)
     if job_id == "job-40" and "Human answer:" not in prompt:
         respond({
             "decision": "NEEDS_INFO",
@@ -843,6 +846,48 @@ class PipelineE2ETests(unittest.TestCase):
         self.assertEqual([r["issue"] for r in results], [20, 21])
         self.assertTrue(all(r["stage"] == "merged" for r in results))
         self.assertFalse(os.path.exists(os.path.join(self.repo, "factory", "jobs", ".factory.pid")))
+
+    def test_process_job_abort_check_interrupts_sleeping_agy_on_local_halt_under_2s(self):
+        import threading
+        import time
+        from factory.lib.git_state import GitStateStore
+
+        host_dir = os.path.join(self.tmp, "host_cfg")
+        os.makedirs(host_dir, exist_ok=True)
+        os.environ["FACTORY_HOST_DIR"] = host_dir
+        os.environ["SLEEP_ON_JOB_80"] = "1"
+        self._seed_issue(80, "Long running intake")
+
+        store = GitStateStore(self.repo, "m0")
+        store.write_worker_heartbeat(1, 2, False)
+        ok, _ = store.claim_job_lease(
+            "job-80",
+            {"id": "job-80", "issue": 80, "stage": "intake", "last_worker_id": "m0"},
+        )
+        self.assertTrue(ok)
+
+        def _trigger_halt():
+            time.sleep(0.3)
+            with open(os.path.join(host_dir, "halt.signal"), "w", encoding="utf-8") as f:
+                json.dump({"halted": True, "reason": "test halt"}, f)
+
+        t = threading.Thread(target=_trigger_halt, daemon=True)
+        t.start()
+        t0 = time.monotonic()
+        halted_job = process_job(self.repo, 80, state_store=store)
+        elapsed = time.monotonic() - t0
+        t.join(timeout=2.0)
+
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(halted_job["stage"], "intake")
+        self.assertEqual(halted_job["activity"], "halted")
+        self.assertIsNone(halted_job.get("lease"))
+        with open(self.agy_state_path, encoding="utf-8") as f:
+            counts = json.load(f)
+        self.assertEqual(counts.get("job-80:intake"), 1)
+        remote_80 = store.hydrate_job("job-80", os.path.join(self.tmp, "hydrated_80"))
+        self.assertEqual(remote_80["activity"], "halted")
+        self.assertIsNone(remote_80["lease"])
 
 
 if __name__ == "__main__":
