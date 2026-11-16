@@ -110,12 +110,17 @@ def fleet_status() -> list[dict]:
     return machines
 
 
+def _factory_shell_cmd(*args: str) -> list[str]:
+    quoted = " ".join(args)
+    return ["sh", "-lc", f'export PATH="$HOME/.local/bin:$PATH"; exec factory {quoted}']
+
+
 def fleet_wake() -> list[tuple[str, int, str]]:
     results: list[tuple[str, int, str]] = []
     for m in discover_machines():
         rc, out = _run_on_machine(
             m,
-            ["factory", "worker", "--all"],
+            _factory_shell_cmd("worker", "--all"),
             bg=True,
             name=f"factory-worker-{m['name']}",
         )
@@ -127,7 +132,7 @@ def fleet_pause(machine: str | None = None, *, drain: bool = False) -> list[tupl
     if not machine:
         set_host_paused(True, drain=drain)
         return [("local", 0, "paused")]
-    cmd = ["factory", "pause"] + (["--drain"] if drain else [])
+    cmd = _factory_shell_cmd("pause", "--drain") if drain else _factory_shell_cmd("pause")
     results: list[tuple[str, int, str]] = []
     for m in discover_machines():
         if m["name"] == machine:
@@ -143,7 +148,7 @@ def fleet_unpause(machine: str | None = None) -> list[tuple[str, int, str]]:
     results: list[tuple[str, int, str]] = []
     for m in discover_machines():
         if m["name"] == machine:
-            rc, out = _run_on_machine(m, ["factory", "unpause"])
+            rc, out = _run_on_machine(m, _factory_shell_cmd("unpause"))
             results.append((m["name"], rc, out))
     return results
 
