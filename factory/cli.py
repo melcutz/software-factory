@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import glob
 import json
 import os
+import statistics
 import subprocess
 import sys
 
@@ -13,6 +15,7 @@ from factory.lib.fleet import fleet_pause, fleet_remove, fleet_status, fleet_unp
 from factory.lib.gate_runner import run_gate
 from factory.lib.git_ops import GitHubClient, _run_git, remove_worktree
 from factory.lib.onboarding import generate_repo_map, init_repository, learn_from_jobs
+from factory.lib.patrol import run_patrol
 from factory.lib.git_state import GitStateStore
 from factory.lib.pipeline import (
     factory_runner_status,
@@ -181,6 +184,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_learn.add_argument("job_id", nargs="?", help="Optional specific job ID (e.g. job-12)")
     p_learn.add_argument("--deterministic", action="store_true", help="Use deterministic extraction without LLM")
+
+    p_stats = sub.add_parser("stats", parents=[repo_flags], help="Show telemetry summary across factory jobs")
+    p_stats.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
+    p_logs = sub.add_parser("logs", parents=[repo_flags], help="Show failure/gate/review summary for a job")
+    p_logs.add_argument("job_id", help="Job ID (e.g. job-12)")
+    p_logs.add_argument("--round", type=int, default=None, help="Specific round number")
+    p_logs.add_argument("--tail", type=int, default=40, help="Number of trailing lines from checks.md")
+
+    p_patrol = sub.add_parser("patrol", parents=[repo_flags], help="Run repo health sensors and file factory issues")
+    p_patrol.add_argument("--dry-run", action="store_true", help="Print findings without creating GitHub issues")
 
     return parser
 
@@ -456,6 +470,123 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"+ {b}")
             else:
                 print("No new pitfalls distilled.")
+        return 0
+
+    if args.command == "stats":
+        all_jobs: list[dict] = []
+        for repo in repos:
+            all_jobs.extend(list_jobs(os.path.join(repo, "factory", "jobs")))
+        counts_by_stage: dict[str, int] = {}
+        merged_costs: list[float] = []
+        total_cost = 0.0
+        total_in = 0
+        total_cache = 0
+        llm_dur = 0.0
+        gate_dur = 0.0
+        deploy_dur = 0.0
+        for j in all_jobs:
+            st = str(j.get("stage") or "unknown")
+            counts_by_stage[st] = counts_by_stage.get(st, 0) + 1
+            u = j.get("usage") or {}
+            m = j.get("metrics") or {}
+            c = float(u.get("cost_usd") or 0.0)
+            total_cost += c
+            if st == "merged":
+                merged_costs.append(c)
+            total_in += int(u.get("input_tokens") or 0)
+            total_cache += int(u.get("cache_read_tokens") or 0)
+            llm_dur += float(u.get("duration_seconds") or 0.0)
+            gate_dur += float(m.get("gate_duration_seconds") or 0.0)
+            deploy_dur += float(m.get("deploy_duration_seconds") or 0.0)
+        total_jobs = len(all_jobs)
+        merged_count = counts_by_stage.get("merged", 0)
+        merge_rate = round(merged_count / total_jobs, 4) if total_jobs else 0.0
+        median_merged_cost = round(statistics.median(merged_costs), 6) if merged_costs else 0.0
+        cache_denom = total_in + total_cache
+        cache_hit_pct = round((total_cache / cache_denom) * 100.0, 2) if cache_denom else 0.0
+        summary = {
+            "total_jobs": total_jobs,
+            "counts_by_stage": counts_by_stage,
+            "merge_rate": merge_rate,
+            "total_cost_usd": round(total_cost, 6),
+            "median_merged_cost_usd": median_merged_cost,
+            "cache_hit_pct": cache_hit_pct,
+            "durations_seconds": {
+                "llm": round(llm_dur, 3),
+                "gate": round(gate_dur, 3),
+                "deploy": round(deploy_dur, 3),
+            },
+        }
+        if args.json:
+            print(json.dumps(summary, indent=2))
+        else:
+            print(f"Total jobs: {total_jobs} | Merge rate: {merge_rate * 100:.1f}%")
+            print(f"Stages: {counts_by_stage}")
+            print(f"Cost: total=${summary['total_cost_usd']:.4f} | median_merged=${median_merged_cost:.4f} | cache_hit={cache_hit_pct:.1f}%")
+            print(f"Durations: llm={llm_dur:.1f}s | gate={gate_dur:.1f}s | deploy={deploy_dur:.1f}s")
+        return 0
+
+    if args.command == "logs":
+        if multi:
+            print("Error: logs requires a single repository.", file=sys.stderr)
+            return 1
+        jobs_dir = os.path.join(repos[0], "factory", "jobs")
+        try:
+            job = load_job(jobs_dir, args.job_id)
+        except FileNotFoundError:
+            print(f"Error: job {args.job_id!r} not found in {jobs_dir}", file=sys.stderr)
+            return 1
+        jdir = os.path.join(jobs_dir, args.job_id)
+        print(f"Job: {job.get('id')} | Issue: #{job.get('issue')} | Stage: {job.get('stage')} | Round: {job.get('round')}")
+        if job.get("last_error"):
+            print(f"Last error: {job['last_error']}")
+        rnum = args.round if args.round is not None else max(1, int(job.get("round") or 1))
+        rdir = os.path.join(jdir, f"round-{rnum}")
+        if args.round is None and not os.path.isdir(rdir):
+            existing_rounds = sorted(
+                glob.glob(os.path.join(jdir, "round-*")),
+                key=lambda p: int(os.path.basename(p).split("-", 1)[1]) if os.path.basename(p).split("-", 1)[1].isdigit() else 0,
+            )
+            if existing_rounds:
+                rdir = existing_rounds[-1]
+                rnum = os.path.basename(rdir).split("-", 1)[1]
+        checks_path = os.path.join(rdir, "checks.md")
+        if os.path.isfile(checks_path):
+            with open(checks_path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            print(f"\n--- round-{rnum}/checks.md (tail {args.tail}) ---")
+            print("\n".join(lines[-max(1, args.tail):]))
+        for rev_path in sorted(glob.glob(os.path.join(rdir, "review-*.json"))):
+            try:
+                with open(rev_path, encoding="utf-8") as f:
+                    rev = json.load(f)
+                findings = rev.get("findings") or []
+                if findings:
+                    print(f"\n--- {os.path.basename(rev_path)} findings ---")
+                    for item in findings:
+                        msg = item.get("message") if isinstance(item, dict) else str(item)
+                        print(f"- {msg}")
+            except (OSError, ValueError):
+                pass
+        qa_fail = os.path.join(jdir, "qa-failure.md")
+        if os.path.isfile(qa_fail):
+            with open(qa_fail, encoding="utf-8") as f:
+                print("\n--- qa-failure.md ---")
+                print(f.read().strip())
+        return 0
+
+    if args.command == "patrol":
+        for idx, repo in enumerate(repos):
+            if multi:
+                if idx > 0:
+                    print()
+                print(f"=== {os.path.basename(repo)} ({repo}) ===")
+            actions = run_patrol(repo, dry_run=args.dry_run)
+            if not actions:
+                print("No new patrol findings.")
+            for act in actions:
+                verb = "[dry-run] would file" if args.dry_run else "filed"
+                print(f"{verb} [patrol:{act['fingerprint']}] {act['title']}")
         return 0
 
     return 1

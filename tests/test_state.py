@@ -233,6 +233,22 @@ class StateTests(unittest.TestCase):
             for rel in expected_rel:
                 self.assertIn(rel, files)
 
+    def test_record_metrics_concurrent(self):
+        from factory.lib.state import record_metrics
+
+        with tempfile.TemporaryDirectory() as d:
+            create_or_resume_job(d, {"number": 1, "title": "T", "url": "u"}, max_rounds=3)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                list(
+                    pool.map(
+                        lambda _: record_metrics(d, "job-1", gate_seconds=1.5, deploy_seconds=2.5),
+                        range(20),
+                    )
+                )
+            job = load_job(d, "job-1")
+            self.assertAlmostEqual(job["metrics"]["gate_duration_seconds"], 30.0)
+            self.assertAlmostEqual(job["metrics"]["deploy_duration_seconds"], 50.0)
+
 
 if __name__ == "__main__":
     unittest.main()

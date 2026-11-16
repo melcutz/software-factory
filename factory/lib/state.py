@@ -377,6 +377,33 @@ def record_usage(
         return _atomic_write_job(jobs_dir, job_id, job)
 
 
+def record_metrics(
+    jobs_dir: str,
+    job_id: str,
+    *,
+    gate_seconds: float = 0.0,
+    deploy_seconds: float = 0.0,
+) -> dict:
+    """Thread-safely accumulate gate and staging deploy durations on job.json."""
+    with _job_lock(jobs_dir, job_id):
+        job = load_job(jobs_dir, job_id)
+        cur = job.setdefault(
+            "metrics",
+            {
+                "gate_duration_seconds": 0.0,
+                "deploy_duration_seconds": 0.0,
+            },
+        )
+        cur["gate_duration_seconds"] = round(
+            float(cur.get("gate_duration_seconds", 0.0) or 0.0) + float(gate_seconds or 0.0), 3
+        )
+        cur["deploy_duration_seconds"] = round(
+            float(cur.get("deploy_duration_seconds", 0.0) or 0.0) + float(deploy_seconds or 0.0), 3
+        )
+        job["updated"] = _now_iso()
+        return _atomic_write_job(jobs_dir, job_id, job)
+
+
 def list_jobs(jobs_dir: str) -> list[dict]:
     if not os.path.isdir(jobs_dir):
         return []

@@ -107,6 +107,7 @@ from factory.lib.state import (
     enqueue_job,
     list_jobs,
     load_job,
+    record_metrics,
     record_usage,
     update_job,
 )
@@ -528,6 +529,7 @@ def _sync_pr_with_base(
             scope=pre_merge_scope,
         )
         gate_dur = time.monotonic() - t_gate
+        record_metrics(jobs_dir, job_id, gate_seconds=gate_dur)
         _log(
             job_id,
             f"gate pre-merge scope={pre_merge_scope} verdict={'PASS' if passed else 'FAIL'} (dur={_fmt_duration(gate_dur)})",
@@ -1347,6 +1349,8 @@ def _execute_staging_train_batch(
             deploy_ok = False
             deploy_log = f"{type(exc).__name__}: {exc}"
         dep_dur = time.monotonic() - t_dep
+        for t in merged_tickets:
+            record_metrics(jobs_dir, t.job_id, deploy_seconds=dep_dur)
 
         redacted_deploy_log = redact_secrets(deploy_log, secrets)
         for t in merged_tickets:
@@ -2478,6 +2482,7 @@ def process_job(
                                 scope=gate_scope,
                             )
                             gate_dur = time.monotonic() - t_gate
+                            record_metrics(jobs_dir, job_id, gate_seconds=gate_dur)
                             _log(
                                 job_id,
                                 f"gate slice={slice_num}/{total_slices} scope={gate_scope} verdict={'PASS' if passed else 'FAIL'} (dur={_fmt_duration(gate_dur)})",
@@ -2658,6 +2663,7 @@ def process_job(
                         t_gate = time.monotonic()
                         passed, checks_md = run_gate(repo_root, job_id, worktree, round_num, cfg, scope="full")
                         gate_dur = time.monotonic() - t_gate
+                        record_metrics(jobs_dir, job_id, gate_seconds=gate_dur)
                         _log(
                             job_id,
                             f"gate scope=full verdict={'PASS' if passed else 'FAIL'} (dur={_fmt_duration(gate_dur)})",

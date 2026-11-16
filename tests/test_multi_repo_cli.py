@@ -210,6 +210,115 @@ class MultiRepoCliTests(unittest.TestCase):
                 pit_txt = f.read()
             self.assertEqual(pit_txt.count("Avoid mutable default arguments in helpers"), 1)
 
+    def test_stats_logs_and_patrol_cli(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, "obs-repo")
+            fdir = os.path.join(repo, "factory")
+            jdir1 = os.path.join(fdir, "jobs", "job-1")
+            jdir2 = os.path.join(fdir, "jobs", "job-2")
+            os.makedirs(os.path.join(jdir2, "round-1"), exist_ok=True)
+            os.makedirs(jdir1, exist_ok=True)
+
+            with open(os.path.join(jdir1, "job.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "id": "job-1",
+                        "issue": 1,
+                        "stage": "merged",
+                        "round": 1,
+                        "usage": {"input_tokens": 100, "cache_read_tokens": 100, "output_tokens": 20, "duration_seconds": 10.0, "cost_usd": 0.4},
+                        "metrics": {"gate_duration_seconds": 2.0, "deploy_duration_seconds": 3.0},
+                    },
+                    f,
+                )
+            with open(os.path.join(jdir2, "job.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "id": "job-2",
+                        "issue": 2,
+                        "stage": "needs-human",
+                        "round": 3,
+                        "last_error": "Exceeded retries",
+                        "usage": {"input_tokens": 200, "cache_read_tokens": 0, "output_tokens": 50, "duration_seconds": 20.0, "cost_usd": 0.8},
+                        "metrics": {"gate_duration_seconds": 5.0, "deploy_duration_seconds": 0.0},
+                    },
+                    f,
+                )
+            with open(os.path.join(jdir2, "round-1", "checks.md"), "w", encoding="utf-8") as f:
+                f.write("VERDICT: FAIL\nFAILED test_foo\n")
+            with open(os.path.join(jdir2, "round-1", "review-code.json"), "w", encoding="utf-8") as f:
+                json.dump({"verdict": "FAIL", "findings": [{"severity": "high", "message": "Missing check"}]}, f)
+            with open(os.path.join(jdir2, "qa-failure.md"), "w", encoding="utf-8") as f:
+                f.write("QA failed on /login\n")
+
+            # factory stats --json and table
+            buf_json = io.StringIO()
+            with contextlib.redirect_stdout(buf_json):
+                rc_s = cli.main(["stats", "--repo", repo, "--json"])
+            self.assertEqual(rc_s, 0)
+            stats = json.loads(buf_json.getvalue())
+            self.assertEqual(stats["counts_by_stage"]["merged"], 1)
+            self.assertEqual(stats["counts_by_stage"]["needs-human"], 1)
+            self.assertAlmostEqual(stats["merge_rate"], 0.5)
+            self.assertAlmostEqual(stats["median_merged_cost_usd"], 0.4)
+
+            buf_tbl = io.StringIO()
+            with contextlib.redirect_stdout(buf_tbl):
+                rc_t = cli.main(["stats", "--repo", repo])
+            self.assertEqual(rc_t, 0)
+            self.assertIn("Merge rate", buf_tbl.getvalue())
+
+            # factory logs
+            buf_logs = io.StringIO()
+            with contextlib.redirect_stdout(buf_logs):
+                rc_l = cli.main(["logs", "job-2", "--repo", repo, "--tail", "10"])
+            self.assertEqual(rc_l, 0)
+            logs_out = buf_logs.getvalue()
+            self.assertIn("FAILED test_foo", logs_out)
+            self.assertIn("Missing check", logs_out)
+            self.assertIn("QA failed on /login", logs_out)
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc_missing = cli.main(["logs", "job-999", "--repo", repo])
+            self.assertNotEqual(rc_missing, 0)
+
+            # factory patrol with hook + built-in + deduplication
+            with open(os.path.join(fdir, "patrol_hooks.py"), "w", encoding="utf-8") as f:
+                f.write(
+                    "def collect_patrol_findings(repo_root):\n"
+                    "    return [\n"
+                    "        {'fingerprint': 'dup-1', 'title': 'Already open', 'body': 'skip me'},\n"
+                    "        {'fingerprint': 'new-1', 'title': 'New finding', 'body': 'open me'},\n"
+                    "    ]\n"
+                )
+
+            created_issues = []
+
+            class _FakePatrolGH:
+                def list_open_issues(self):
+                    return [{"number": 50, "title": "Existing", "body": "[patrol:dup-1]"}]
+                def create_issue(self, title, body, labels=("factory",)):
+                    created_issues.append((title, body, tuple(labels)))
+                    return {"number": 51, "url": "https://x/51"}
+
+            from factory.lib import patrol as patrol_mod
+            with patch.object(patrol_mod, "GitHubClient", return_value=_FakePatrolGH()):
+                buf_dry = io.StringIO()
+                with contextlib.redirect_stdout(buf_dry):
+                    rc_pd = cli.main(["patrol", "--repo", repo, "--dry-run"])
+                self.assertEqual(rc_pd, 0)
+                self.assertEqual(created_issues, [])
+                self.assertIn("new-1", buf_dry.getvalue())
+
+                buf_live = io.StringIO()
+                with contextlib.redirect_stdout(buf_live):
+                    rc_pl = cli.main(["patrol", "--repo", repo])
+                self.assertEqual(rc_pl, 0)
+                self.assertTrue(any("[patrol:new-1]" in body for _, body, _ in created_issues))
+                self.assertFalse(any("[patrol:dup-1]" in body for _, body, _ in created_issues))
+
 
 if __name__ == "__main__":
     unittest.main()

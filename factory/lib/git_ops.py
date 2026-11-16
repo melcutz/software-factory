@@ -387,6 +387,22 @@ class GitHubClient:
     def comment_issue(self, issue_number: int, body: str) -> None:
         self._runner(["issue", "comment", str(issue_number), "--body", body], self.repo_root)
 
+    def list_open_issues(self) -> list[dict]:
+        out = self._runner(
+            ["issue", "list", "--state", "open", "--limit", "100", "--json", "number,title,body,url,labels"],
+            self.repo_root,
+        )
+        data = json.loads(out) if out and out.strip() else []
+        return data if isinstance(data, list) else []
+
+    def create_issue(self, title: str, body: str, labels: tuple[str, ...] = ("factory",)) -> dict:
+        args = ["issue", "create", "--title", title, "--body", body]
+        for lbl in labels:
+            if lbl:
+                args.extend(["--label", lbl])
+        out = self._runner(args, self.repo_root)
+        return {"url": (out or "").strip()}
+
     def edit_labels(
         self,
         issue_number: int,
