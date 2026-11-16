@@ -186,3 +186,25 @@ def test_sanitize_hc_name_and_human_readable_fleet_output():
     failed = _format_fleet_result("Rocket", 6, '{"error":{"message":"bad name","hint":"lowercase only"}}')
     assert failed == "Rocket: FAILED - bad name (lowercase only)"
 
+
+def test_fleet_remove_calls_hc_machine_rm(tmp_path, monkeypatch):
+    log_file = tmp_path / "hc_rm.log"
+    fake_hc = tmp_path / "hc"
+    fake_hc.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"with open({str(log_file)!r}, 'a') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1:3] == ['machine', 'ls']:\n"
+        "    print(json.dumps({'machines': [{'name': 'lenovo', 'state': 'connected'}]}))\n",
+        encoding="utf-8",
+    )
+    fake_hc.chmod(0o755)
+    monkeypatch.setenv("HC_BIN_PATH", str(fake_hc))
+    monkeypatch.setenv("FACTORY_HOST_DIR", str(tmp_path))
+
+    from factory import cli
+    assert cli.main(["fleet", "remove", "lenovo"]) == 0
+    lines = log_file.read_text().splitlines()
+    assert "machine rm lenovo" in lines
+

@@ -202,3 +202,46 @@ def fleet_update(machine: str | None = None) -> list[tuple[str, int, str]]:
         rc, out = _run_on_machine(m, ["sh", "-lc", update_script])
         results.append((m["name"], rc, out))
     return results
+
+
+def fleet_remove(machine: str) -> tuple[int, str]:
+    """Remove a peer machine from hc (`hc machine rm`) and/or fleet.json."""
+    machines = discover_machines()
+    match = next((m for m in machines if m["name"] == machine), None)
+    if match is None:
+        return 1, f"machine '{machine}' not found"
+    if match.get("via") == "local":
+        return 1, f"cannot remove local machine '{machine}'"
+
+    removed_msgs: list[str] = []
+    hc = _hc_bin()
+    if match.get("via") == "hc" and hc:
+        res = subprocess.run([hc, "machine", "rm", machine], capture_output=True, text=True, timeout=10.0, check=False)
+        if res.returncode != 0:
+            return res.returncode, (res.stdout or res.stderr or "").strip()
+        removed_msgs.append("removed from hc")
+
+    fleet_path = os.path.join(host_config_dir(), "fleet.json")
+    if os.path.isfile(fleet_path):
+        try:
+            with open(fleet_path, encoding="utf-8") as f:
+                data = json.load(f)
+            entries = data.get("machines", []) if isinstance(data, dict) else data
+            if isinstance(entries, list):
+                new_entries = [
+                    item
+                    for item in entries
+                    if not (
+                        (isinstance(item, str) and item == machine)
+                        or (isinstance(item, dict) and item.get("name") == machine)
+                    )
+                ]
+                if len(new_entries) != len(entries):
+                    new_data = {**data, "machines": new_entries} if isinstance(data, dict) else new_entries
+                    with open(fleet_path, "w", encoding="utf-8") as f:
+                        json.dump(new_data, f, indent=2)
+                    removed_msgs.append("removed from fleet.json")
+        except (OSError, ValueError):
+            pass
+
+    return 0, ", ".join(removed_msgs) or "removed"
