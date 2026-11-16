@@ -36,6 +36,84 @@ SCHEMAS: dict[str, dict] = {
             "reasoning": {"type": "string"},
         },
     },
+    "batch_plan": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["items", "reasoning"],
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "issue",
+                        "decision",
+                        "risk",
+                        "surfaces",
+                        "complexity_weight",
+                        "predicted_files",
+                        "depends_on",
+                        "topic_group",
+                        "summary",
+                        "questions",
+                        "decision_reason",
+                    ],
+                    "properties": {
+                        "issue": {"type": "integer"},
+                        "decision": {"type": "string", "enum": ["ACCEPT", "NEEDS_INFO", "REJECT"]},
+                        "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+                        "surfaces": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["ui", "security"]},
+                        },
+                        "complexity_weight": {"type": "integer", "minimum": 1, "maximum": 5},
+                        "predicted_files": {"type": "array", "items": {"type": "string"}},
+                        "depends_on": {"type": "array", "items": {"type": "integer"}},
+                        "topic_group": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "questions": {"type": "array", "items": {"type": "string"}},
+                        "decision_reason": {"type": "string"},
+                    },
+                },
+            },
+            "reasoning": {"type": "string"},
+        },
+    },
+    "batch_build": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["results", "notes"],
+        "properties": {
+            "results": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "issue",
+                        "status",
+                        "commit",
+                        "summary",
+                        "changes",
+                        "tests_run",
+                        "blocked_reason",
+                    ],
+                    "properties": {
+                        "issue": {"type": "integer"},
+                        "status": {"type": "string", "enum": ["DONE", "BLOCKED", "SKIPPED_DEP"]},
+                        "commit": {"type": "string"},
+                        "summary": {"type": "array", "items": {"type": "string"}},
+                        "changes": {"type": "array", "items": {"type": "string"}},
+                        "tests_run": {"type": "array", "items": {"type": "string"}},
+                        "blocked_reason": {"type": "string"},
+                    },
+                },
+            },
+            "notes": {"type": "string"},
+        },
+    },
     "intake": {
         "type": "object",
         "additionalProperties": False,
@@ -209,7 +287,46 @@ def validate_stage_output(stage: str, payload: dict) -> dict:
     schema = SCHEMAS[stage]
     _require_keys(stage, data, schema["required"])
 
-    if stage == "intake":
+    if stage == "batch_plan":
+        items = data.get("items")
+        if not isinstance(items, list):
+            raise ValueError("batch_plan items must be a list")
+        item_req = schema["properties"]["items"]["items"]["required"]
+        for idx, item in enumerate(items):
+            _require_keys(f"batch_plan.items[{idx}]", item, item_req)
+            if item["decision"] not in {"ACCEPT", "NEEDS_INFO", "REJECT"}:
+                raise ValueError(f"Invalid batch_plan decision: {item['decision']!r}")
+            if item["risk"] not in {"low", "medium", "high"}:
+                raise ValueError(f"Invalid batch_plan risk: {item['risk']!r}")
+            if not isinstance(item["surfaces"], list) or any(s not in {"ui", "security"} for s in item["surfaces"]):
+                raise ValueError(f"Invalid batch_plan surfaces: {item['surfaces']!r}")
+            item["surfaces"] = sorted(set(item["surfaces"]))
+            weight = item.get("complexity_weight")
+            if not isinstance(weight, int) or isinstance(weight, bool) or not (1 <= weight <= 5):
+                raise ValueError(f"batch_plan.items[{idx}].complexity_weight must be an integer in 1..5, got {weight!r}")
+            if item["decision"] == "NEEDS_INFO" and not [q for q in item["questions"] if str(q).strip()]:
+                raise ValueError("NEEDS_INFO batch_plan item must provide at least one question")
+            if item["decision"] == "REJECT" and not str(item["decision_reason"]).strip():
+                raise ValueError("REJECT batch_plan item must include non-empty decision_reason")
+
+    elif stage == "batch_build":
+        results = data.get("results")
+        if not isinstance(results, list) or not results:
+            raise ValueError("batch_build results must be a non-empty list")
+        res_req = schema["properties"]["results"]["items"]["required"]
+        seen_issues: set[int] = set()
+        for idx, res in enumerate(results):
+            _require_keys(f"batch_build.results[{idx}]", res, res_req)
+            inum = int(res["issue"])
+            if inum in seen_issues:
+                raise ValueError(f"Duplicate issue {inum} in batch_build results")
+            seen_issues.add(inum)
+            if res["status"] not in {"DONE", "BLOCKED", "SKIPPED_DEP"}:
+                raise ValueError(f"Invalid batch_build status: {res['status']!r}")
+            if res["status"] == "BLOCKED" and not str(res["blocked_reason"]).strip():
+                raise ValueError("BLOCKED batch_build result must specify blocked_reason")
+
+    elif stage == "intake":
         if data["decision"] not in {"ACCEPT", "NEEDS_INFO", "REJECT"}:
             raise ValueError(f"Invalid intake decision: {data['decision']!r}")
         if data["risk"] not in {"low", "medium", "high"}:

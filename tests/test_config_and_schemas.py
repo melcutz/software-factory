@@ -91,7 +91,10 @@ class ConfigAndSchemaTests(unittest.TestCase):
                 load_config(d)
 
     def test_markdown_renderers_and_schemas_cover_all_stages(self):
-        self.assertEqual(set(SCHEMAS.keys()), {"plan", "intake", "spec", "build", "review", "approve", "qa"})
+        self.assertEqual(
+            set(SCHEMAS.keys()),
+            {"plan", "batch_plan", "intake", "spec", "build", "batch_build", "review", "approve", "qa"},
+        )
         intake = validate_stage_output(
             "intake",
             {
@@ -239,6 +242,84 @@ class ConfigAndSchemaTests(unittest.TestCase):
                 json.dump({"batch": {"max_batch_issues": 0}}, f)
             with self.assertRaisesRegex(ValueError, "max_batch_issues"):
                 load_config(d)
+
+    def test_validate_batch_plan_enforces_enums_bounds_and_reasons(self):
+        valid = validate_stage_output(
+            "batch_plan",
+            {
+                "items": [
+                    {
+                        "issue": 12,
+                        "decision": "ACCEPT",
+                        "risk": "low",
+                        "surfaces": ["security"],
+                        "complexity_weight": 2,
+                        "predicted_files": ["factory/cli.py"],
+                        "depends_on": [],
+                        "topic_group": "cli",
+                        "summary": "Add check",
+                        "questions": [],
+                        "decision_reason": "",
+                    }
+                ],
+                "reasoning": "Single issue ready",
+            },
+        )
+        self.assertEqual(valid["items"][0]["complexity_weight"], 2)
+
+        with self.assertRaisesRegex(ValueError, "question"):
+            validate_stage_output(
+                "batch_plan",
+                {
+                    "items": [{**valid["items"][0], "decision": "NEEDS_INFO", "questions": []}],
+                    "reasoning": "Missing info",
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "complexity_weight"):
+            validate_stage_output(
+                "batch_plan",
+                {
+                    "items": [{**valid["items"][0], "complexity_weight": 7}],
+                    "reasoning": "Bad weight",
+                },
+            )
+
+    def test_validate_batch_build_enforces_status_unique_issues_and_blocked_reason(self):
+        valid = validate_stage_output(
+            "batch_build",
+            {
+                "results": [
+                    {
+                        "issue": 12,
+                        "status": "DONE",
+                        "commit": "abc1234",
+                        "summary": ["Added check"],
+                        "changes": ["factory/cli.py"],
+                        "tests_run": ["tests/test_cli.py"],
+                        "blocked_reason": "",
+                    }
+                ],
+                "notes": "All green",
+            },
+        )
+        self.assertEqual(valid["results"][0]["status"], "DONE")
+
+        with self.assertRaisesRegex(ValueError, "blocked_reason"):
+            validate_stage_output(
+                "batch_build",
+                {
+                    "results": [{**valid["results"][0], "status": "BLOCKED", "blocked_reason": ""}],
+                    "notes": "",
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "Duplicate"):
+            validate_stage_output(
+                "batch_build",
+                {
+                    "results": [valid["results"][0], valid["results"][0]],
+                    "notes": "",
+                },
+            )
 
 
 if __name__ == "__main__":
