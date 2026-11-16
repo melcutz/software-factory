@@ -1,6 +1,7 @@
 """Repository onboarding (`init`, `map`) and deterministic `PITFALLS.md` distillation (`learn`)."""
 from __future__ import annotations
 
+import ast
 import glob
 import json
 import os
@@ -49,13 +50,39 @@ def detect_stack(repo_root: str) -> tuple[str, str]:
     return "generic", "#!/usr/bin/env bash\nset -euo pipefail\necho 'No test suite configured yet'\n"
 
 
+def _extract_python_symbols(path: str, max_symbols: int = 8) -> list[str]:
+    """Extract top-level class/def symbols with 1-based line numbers via stdlib ast."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=path)
+    except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
+        return []
+    symbols: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            symbols.append(f"`{node.name}` (L{node.lineno})")
+            if len(symbols) >= max_symbols:
+                break
+    return symbols
+
+
+def _is_test_file(rel: str) -> bool:
+    base = os.path.basename(rel)
+    return rel.startswith("tests/") or base.startswith("test_") or base.endswith("_test.py")
+
+
 def generate_repo_map(repo_root: str) -> str:
-    """Deterministically generate a concise (<100 lines) REPO_MAP.md for `repo_root`."""
+    """Deterministically generate a concise (<=150 lines) AST-enriched REPO_MAP.md."""
     repo_root = os.path.abspath(repo_root)
     name = os.path.basename(repo_root) or "repository"
     files = _list_repo_files(repo_root)
     stack, _ = detect_stack(repo_root)
-    manifests = [m for m in ("pyproject.toml", "package.json", "Cargo.toml", "go.mod") if m in files or os.path.isfile(os.path.join(repo_root, m))]
+    manifests = [
+        m
+        for m in ("pyproject.toml", "package.json", "Cargo.toml", "go.mod")
+        if m in files or os.path.isfile(os.path.join(repo_root, m))
+    ]
 
     top_dirs: dict[str, int] = {}
     root_files: list[str] = []
@@ -75,19 +102,60 @@ def generate_repo_map(repo_root: str) -> str:
         "",
         "## Top-Level Directories",
     ]
-    for d, count in sorted(top_dirs.items())[:25]:
+    for d, count in sorted(top_dirs.items())[:15]:
         lines.append(f"- `{d}/` ({count} files)")
     if not top_dirs:
         lines.append("- (no subdirectories)")
+
     lines.extend(["", "## Key Root Files"])
-    for rf in root_files[:20]:
+    for rf in root_files[:12]:
         lines.append(f"- `{rf}`")
     if not root_files:
         lines.append("- (none)")
-    lines.extend(["", "## Sample Paths"])
-    for rel in files[:30]:
-        lines.append(f"- `{rel}`")
-    return "\n".join(lines[:95]) + "\n"
+
+    py_sources = [f for f in files if f.endswith(".py") and not _is_test_file(f)]
+    py_tests = [f for f in files if f.endswith(".py") and _is_test_file(f)]
+
+    # Sort core package sources first for higher signal density within the 150-line budget.
+    def _src_priority(rel: str) -> tuple[int, str]:
+        for idx, prefix in enumerate(("factory/", "src/", "app/")):
+            if rel.startswith(prefix):
+                return (idx, rel)
+        return (9, rel)
+
+    py_sources.sort(key=_src_priority)
+
+    test_by_stem: dict[str, list[str]] = {}
+    for tf in py_tests:
+        stem = os.path.splitext(os.path.basename(tf))[0]
+        if stem.startswith("test_"):
+            stem = stem[5:]
+        elif stem.endswith("_test"):
+            stem = stem[:-5]
+        test_by_stem.setdefault(stem, []).append(tf)
+
+    pairs: list[str] = []
+    for src_rel in py_sources:
+        stem = os.path.splitext(os.path.basename(src_rel))[0]
+        matched = test_by_stem.get(stem) or []
+        if matched:
+            pairs.append(f"- `{src_rel}` -> `{matched[0]}`")
+    if pairs:
+        lines.extend(["", "## Test Mapping", *pairs[:25]])
+
+    symbol_lines: list[str] = []
+    for src_rel in py_sources:
+        syms = _extract_python_symbols(os.path.join(repo_root, src_rel))
+        if syms:
+            symbol_lines.append(f"- `{src_rel}` -> {', '.join(syms)}")
+        if len(symbol_lines) >= 40:
+            break
+    if symbol_lines:
+        lines.extend(["", "## Python Symbol Index", *symbol_lines])
+    else:
+        lines.extend(["", "## Sample Paths", *[f"- `{rel}`" for rel in files[:25]]])
+
+    return "\n".join(lines[:150]) + "\n"
 
 
 def init_repository(repo_root: str, *, force: bool = False) -> list[str]:
