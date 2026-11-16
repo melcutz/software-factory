@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -50,6 +51,19 @@ def _detect_quota_error(model_spec: str, stdout_text: str, stderr_text: str) -> 
     m = _RETRY_AFTER_RE.search(combined)
     retry_after = int(m.group(1)) if m else None
     return QuotaExhaustedError(model_spec, retry_after_sec=retry_after, message=combined.strip()[:400])
+
+
+def resolve_agy_bin() -> str:
+    """Return `agy` when on PATH, else check common user-local bin dirs for non-login shells."""
+    if shutil.which("agy"):
+        return "agy"
+    for candidate in (
+        os.path.expanduser("~/.local/bin/agy"),
+        os.path.expanduser("~/bin/agy"),
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return "agy"
 
 
 def resolve_agent_path(factory_dir: str, agent_name: str) -> str | None:
@@ -439,7 +453,7 @@ def run_agent(
     effective_log = log_name or f"{stage}-{agent_name}"
 
     cmd = [
-        "agy",
+        resolve_agy_bin(),
         "-p",
         full_prompt,
         "--model",
