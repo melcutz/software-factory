@@ -537,5 +537,58 @@ class MultiRepoCliTests(unittest.TestCase):
                 self.assertNotIn("python3 -m pytest", buf.getvalue())
 
 
+class CliHelpTests(unittest.TestCase):
+    def _capture_help(self, argv: list[str]) -> str:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.main(argv)
+            self.assertEqual(ctx.exception.code, 0)
+        return buf.getvalue()
+
+    def test_root_help_describes_workflow_and_command_groups(self):
+        out = self._capture_help(["--help"])
+        self.assertIn("How it works:", out)
+        self.assertIn("factory patrol --help", out)
+        self.assertIn("factory run", out)
+
+    def test_patrol_help_explains_sensors_hooks_and_dedup(self):
+        out = self._capture_help(["patrol", "--help"])
+        self.assertIn("stale-repo-map", out)
+        self.assertIn("14", out)
+        self.assertIn("repeated-gate-retries", out)
+        self.assertIn("factory/patrol_hooks.py", out)
+        self.assertIn("[patrol:<fingerprint>]", out)
+        self.assertIn("--dry-run", out)
+
+    def test_all_user_subcommands_include_how_it_works_in_help(self):
+        subcommands = [
+            "run",
+            "queue",
+            "plan",
+            "status",
+            "gate",
+            "doctor",
+            "init-board",
+            "halt",
+            "resume",
+            "worker",
+            "pause",
+            "unpause",
+            "fleet",
+            "clean",
+            "map",
+            "init",
+            "learn",
+            "stats",
+            "logs",
+            "patrol",
+        ]
+        for cmd in subcommands:
+            with self.subTest(cmd=cmd):
+                out = self._capture_help([cmd, "--help"])
+                self.assertIn("How it works:", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -981,6 +981,15 @@ def _run_distributed_staging_train(
     max_batch_size = max(1, int(staging_cfg.get("max_batch_size", 4)))
     coalesce_window_sec = max(0.0, float(staging_cfg.get("coalesce_window_sec", 15)))
 
+    from factory.lib.worker import _is_lease_expired
+
+    existing_remote = next(
+        (rj for rj in state_store.list_remote_jobs() if rj.get("id") == job_id),
+        None,
+    )
+    if existing_remote and str(existing_remote.get("stage") or "") in {"merged", "rejected"}:
+        return TrainOutcome(action="exit", job=existing_remote)
+
     state_store.put_train_ticket(
         job_id,
         {
@@ -1012,6 +1021,29 @@ def _run_distributed_staging_train(
                         time.sleep(min(0.2, max(0.05, deadline - time.monotonic())))
 
                 raw_tickets = state_store.list_train_tickets()
+                remote_jobs_by_id = {
+                    str(rj.get("id")): rj
+                    for rj in state_store.list_remote_jobs()
+                    if rj.get("id")
+                }
+                workers_by_id = state_store.list_worker_heartbeats()
+                now_ts = time.time()
+                valid_tickets: list[dict] = []
+                for t in raw_tickets:
+                    tid = str(t.get("job_id") or "")
+                    if tid and tid != job_id:
+                        rj = remote_jobs_by_id.get(tid)
+                        if rj is not None:
+                            r_stage = str(rj.get("stage") or "")
+                            r_lease = rj.get("lease")
+                            if r_stage in {"merged", "rejected", "needs-human", "needs-info"} or (
+                                isinstance(r_lease, dict)
+                                and _is_lease_expired(r_lease, workers_by_id, now_ts)
+                            ):
+                                state_store.delete_train_ticket(tid)
+                                continue
+                    valid_tickets.append(t)
+                raw_tickets = valid_tickets
                 if not any(t.get("job_id") == job_id for t in raw_tickets):
                     raw_tickets.insert(
                         0,

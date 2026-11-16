@@ -172,12 +172,19 @@ def select_next_candidate(
     tier2: list[dict] = []
     known_issues: set[int] = set()
 
+    ready_issue_nums = {int(iss["number"]) for iss in ready_issues if iss.get("number") is not None}
+
     for j in remote_jobs:
         issue_num = j.get("issue")
         if issue_num is not None:
             known_issues.add(int(issue_num))
         stage = str(j.get("stage") or "")
-        if stage in TERMINAL_STAGES or stage in {"needs-human", "needs-info"}:
+        # Re-applying the queue label on GitHub puts the issue back into ready_issues;
+        # allow resuming needs-human/needs-info jobs when they are explicitly re-queued.
+        if stage in TERMINAL_STAGES or (
+            stage in {"needs-human", "needs-info"}
+            and (issue_num is None or int(issue_num) not in ready_issue_nums)
+        ):
             continue
         lease = j.get("lease")
         if lease is None:
@@ -217,6 +224,10 @@ def select_next_candidate(
 
 def exec_job_command(repo_root: str, issue_number: int) -> int:
     """Execute one factory job inside an hc child terminal or local worker thread."""
+    local_bin = os.path.expanduser("~/.local/bin")
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    if os.path.isdir(local_bin) and local_bin not in path_parts:
+        os.environ["PATH"] = os.pathsep.join([local_bin, *(p for p in path_parts if p)])
     repo_root = os.path.abspath(repo_root)
     host_cfg = load_host_config()
     bridge = HerdrBridge.from_env()
@@ -454,10 +465,20 @@ def run_worker(
             bridge.emit_status("working")
             name = f"{os.path.basename(repo)}-{issue_num}"
             if bridge.enabled:
+                factory_bin = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                    "bin",
+                    "factory",
+                )
+                exec_cmd = (
+                    [factory_bin]
+                    if os.path.isfile(factory_bin) and os.access(factory_bin, os.X_OK)
+                    else [sys.executable, "-m", "factory.cli"]
+                )
                 tid = bridge.spawn_job_terminal(
                     name,
                     repo,
-                    [sys.executable, "-m", "factory.cli", "_exec-job", "--repo", repo, str(issue_num)],
+                    [*exec_cmd, "_exec-job", "--repo", repo, str(issue_num)],
                 )
                 if tid:
                     from factory.lib.herdr_bridge import sanitize_hc_name

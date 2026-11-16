@@ -97,9 +97,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run against all repositories listed in ~/.config/factory/repos.json",
     )
 
+    _FMT = argparse.RawDescriptionHelpFormatter
+
     parser = argparse.ArgumentParser(
         prog="factory",
         description="Autonomous Software Factory for Google Antigravity (agy)",
+        formatter_class=_FMT,
+        epilog=(
+            "How it works:\n"
+            "  1. Queue & triage: `queue` lists eligible `factory`-labeled GitHub issues;\n"
+            "     `plan` dry-runs Smart Batch triage into a parallel/sequential Batch-DAG.\n"
+            "  2. Execute: `run` (single/batch) or `worker` (daemon) claims issues, creates\n"
+            "     isolated git worktrees under `.worktrees/`, runs build/gate/review/merge,\n"
+            "     and records state in `factory/jobs/` and `refs/factory/*`.\n"
+            "  3. Inspect & maintain: `status`, `logs`, `stats`, `clean`, `patrol`, `doctor`.\n\n"
+            "Examples:\n"
+            "  factory queue\n"
+            "  factory plan\n"
+            "  factory run 42\n"
+            "  factory patrol --dry-run\n"
+            "  factory clean && factory status\n\n"
+            "Run `factory <command> --help` (e.g. `factory patrol --help`) for details."
+        ),
         parents=[repo_flags],
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -107,61 +126,229 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser(
         "run",
         parents=[repo_flags],
+        formatter_class=_FMT,
         help="Drain queued factory issues or process specific issue number(s)",
+        description=(
+            "Drain queued `factory`-labeled GitHub issues or run specific issue number(s).\n\n"
+            "How it works:\n"
+            "  By default, Smart Batch Mode triages open issues into a dependency-aware\n"
+            "  Batch-DAG (parallelizing non-conflicting work), creates isolated git\n"
+            "  worktrees under `.worktrees/`, runs implementation, `gate` checks, code\n"
+            "  review, and merge/deploy, and writes per-job state under `factory/jobs/`.\n"
+            "  Use `--no-batch` to force the legacy sequential single-issue pipeline."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  factory run\n"
+            "  factory run 42 43\n"
+            "  factory run --no-batch 42\n"
+            "  factory run --max-batch 3"
+        ),
     )
     p_run.add_argument("issues", nargs="*", type=int, help="Optional GitHub issue numbers (default: drain all queued)")
     p_run.add_argument("--no-batch", action="store_true", help="Disable Smart Batch Mode and use legacy single-issue pipeline")
     p_run.add_argument("--max-batch", type=int, default=None, help="Override batch.max_batch_issues for this run")
 
-    sub.add_parser("queue", parents=[repo_flags], help="List open eligible factory-labeled GitHub issues")
+    sub.add_parser(
+        "queue",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="List open eligible factory-labeled GitHub issues",
+        description=(
+            "List open GitHub issues eligible for the factory queue.\n\n"
+            "How it works:\n"
+            "  Queries GitHub via `gh` for open issues carrying the configured `factory`\n"
+            "  label and filters out issues already blocked or claimed, printing issue\n"
+            "  numbers and titles in queue order."
+        ),
+        epilog="Examples:\n  factory queue\n  factory queue --all",
+    )
 
     p_plan = sub.add_parser(
         "plan",
         parents=[repo_flags],
+        formatter_class=_FMT,
         help="Dry-run smart batch triage and print the planned parallel/sequential Batch-DAG",
+        description=(
+            "Dry-run Smart Batch triage without creating worktrees or modifying issues.\n\n"
+            "How it works:\n"
+            "  Inspects queued (or specified) GitHub issues, estimates touched files and\n"
+            "  dependencies, and prints the planned Batch-DAG stages (which issues can\n"
+            "  run in parallel vs. sequentially) before you commit to `factory run`."
+        ),
+        epilog="Examples:\n  factory plan\n  factory plan 10 11 12",
     )
     p_plan.add_argument("issues", nargs="*", type=int, help="Optional GitHub issue numbers (default: all queued)")
 
     p_status = sub.add_parser(
         "status",
         parents=[repo_flags],
+        formatter_class=_FMT,
         help="Show job status summary or detailed JSON for one job",
+        description=(
+            "Show factory runner/fleet status and a summary table of jobs (or JSON for one job).\n\n"
+            "How it works:\n"
+            "  Reads local `factory/jobs/*/job.json` files and, when `origin` is configured,\n"
+            "  merges remote `refs/factory/*` fleet control state, worker heartbeats,\n"
+            "  model quota cooldowns, and remote job refs. Pass a `job_id` for full JSON."
+        ),
+        epilog="Examples:\n  factory status\n  factory status job-42\n  factory status --all",
     )
     p_status.add_argument("job_id", nargs="?", help="Optional job id (e.g. job-42)")
 
     p_gate = sub.add_parser(
         "gate",
         parents=[repo_flags],
+        formatter_class=_FMT,
         help="Run protected_paths + factory/checks.sh for a job worktree",
+        description=(
+            "Run protected-path validation and `factory/checks.sh` for a job worktree.\n\n"
+            "How it works:\n"
+            "  Verifies that modified files in the target worktree do not violate\n"
+            "  `protected_paths` in `factory/config.json`, executes `factory/checks.sh`,\n"
+            "  and writes the round report to `factory/jobs/<job_id>/round-<N>/checks.md`."
+        ),
+        epilog="Examples:\n  factory gate job-42\n  factory gate job-42 .worktrees/job-42 2",
     )
     p_gate.add_argument("job_id", help="Job id (e.g. job-42)")
     p_gate.add_argument("worktree", nargs="?", help="Worktree path (defaults to .worktrees/<job_id>)")
     p_gate.add_argument("round", nargs="?", type=int, default=1, help="Round number (default: 1)")
 
-    sub.add_parser("doctor", parents=[repo_flags], help="Verify git, gh, agy, config.json, checks.sh, and .gitignore")
+    sub.add_parser(
+        "doctor",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="Verify git, gh, agy, config.json, checks.sh, and .gitignore",
+        description=(
+            "Verify repository and host prerequisites for running the factory.\n\n"
+            "How it works:\n"
+            "  Checks that `git`, `gh`, and `agy` are installed, `git config user.name`\n"
+            "  and `user.email` are set, `factory/config.json` and executable\n"
+            "  `factory/checks.sh` exist, `python3 -m pytest` works (if referenced by\n"
+            "  `checks.sh`), and `.gitignore` ignores `.worktrees/` and `factory/jobs/`."
+        ),
+        epilog="Examples:\n  factory doctor\n  factory doctor --all",
+    )
 
-    p_board = sub.add_parser("init-board", parents=[repo_flags], help="Create a generic 'Factory' GitHub Project board")
+    p_board = sub.add_parser(
+        "init-board",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="Create a generic 'Factory' GitHub Project board",
+        description=(
+            "Create and wire a GitHub Project board for tracking factory issues.\n\n"
+            "How it works:\n"
+            "  Uses `gh` to create a GitHub Project (default title `Factory` under\n"
+            "  `@me`) with standard workflow columns and stores board metadata."
+        ),
+        epilog="Examples:\n  factory init-board\n  factory init-board --owner my-org --title 'Factory'",
+    )
     p_board.add_argument("--owner", default="@me", help="GitHub owner login (default: @me)")
     p_board.add_argument("--title", default="Factory", help="Project title (default: Factory)")
 
-    p_halt = sub.add_parser("halt", parents=[repo_flags], help="Globally halt the factory fleet and checkpoint active jobs")
+    p_halt = sub.add_parser(
+        "halt",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="Globally halt the factory fleet and checkpoint active jobs",
+        description=(
+            "Globally halt all factory workers across the fleet.\n\n"
+            "How it works:\n"
+            "  Writes a halted state (with optional `--reason`) into `refs/factory/control`\n"
+            "  on `origin`. Workers stop claiming new issues and checkpoint active jobs;\n"
+            "  `--force` interrupts immediately even during staging deploy."
+        ),
+        epilog="Examples:\n  factory halt --reason 'maintenance'\n  factory halt --force",
+    )
     p_halt.add_argument("--reason", default="", help="Optional reason recorded in refs/factory/control")
     p_halt.add_argument("--force", action="store_true", help="Interrupt immediately even during staging deploy")
 
-    sub.add_parser("resume", parents=[repo_flags], help="Clear global halt and allow workers to resume")
+    sub.add_parser(
+        "resume",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="Clear global halt and allow workers to resume",
+        description=(
+            "Clear a global fleet halt so workers can resume claiming jobs.\n\n"
+            "How it works:\n"
+            "  Updates `refs/factory/control` on `origin` to clear the halted flag\n"
+            "  set by `factory halt`."
+        ),
+        epilog="Examples:\n  factory resume\n  factory resume --all",
+    )
 
-    p_worker = sub.add_parser("worker", parents=[repo_flags], help="Run continuous competing-consumer worker loop")
+    p_worker = sub.add_parser(
+        "worker",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="Run continuous competing-consumer worker loop",
+        description=(
+            "Run the competing-consumer factory worker loop on this machine.\n\n"
+            "How it works:\n"
+            "  Polls eligible `factory`-labeled GitHub issues, acquires atomic leases\n"
+            "  via git refs (`refs/factory/*`), publishes worker heartbeats, respects\n"
+            "  global `halt` and local `pause` state, and runs `_exec-job` in parallel\n"
+            "  slots. Pass `--once` to execute a single poll cycle and exit."
+        ),
+        epilog="Examples:\n  factory worker\n  factory worker --once\n  factory worker --all",
+    )
     p_worker.add_argument("--once", action="store_true", help="Run a single poll cycle and exit")
 
-    p_exec = sub.add_parser("_exec-job", parents=[repo_flags], help="Internal: execute a single claimed job")
+    p_exec = sub.add_parser(
+        "_exec-job",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="Internal: execute a single claimed job",
+        description=(
+            "Internal entrypoint used by `factory worker` to execute one claimed issue.\n\n"
+            "How it works:\n"
+            "  Runs the single-issue job pipeline for the given GitHub issue number\n"
+            "  inside the calling worker's lease."
+        ),
+    )
     p_exec.add_argument("issue", type=int, help="GitHub issue number")
 
-    p_pause = sub.add_parser("pause", parents=[repo_flags], help="Pause new job claims on this machine")
+    p_pause = sub.add_parser(
+        "pause",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="Pause new job claims on this machine",
+        description=(
+            "Pause new job claims on the local machine without halting the whole fleet.\n\n"
+            "How it works:\n"
+            "  Sets the local worker pause marker so this host stops claiming new\n"
+            "  issues. With `--drain`, waits for currently running local jobs to finish."
+        ),
+        epilog="Examples:\n  factory pause\n  factory pause --drain",
+    )
     p_pause.add_argument("--drain", action="store_true", help="Drain active jobs cleanly")
 
-    sub.add_parser("unpause", parents=[repo_flags], help="Resume job claims on this machine")
+    sub.add_parser(
+        "unpause",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="Resume job claims on this machine",
+        description=(
+            "Clear the local pause marker so this machine resumes claiming jobs.\n\n"
+            "How it works:\n"
+            "  Removes the local pause state created by `factory pause`."
+        ),
+        epilog="Examples:\n  factory unpause",
+    )
 
-    p_fleet = sub.add_parser("fleet", parents=[repo_flags], help="Manage peer machines via hc machine")
+    p_fleet = sub.add_parser(
+        "fleet",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="Manage peer machines via hc machine",
+        description=(
+            "Manage peer worker machines in the fleet via `hc machine`.\n\n"
+            "How it works:\n"
+            "  Dispatches `status`, `wake`, `pause`, `unpause`, `update`, or `remove`\n"
+            "  to one named machine or all configured fleet peers."
+        ),
+        epilog="Examples:\n  factory fleet status\n  factory fleet pause Base --drain\n  factory fleet wake Rocket",
+    )
     p_fleet.add_argument("action", choices=["status", "wake", "pause", "unpause", "update", "remove"], help="Fleet action")
     p_fleet.add_argument("machine", nargs="?", help="Optional target machine name")
     p_fleet.add_argument("--drain", action="store_true", help="Drain active jobs when pausing")
@@ -169,41 +356,132 @@ def _build_parser() -> argparse.ArgumentParser:
     p_clean = sub.add_parser(
         "clean",
         parents=[repo_flags],
+        formatter_class=_FMT,
         help="Remove worktrees for merged/rejected jobs and prune stale git worktrees",
+        description=(
+            "Clean up finished worktrees and reconcile stale local/remote job status.\n\n"
+            "How it works:\n"
+            "  1. Removes `.worktrees/<job_id>` for `merged` or `rejected` jobs.\n"
+            "  2. Checks non-terminal jobs against GitHub: removes empty `queued` stubs\n"
+            "     (no `logs/` or `round-*`) for CLOSED issues, and marks CLOSED jobs\n"
+            "     that have logs as `rejected` while preserving their logs.\n"
+            "  3. Removes `_planner` scratch worktrees and runs `git worktree prune`.\n"
+            "  4. Reconciles stale `refs/factory/*` job/worker refs on `origin` so\n"
+            "     `factory status` reflects clean real state."
+        ),
+        epilog="Examples:\n  factory clean --dry-run\n  factory clean\n  factory clean --all",
     )
     p_clean.add_argument("--dry-run", action="store_true", help="Show worktrees that would be removed without deleting them")
 
     p_map = sub.add_parser(
         "map",
         parents=[repo_flags],
+        formatter_class=_FMT,
         help="Generate factory/REPO_MAP.md from tracked repository layout",
+        description=(
+            "Generate a concise repository map (`factory/REPO_MAP.md`) for agents.\n\n"
+            "How it works:\n"
+            "  Scans git-tracked files in the repository, groups key modules and entry\n"
+            "  points, and writes `factory/REPO_MAP.md` (or prints with `--stdout`)."
+        ),
+        epilog="Examples:\n  factory map\n  factory map --stdout",
     )
     p_map.add_argument("--stdout", action="store_true", help="Print generated map to stdout instead of writing file")
 
     p_init = sub.add_parser(
         "init",
         parents=[repo_flags],
+        formatter_class=_FMT,
         help="Scaffold factory/config.json, checks.sh, REPO_MAP.md, and .gitignore",
+        description=(
+            "Initialize a repository for autonomous factory runs.\n\n"
+            "How it works:\n"
+            "  Detects project tooling and scaffolds `factory/config.json`,\n"
+            "  `factory/checks.sh`, `factory/REPO_MAP.md`, and `.gitignore` entries\n"
+            "  (`.worktrees/`, `factory/jobs/`). Pass `--force` to overwrite existing files."
+        ),
+        epilog="Examples:\n  factory init\n  factory init --force",
     )
     p_init.add_argument("--force", action="store_true", help="Overwrite existing factory files")
 
     p_learn = sub.add_parser(
         "learn",
         parents=[repo_flags],
+        formatter_class=_FMT,
         help="Distill guardrails from multi-round/QA jobs into factory/PITFALLS.md",
+        description=(
+            "Distill recurring failure patterns into `factory/PITFALLS.md` guardrails.\n\n"
+            "How it works:\n"
+            "  Inspects multi-round or QA-failed jobs under `factory/jobs/` (or one\n"
+            "  specific `job_id`), extracts root-cause lessons, and appends new\n"
+            "  guardrails to `factory/PITFALLS.md` for future agent runs."
+        ),
+        epilog="Examples:\n  factory learn\n  factory learn job-12 --deterministic",
     )
     p_learn.add_argument("job_id", nargs="?", help="Optional specific job ID (e.g. job-12)")
     p_learn.add_argument("--deterministic", action="store_true", help="Use deterministic extraction without LLM")
 
-    p_stats = sub.add_parser("stats", parents=[repo_flags], help="Show telemetry summary across factory jobs")
+    p_stats = sub.add_parser(
+        "stats",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="Show telemetry summary across factory jobs",
+        description=(
+            "Aggregate cost, cache, stage, and duration telemetry across factory jobs.\n\n"
+            "How it works:\n"
+            "  Reads all `factory/jobs/*/job.json` records across the target repo(s)\n"
+            "  and computes total jobs, stage counts, merge rate, total and median\n"
+            "  merged USD cost, prompt cache hit %, and LLM/gate/deploy durations."
+        ),
+        epilog="Examples:\n  factory stats\n  factory stats --json\n  factory stats --all --json",
+    )
     p_stats.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
-    p_logs = sub.add_parser("logs", parents=[repo_flags], help="Show failure/gate/review summary for a job")
+    p_logs = sub.add_parser(
+        "logs",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="Show failure/gate/review summary for a job",
+        description=(
+            "Inspect gate output, review findings, and QA failures for a single job.\n\n"
+            "How it works:\n"
+            "  Loads `factory/jobs/<job_id>/job.json`, prints stage, round, and\n"
+            "  `last_error`, then tails `round-<N>/checks.md` and prints any findings\n"
+            "  from `round-<N>/review-*.json` and `qa-failure.md`."
+        ),
+        epilog="Examples:\n  factory logs job-12\n  factory logs job-12 --round 2 --tail 80",
+    )
     p_logs.add_argument("job_id", help="Job ID (e.g. job-12)")
     p_logs.add_argument("--round", type=int, default=None, help="Specific round number")
     p_logs.add_argument("--tail", type=int, default=40, help="Number of trailing lines from checks.md")
 
-    p_patrol = sub.add_parser("patrol", parents=[repo_flags], help="Run repo health sensors and file factory issues")
+    p_patrol = sub.add_parser(
+        "patrol",
+        parents=[repo_flags],
+        formatter_class=_FMT,
+        help="Run repo health sensors and file factory issues",
+        description=(
+            "Scan repository health and file deduplicated `factory`-labeled GitHub issues.\n\n"
+            "How it works:\n"
+            "  1. Runs built-in sensors:\n"
+            "     - `stale-repo-map`: triggers if `factory/REPO_MAP.md` is > 14 days old\n"
+            "       (recommends `factory map`).\n"
+            "     - `repeated-gate-retries`: triggers if >= 3 jobs in `factory/jobs/`\n"
+            "       required >= 3 rounds (recommends `factory learn` / `factory logs`).\n"
+            "  2. Loads optional `factory/patrol_hooks.py` and calls\n"
+            "     `collect_patrol_findings(repo_root)` for custom findings with\n"
+            "     `fingerprint`, `title`, and optional `body`.\n"
+            "  3. Checks open GitHub issues for `[patrol:<fingerprint>]`; skips any\n"
+            "     already-open finding and files new issues labeled `factory`\n"
+            "     (unless `--dry-run` is passed)."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  factory patrol --dry-run\n"
+            "  factory patrol\n"
+            "  factory patrol --all --dry-run"
+        ),
+    )
     p_patrol.add_argument("--dry-run", action="store_true", help="Print findings without creating GitHub issues")
 
     return parser

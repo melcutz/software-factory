@@ -556,7 +556,7 @@ class GitStateStore:
 
     def put_train_ticket(self, job_id: str, payload: dict) -> bool:
         ref = f"refs/factory/train/{job_id}"
-        old_sha = self._ls_remote_one(ref)
+        old_sha = self._fetch_ref(ref)
         data = dict(payload)
         data.setdefault("job_id", job_id)
         data.setdefault("machine_id", self.machine_id)
