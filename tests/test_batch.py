@@ -551,3 +551,75 @@ def test_run_factory_uses_batch_by_default_and_respects_no_batch_and_max_batch(t
     rc2 = cli.main(["run", "--repo", str(repo), "--no-batch"])
     assert rc2 == 0
     assert sorted(legacy_calls) == [1, 2]
+
+
+def test_run_batch_factory_skips_issue_whose_prereq_was_rejected_or_needs_info(tmp_path):
+    from unittest.mock import MagicMock
+    from factory.lib.batch import run_batch_factory
+    from factory.lib.config import load_config
+
+    _, repo = _init_temp_git_repo(tmp_path)
+    cfg = load_config(str(repo / "factory"))
+    issues = [
+        {"number": 1, "title": "Vague Base", "body": "unclear", "url": "https://x/1"},
+        {"number": 2, "title": "Dependent", "body": "Depends on #1", "url": "https://x/2"},
+    ]
+    gh = MagicMock()
+    built = []
+
+    def fake_agent(factory_dir, job_dir, wt, stage, agent_name, model, prompt, schema, timeout_sec, **kwargs):
+        if stage == "batch_plan":
+            return (
+                {
+                    "items": [
+                        {"issue": 1, "decision": "NEEDS_INFO", "risk": "low", "surfaces": [], "complexity_weight": 1, "predicted_files": [], "depends_on": [], "topic_group": "", "summary": "1", "questions": ["What?"], "decision_reason": ""},
+                        {"issue": 2, "decision": "ACCEPT", "risk": "low", "surfaces": [], "complexity_weight": 1, "predicted_files": ["a.py"], "depends_on": [1], "topic_group": "", "summary": "2", "questions": [], "decision_reason": ""},
+                    ],
+                    "reasoning": "1 needs info",
+                },
+                {"total_tokens": 20},
+                0.5,
+            )
+        built.append(stage)
+        raise AssertionError("Should not build #2 when prerequisite #1 is NEEDS_INFO")
+
+    jobs = run_batch_factory(str(repo), issues, config=cfg, gh=gh, agent_runner=fake_agent)
+    by_id = {j["id"]: j for j in jobs}
+    assert by_id["job-1"]["stage"] == "needs-info"
+    assert by_id["job-2"]["stage"] == "needs-human"
+    assert built == []
+
+
+def test_execute_batch_enforces_max_job_cost_usd_budget(tmp_path):
+    from unittest.mock import MagicMock
+    from factory.lib.batch import BatchSpec, execute_batch
+    from factory.lib.config import load_config
+    from factory.lib.state import enqueue_job, load_job
+
+    _, repo = _init_temp_git_repo(tmp_path)
+    cfg = load_config(str(repo / "factory"))
+    cfg["max_job_cost_usd"] = 0.01
+    jobs_dir = str(repo / "factory" / "jobs")
+    items = [_item(1, weight=1, files=["f1.py"])]
+    enqueue_job(jobs_dir, {"number": 1, "title": "Issue 1", "body": "", "url": ""}, max_rounds=3)
+    batch = BatchSpec(id="batch-1", issues=items, solo_only=False, total_weight=1, predicted_files=["f1.py"])
+    gh = MagicMock()
+
+    def fake_agent(factory_dir, job_dir, wt, stage, agent_name, model, prompt, schema, timeout_sec, **kwargs):
+        if stage == "batch_build":
+            s1 = _git_commit_file(wt, "f1.py", "x = 1\n", "feat: one (#1)")
+            return (
+                {
+                    "results": [{"issue": 1, "status": "DONE", "commit": s1, "summary": ["one"], "changes": ["f1.py"], "tests_run": [], "blocked_reason": ""}],
+                    "notes": "",
+                },
+                {"cost_usd": 0.05, "total_tokens": 1000},
+                1.0,
+            )
+        return ({"verdict": "PASS", "summary": ["ok"], "findings": [], "checked": ["f1.py"]}, {"total_tokens": 10}, 0.1)
+
+    outcome = execute_batch(str(repo), batch, config=cfg, gh=gh, agent_runner=fake_agent)
+    assert outcome.merged_issues == []
+    assert outcome.failed_issues == [1]
+    assert load_job(jobs_dir, "job-1")["stage"] == "needs-human"
+    gh.ensure_draft_pr.assert_not_called()

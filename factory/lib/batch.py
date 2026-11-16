@@ -240,6 +240,7 @@ def pack_batches(
                     batch_deps[b2.id].add(b1.id)
 
     graphlib.TopologicalSorter(batch_deps).prepare()
+    full_hard_deps = {num: set(hard_deps.get(num, set())) for num in (accepted_ids | {it.issue for it in rejected} | {it.issue for it in needs_info})}
     return BatchPlan(
         accepted=accepted,
         rejected=rejected,
@@ -247,7 +248,7 @@ def pack_batches(
         batches=batches,
         batch_deps=batch_deps,
         hard_batch_deps=hard_batch_deps,
-        hard_deps=clean_deps,
+        hard_deps=full_hard_deps,
     )
 
 
@@ -504,6 +505,22 @@ def _record_batch_usage(
         }
         cost = estimate_usage_cost_usd(model_spec, scaled, config)
         record_usage(jobs_dir, f"job-{it.issue}", scaled, duration * ratio, cost_usd=cost)
+
+
+def _check_batch_cost_budget(jobs_dir: str, issues: list[TriageItem], config: dict) -> tuple[bool, float, float]:
+    """Return `(within_budget, total_cost, budget_limit)` for surviving batch issues."""
+    per_job = float(config.get("max_job_cost_usd", 0.0) or 0.0)
+    if per_job <= 0.0 or not issues:
+        return True, 0.0, 0.0
+    limit = round(per_job * len(issues), 6)
+    total = 0.0
+    for it in issues:
+        try:
+            job = load_job(jobs_dir, f"job-{it.issue}")
+            total += float((job.get("usage") or {}).get("cost_usd", 0.0) or 0.0)
+        except FileNotFoundError:
+            pass
+    return total <= limit, round(total, 6), limit
 
 
 def _escalate_issue(
@@ -792,6 +809,15 @@ def execute_batch(
         remove_worktree(repo_root, wt)
         return BatchExecutionOutcome(batch.id, [], [], failed_issues)
 
+    within_budget, spent, limit = _check_batch_cost_budget(jobs_dir, surviving, config)
+    if not within_budget:
+        msg = f"Batch cost ${spent:.4f} exceeded budget ${limit:.4f}"
+        for it in surviving:
+            _escalate_issue(jobs_dir, it, msg, config, gh, board)
+            failed_issues.append(it.issue)
+        remove_worktree(repo_root, wt)
+        return BatchExecutionOutcome(batch.id, [], [], failed_issues)
+
     def _gate_once(worktree_path: str, round_num: int) -> tuple[bool, str]:
         ok, out = run_gate(repo_root, batch.id, worktree_path, round_num, config)
         return ok, out
@@ -904,6 +930,18 @@ def execute_batch(
                         failed_issues.append(it.issue)
                     remove_worktree(repo_root, wt)
                     return BatchExecutionOutcome(batch.id, [], [], failed_issues)
+        prot_violations = find_protected_violations(
+            changed_files_against_base(wt, base_branch),
+            config.get("protected_paths", []),
+            allow_self_host=bool(config.get("allow_self_host", False)),
+        )
+        if prot_violations:
+            msg = f"Protected paths modified: {', '.join(prot_violations)}"
+            for it in surviving:
+                _escalate_issue(jobs_dir, it, msg, config, gh, board)
+                failed_issues.append(it.issue)
+            remove_worktree(repo_root, wt)
+            return BatchExecutionOutcome(batch.id, [], [], failed_issues)
         push_branch(wt, batch_branch)
         pr = gh.ensure_draft_pr(branch=batch_branch, base=base_branch, title=pr_title, body=pr_body, draft=False)
         pr_num = int(pr["number"])
@@ -985,7 +1023,7 @@ def run_batch_factory(
 
     max_workers = max(1, int((config.get("batch") or {}).get("max_parallel_batches", 2)))
     unmerged_lock = threading.Lock()
-    unmerged_issues: set[int] = set()
+    unmerged_issues: set[int] = {it.issue for it in plan.rejected} | {it.issue for it in plan.needs_info}
 
     def _run_one_batch(bid: str) -> BatchExecutionOutcome:
         b = by_id[bid]
