@@ -501,7 +501,7 @@ class PipelineE2ETests(unittest.TestCase):
 
     def test_low_risk_fix_auto_merges(self):
         self._seed_issue(20, "Small typo fix")
-        results = run_factory(self.repo)
+        results = run_factory(self.repo, batch_mode=False)
         self.assertEqual(len(results), 1)
         job = results[0]
         self.assertEqual(job["stage"], "merged")
@@ -544,7 +544,7 @@ class PipelineE2ETests(unittest.TestCase):
         paused = process_job(self.repo, 40)
         self.assertEqual(paused["stage"], "needs-info")
         # Next queue run skips issue 40 while factory:needs-info is set
-        self.assertEqual(run_factory(self.repo), [])
+        self.assertEqual(run_factory(self.repo, batch_mode=False), [])
 
         # Human comments and swaps label back to factory
         with open(self.gh_state_path, encoding="utf-8") as f:
@@ -554,7 +554,7 @@ class PipelineE2ETests(unittest.TestCase):
         with open(self.gh_state_path, "w", encoding="utf-8") as f:
             json.dump(gh_data, f, indent=2)
 
-        done = run_factory(self.repo)
+        done = run_factory(self.repo, batch_mode=False)
         self.assertEqual(len(done), 1)
         self.assertEqual(done[0]["stage"], "merged")
 
@@ -634,7 +634,7 @@ class PipelineE2ETests(unittest.TestCase):
         subprocess.run(["git", "-C", other_clone, "commit", "-m", "upstream"], check=True, capture_output=True)
         subprocess.run(["git", "-C", other_clone, "push", "origin", "main"], check=True, capture_output=True)
 
-        results = run_factory(self.repo)
+        results = run_factory(self.repo, batch_mode=False)
         by_issue = {j["issue"]: j["stage"] for j in results}
         self.assertEqual(by_issue[21], "merged")
         self.assertEqual(by_issue[22], "merged")
@@ -841,7 +841,7 @@ class PipelineE2ETests(unittest.TestCase):
             return []
 
         with patch("factory.lib.pipeline.GitHubClient.list_queue_issues", side_effect=fake_list_queue_issues):
-            results = run_factory(self.repo)
+            results = run_factory(self.repo, batch_mode=False)
 
         self.assertEqual([r["issue"] for r in results], [20, 21])
         self.assertTrue(all(r["stage"] == "merged" for r in results))

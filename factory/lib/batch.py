@@ -35,7 +35,7 @@ from factory.lib.planner import (
     parse_explicit_dependencies,
 )
 from factory.lib.project_board import ProjectBoardSync
-from factory.lib.schemas import render_intake_md
+from factory.lib.schemas import SCHEMAS, render_intake_md
 from factory.lib.state import advance_stage, enqueue_job, load_job, record_metrics, record_usage, update_job
 
 
@@ -351,15 +351,18 @@ def triage_and_plan_queue(
         )
     else:
         payload, usage, duration = run_agent(
-            repo_root,
             factory_dir,
-            "batch-planner",
+            jobs_dir,
+            repo_root,
             "batch_plan",
+            "batch-planner",
             model,
             prompt,
-            timeout_sec=int(config.get("agent_timeout_sec", 900)),
-            read_only=True,
-            config=config,
+            SCHEMAS["batch_plan"],
+            int(config.get("agent_timeout_sec", 900)),
+            sandbox=True,
+            clean_worktree=False,
+            log_name="batch-planner",
         )
 
     raw_by_num = {int(entry["issue"]): entry for entry in (payload.get("items") or []) if int(entry["issue"]) in issue_by_num}
@@ -672,6 +675,8 @@ def _run_batch_review(
     issue_summary = "\n".join(f"- #{it.issue}: {it.title}" for it in surviving)
     findings_text: list[str] = []
     passed = True
+    batch_job_dir = os.path.join(jobs_dir, batch.id)
+    os.makedirs(batch_job_dir, exist_ok=True)
     for role in roles:
         model = reviewers[role]
         prompt = (
@@ -679,16 +684,18 @@ def _run_batch_review(
             f"## Diff Stat\n{stat}\n"
         )
         payload, usage, dur = agent_runner(
-            repo_root,
             factory_dir,
-            f"reviewer-{role}",
+            batch_job_dir,
+            worktree,
             "review",
+            f"reviewer-{role}",
             model,
             prompt,
-            worktree=worktree,
-            timeout_sec=int(config.get("agent_timeout_sec", 900)),
-            read_only=True,
-            config=config,
+            SCHEMAS["review"],
+            int(config.get("agent_timeout_sec", 900)),
+            sandbox=True,
+            clean_worktree=True,
+            log_name=f"review-{role}",
         )
         _record_batch_usage(jobs_dir, surviving, usage, dur, model, config)
         if payload.get("verdict") != "PASS":
@@ -737,19 +744,23 @@ def execute_batch(
     ):
         builder_model = str(config["models"]["builder_low"])
 
+    batch_job_dir = os.path.join(jobs_dir, batch.id)
+    os.makedirs(batch_job_dir, exist_ok=True)
     timeout_sec = min(2400, int(config.get("agent_timeout_sec", 900)) + 240 * (len(batch.issues) - 1))
     build_prompt = _build_batch_builder_prompt(batch, repo_map)
     build_payload, usage, dur = runner(
-        repo_root,
         factory_dir,
-        "batch-builder",
+        batch_job_dir,
+        wt,
         "batch_build",
+        "batch-builder",
         builder_model,
         build_prompt,
-        worktree=wt,
-        timeout_sec=timeout_sec,
-        require_clean_worktree=True,
-        config=config,
+        SCHEMAS["batch_build"],
+        timeout_sec,
+        sandbox=False,
+        clean_worktree=True,
+        log_name="batch-builder",
     )
     _record_batch_usage(jobs_dir, batch.issues, usage, dur, builder_model, config)
 
@@ -808,16 +819,18 @@ def execute_batch(
                 advance_stage(jobs_dir, f"job-{it.issue}", "build", last_error=feedback)
             fix_prompt = _build_batch_builder_prompt(batch, repo_map, fix_feedback=feedback)
             _, fix_usage, fix_dur = runner(
-                repo_root,
                 factory_dir,
-                "batch-builder",
+                batch_job_dir,
+                wt,
                 "batch_build",
+                "batch-builder",
                 builder_model,
                 fix_prompt,
-                worktree=wt,
-                timeout_sec=timeout_sec,
-                require_clean_worktree=True,
-                config=config,
+                SCHEMAS["batch_build"],
+                timeout_sec,
+                sandbox=False,
+                clean_worktree=True,
+                log_name=f"batch-builder-round-{rnd + 1}",
             )
             _record_batch_usage(jobs_dir, surviving, fix_usage, fix_dur, builder_model, config)
 
@@ -939,15 +952,18 @@ def run_batch_factory(
     def _planner_hook(prompt: str, **kw):
         model = kw["model"]
         return runner(
-            repo_root,
             factory_dir,
-            "batch-planner",
+            jobs_dir,
+            repo_root,
             "batch_plan",
+            "batch-planner",
             model,
             prompt,
-            timeout_sec=int(config.get("agent_timeout_sec", 900)),
-            read_only=True,
-            config=config,
+            SCHEMAS["batch_plan"],
+            int(config.get("agent_timeout_sec", 900)),
+            sandbox=True,
+            clean_worktree=False,
+            log_name="batch-planner",
         )
 
     plan = triage_and_plan_queue(

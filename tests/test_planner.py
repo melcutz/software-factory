@@ -109,7 +109,7 @@ class PlannerTests(unittest.TestCase):
                 patch("factory.lib.pipeline.GitHubClient.comment_issue"),
                 patch("factory.lib.pipeline.process_job", fake_process),
             ):
-                results = run_factory(tmp, issue_numbers=[10, 11, 12])
+                results = run_factory(tmp, issue_numbers=[10, 11, 12], batch_mode=False)
 
             # 11 depended on 10, which halted in needs-human -> 11 must be skipped
             self.assertIn(10, call_order)
@@ -210,7 +210,7 @@ class PlannerTests(unittest.TestCase):
                 patch("factory.lib.pipeline.run_agent", fake_run_agent),
                 patch("factory.lib.pipeline.process_job", fake_process),
             ):
-                results = run_factory(tmp, issue_numbers=[10, 11, 12])
+                results = run_factory(tmp, issue_numbers=[10, 11, 12], batch_mode=False)
 
             self.assertEqual(call_order, [10, 11])
             self.assertEqual({r["issue"] for r in results}, {10, 11})
@@ -287,7 +287,7 @@ class PlannerTests(unittest.TestCase):
                 ),
                 patch("factory.lib.pipeline.process_job", fake_process),
             ):
-                results = run_factory(tmp)
+                results = run_factory(tmp, batch_mode=False)
 
             self.assertEqual(len(results), 3)
             stages_map, table_str, banner_str = snapshots[0]

@@ -110,6 +110,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Drain queued factory issues or process specific issue number(s)",
     )
     p_run.add_argument("issues", nargs="*", type=int, help="Optional GitHub issue numbers (default: drain all queued)")
+    p_run.add_argument("--no-batch", action="store_true", help="Disable Smart Batch Mode and use legacy single-issue pipeline")
+    p_run.add_argument("--max-batch", type=int, default=None, help="Override batch.max_batch_issues for this run")
 
     sub.add_parser("queue", parents=[repo_flags], help="List open eligible factory-labeled GitHub issues")
 
@@ -303,12 +305,28 @@ def main(argv: list[str] | None = None) -> int:
         if multi and args.issues:
             print("Error: explicit issue numbers cannot be combined with multiple repos.", file=sys.stderr)
             return 1
+        extra_kwargs: dict = {}
+        if args.no_batch:
+            extra_kwargs["batch_mode"] = False
+        if args.max_batch is not None:
+            extra_kwargs["max_batch_issues"] = args.max_batch
         if not multi:
-            jobs = run_factory(repos[0], issue_numbers=args.issues or None)
+            jobs = run_factory(
+                repos[0],
+                issue_numbers=args.issues or None,
+                **extra_kwargs,
+            )
             print(format_status_table(jobs))
             return 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(repos)) as pool:
-            futs = {pool.submit(run_factory, repo): repo for repo in repos}
+            futs = {
+                pool.submit(
+                    run_factory,
+                    repo,
+                    **extra_kwargs,
+                ): repo
+                for repo in repos
+            }
             for fut, repo in futs.items():
                 jobs = fut.result()
                 print(f"\n=== {os.path.basename(repo)} ({repo}) ===")

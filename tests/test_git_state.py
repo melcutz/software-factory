@@ -717,13 +717,13 @@ def test_run_factory_coordinates_leases_with_origin_and_skips_active_peer_lease(
     monkeypatch.setattr("factory.lib.pipeline.run_agent", fake_run_agent)
 
     # Queue run on clone 1: skips 201 (leased by peer-a) and processes + releases 202
-    results = run_factory(clones[1])
+    results = run_factory(clones[1], batch_mode=False)
     assert [r["issue"] for r in results] == [202]
     assert results[0]["stage"] == "merged"
     assert results[0].get("lease") is None
 
     # Explicit single-issue run on 201 also skips when leased by live peer-a
-    assert run_factory(clones[1], issue_number=201) == []
+    assert run_factory(clones[1], issue_number=201, batch_mode=False) == []
 
     # Verify remote job-202 lease was released while job-201 is still owned by peer-a
     check_store = GitStateStore(clones[1], "m1")

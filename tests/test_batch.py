@@ -288,8 +288,7 @@ def test_execute_batch_happy_path_three_issues_non_squash_and_proportional_metri
     gh = MagicMock()
     gh.ensure_draft_pr.return_value = {"number": 50, "url": "https://github.com/o/r/pull/50"}
 
-    def fake_agent(repo_root, factory_dir, agent_name, stage, model, prompt, **kwargs):
-        wt = kwargs["worktree"]
+    def fake_agent(factory_dir, job_dir, wt, stage, agent_name, model, prompt, schema, timeout_sec, **kwargs):
         if stage == "batch_build":
             s1 = _git_commit_file(wt, "f1.py", "x = 1\n", "feat: one (#1)")
             s2 = _git_commit_file(wt, "f2.py", "y = 2\n", "feat: two (#2)")
@@ -342,8 +341,7 @@ def test_execute_batch_handles_blocked_and_skipped_dep_mid_batch(tmp_path):
     gh = MagicMock()
     gh.ensure_draft_pr.return_value = {"number": 51, "url": "https://github.com/o/r/pull/51"}
 
-    def fake_agent(repo_root, factory_dir, agent_name, stage, model, prompt, **kwargs):
-        wt = kwargs["worktree"]
+    def fake_agent(factory_dir, job_dir, wt, stage, agent_name, model, prompt, schema, timeout_sec, **kwargs):
         if stage == "batch_build":
             s1 = _git_commit_file(wt, "f1.py", "x = 1\n", "feat: one (#1)")
             return (
@@ -382,7 +380,7 @@ def test_execute_batch_audits_missing_commit_for_done_issue(tmp_path):
     batch = BatchSpec(id="batch-1", issues=items, solo_only=False, total_weight=1, predicted_files=["f1.py"])
     gh = MagicMock()
 
-    def fake_agent(repo_root, factory_dir, agent_name, stage, model, prompt, **kwargs):
+    def fake_agent(factory_dir, job_dir, wt, stage, agent_name, model, prompt, schema, timeout_sec, **kwargs):
         return (
             {
                 "results": [{"issue": 1, "status": "DONE", "commit": "", "summary": ["lied"], "changes": [], "tests_run": [], "blocked_reason": ""}],
@@ -415,8 +413,7 @@ def test_salvage_passing_commits_drops_broken_commit_and_ships_healthy_subset(tm
     gh = MagicMock()
     gh.ensure_draft_pr.return_value = {"number": 52, "url": "https://github.com/o/r/pull/52"}
 
-    def fake_agent(repo_root, factory_dir, agent_name, stage, model, prompt, **kwargs):
-        wt = kwargs["worktree"]
+    def fake_agent(factory_dir, job_dir, wt, stage, agent_name, model, prompt, schema, timeout_sec, **kwargs):
         if stage == "batch_build":
             s1 = _git_commit_file(wt, "f1.py", "x = 1\n", "feat: one (#1)")
             s2 = _git_commit_file(wt, "FAIL_GATE", "bad\n", "feat: break gate (#2)")
@@ -461,7 +458,7 @@ def test_run_batch_factory_skips_downstream_dependent_of_failed_parent(tmp_path)
     gh = MagicMock()
     gh.ensure_draft_pr.return_value = {"number": 60, "url": "https://github.com/o/r/pull/60"}
 
-    def fake_agent(repo_root, factory_dir, agent_name, stage, model, prompt, **kwargs):
+    def fake_agent(factory_dir, job_dir, wt, stage, agent_name, model, prompt, schema, timeout_sec, **kwargs):
         if stage == "batch_plan":
             return (
                 {
@@ -476,7 +473,6 @@ def test_run_batch_factory_skips_downstream_dependent_of_failed_parent(tmp_path)
                 {"total_tokens": 100},
                 1.0,
             )
-        wt = kwargs["worktree"]
         if stage == "batch_build":
             if "[#1" in prompt:
                 s1 = _git_commit_file(wt, "a.py", "1\n", "feat: one (#1)")
@@ -510,3 +506,48 @@ def test_run_batch_factory_skips_downstream_dependent_of_failed_parent(tmp_path)
     assert by_id["job-2"]["stage"] == "needs-human"
     assert by_id["job-3"]["stage"] == "needs-human"
     assert by_id["job-4"]["stage"] == "merged"
+
+
+def test_run_factory_uses_batch_by_default_and_respects_no_batch_and_max_batch(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+    from factory import cli
+    from factory.lib import pipeline
+
+    _, repo = _init_temp_git_repo(tmp_path)
+    fake_gh = MagicMock()
+    fake_gh.list_queue_issues.return_value = [
+        {"number": 1, "title": "One", "body": "", "url": "https://x/1"},
+        {"number": 2, "title": "Two", "body": "", "url": "https://x/2"},
+    ]
+    monkeypatch.setattr(pipeline, "GitHubClient", lambda r: fake_gh)
+    monkeypatch.setattr(pipeline.ProjectBoardSync, "discover", lambda r: None)
+
+    batch_calls = []
+    legacy_calls = []
+
+    def fake_batch_factory(repo_root, issues, *, config, gh, board=None, state_store=None):
+        batch_calls.append((len(issues), config["batch"]["max_batch_issues"]))
+        return [{"id": f"job-{iss['number']}", "issue": iss["number"], "stage": "merged"} for iss in issues]
+
+    def fake_process_job(repo_root, issue_num, **kwargs):
+        legacy_calls.append(issue_num)
+        return {"id": f"job-{issue_num}", "issue": issue_num, "stage": "merged"}
+
+    monkeypatch.setattr(pipeline, "run_batch_factory", fake_batch_factory)
+    monkeypatch.setattr(pipeline, "process_job", fake_process_job)
+
+    # Default -> batch mode
+    res = pipeline.run_factory(str(repo))
+    assert len(res) == 2
+    assert batch_calls == [(2, 5)]
+    assert legacy_calls == []
+
+    # CLI --max-batch 2
+    rc = cli.main(["run", "--repo", str(repo), "--max-batch", "2"])
+    assert rc == 0
+    assert batch_calls[-1] == (2, 2)
+
+    # CLI --no-batch -> legacy process_job
+    rc2 = cli.main(["run", "--repo", str(repo), "--no-batch"])
+    assert rc2 == 0
+    assert sorted(legacy_calls) == [1, 2]

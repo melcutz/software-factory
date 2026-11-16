@@ -550,7 +550,7 @@ def test_run_factory_spawns_hc_terminals(tmp_path, monkeypatch):
         lambda self, cfg: [{"number": 71, "title": "Queued", "url": "https://x/71", "body": ""}],
     )
     monkeypatch.setattr("factory.lib.pipeline._plan_queue_batch", lambda *a, **kw: ({71: []}, {}))
-    out_jobs = run_factory(str(repo))
+    out_jobs = run_factory(str(repo), batch_mode=False)
     assert len(out_jobs) == 1
     spawn_lines = hc_log.read_text(encoding="utf-8").splitlines()
     assert any("run --bg" in ln and "_exec-job" in ln and "71" in ln for ln in spawn_lines)

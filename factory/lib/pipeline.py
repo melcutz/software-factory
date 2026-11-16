@@ -17,6 +17,7 @@ from datetime import datetime
 
 import factory.lib.governor as _governor
 from factory.lib.agy_runner import AgentExecutionError, QuotaExhaustedError, resolve_agent_path, run_agent
+from factory.lib.batch import run_batch_factory
 
 _ORIG_RUN_AGENT = run_agent
 from factory.lib.config import (
@@ -3371,14 +3372,19 @@ def run_factory(
     repo_root: str,
     issue_number: int | None = None,
     issue_numbers: list[int] | None = None,
+    *,
+    batch_mode: bool | None = None,
+    max_batch_issues: int | None = None,
 ) -> list[dict]:
-    """Process specific issue(s) or drain all eligible queued issues using a dependency DAG."""
+    """Process specific issue(s) or drain all eligible queued issues using Smart Batch Mode (default) or legacy DAG."""
     repo_root = os.path.abspath(repo_root)
     factory_dir = os.path.join(repo_root, "factory")
     jobs_dir = os.path.join(factory_dir, "jobs")
     os.makedirs(jobs_dir, exist_ok=True)
     pid_path = os.path.join(jobs_dir, ".factory.pid")
     cfg = load_config(factory_dir)
+    if max_batch_issues is not None:
+        cfg.setdefault("batch", {})["max_batch_issues"] = max(1, int(max_batch_issues))
     gh = GitHubClient(repo_root)
     board = ProjectBoardSync.discover(repo_root)
 
@@ -3392,7 +3398,45 @@ def run_factory(
     state_store: GitStateStore | None = None
     if _has_origin_remote(repo_root):
         state_store = GitStateStore(repo_root, _default_machine_id())
+    use_batch = bool((cfg.get("batch") or {}).get("enabled", True)) if batch_mode is None else bool(batch_mode)
     try:
+        if use_batch:
+            if not explicit_nums:
+                reconcile_ready_jobs(repo_root, cfg, gh, state_store=state_store)
+            issues_to_run = (
+                [gh.fetch_issue(num)[0] for num in explicit_nums]
+                if explicit_nums
+                else gh.list_queue_issues(cfg)
+            )
+            midflight_nums: list[int] = []
+            fresh_issues: list[dict] = []
+            for iss in issues_to_run:
+                inum = int(iss["number"])
+                try:
+                    existing = load_job(jobs_dir, f"job-{inum}")
+                    if existing.get("stage") not in {"queued"}:
+                        midflight_nums.append(inum)
+                        continue
+                except FileNotFoundError:
+                    pass
+                fresh_issues.append(iss)
+
+            batch_results: list[dict] = []
+            for mnum in midflight_nums:
+                batch_results.append(process_job(repo_root, mnum, config=cfg, gh=gh, board=board))
+            if fresh_issues:
+                batch_results.extend(
+                    run_batch_factory(
+                        repo_root,
+                        fresh_issues,
+                        config=cfg,
+                        gh=gh,
+                        board=board,
+                        state_store=state_store,
+                    )
+                )
+            return batch_results
+
         if len(explicit_nums) == 1:
             num = explicit_nums[0]
             job_id = f"job-{num}"
