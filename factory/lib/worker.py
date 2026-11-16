@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from factory.lib.config import load_config
 from factory.lib.git_ops import GitHubClient
 from factory.lib.git_state import SKEW_MARGIN_SEC, TERMINAL_STAGES, GitStateStore
+import factory.lib.governor as _governor
 from factory.lib.herdr_bridge import HerdrBridge
 from factory.lib.pipeline import (
     _plan_queue_batch,
@@ -22,6 +23,9 @@ from factory.lib.pipeline import (
     process_job,
     run_doctor,
 )
+
+probe_host_resources = _governor.probe_host_resources
+_ORIG_PROBE_HOST_RESOURCES = _governor.probe_host_resources
 
 
 def host_config_dir() -> str:
@@ -97,9 +101,49 @@ def _is_lease_expired(lease: dict, workers: dict[str, dict], now_ts: float) -> b
     owner = lease.get("worker_id")
     if not owner:
         return True
+    lease_exp = lease.get("expires_at_ts")
+    if lease_exp is not None and now_ts > (float(lease_exp) + SKEW_MARGIN_SEC):
+        return True
     w = workers.get(owner)
-    exp = float((w or {}).get("expires_at_ts") or lease.get("expires_at_ts") or 0.0)
+    exp = float((w or {}).get("expires_at_ts") or lease_exp or 0.0)
     return now_ts > (exp + SKEW_MARGIN_SEC)
+
+
+def _is_active_leased_job(job: dict, workers: dict[str, dict], now_ts: float) -> bool:
+    stage = str(job.get("stage") or "")
+    if stage in TERMINAL_STAGES or stage in {"needs-human", "needs-info"}:
+        return False
+    lease = job.get("lease")
+    if not isinstance(lease, dict) or not lease.get("worker_id"):
+        return False
+    return not _is_lease_expired(lease, workers, now_ts)
+
+
+def _job_key(repo: str, job: dict) -> tuple[str, str]:
+    if job.get("issue") is not None:
+        return (repo, f"job-{int(job['issue'])}")
+    return (repo, str(job.get("id") or ""))
+
+
+def _collect_active_local_jobs(
+    machine_id: str,
+    stores: dict[str, GitStateStore],
+    active_threads: list[tuple[str, int, threading.Thread]],
+    *,
+    now_ts: float | None = None,
+) -> set[tuple[str, str]]:
+    ts = time.time() if now_ts is None else now_ts
+    active: set[tuple[str, str]] = {(r, f"job-{i}") for (r, i, t) in active_threads if t.is_alive()}
+    for repo, store in stores.items():
+        try:
+            remote_jobs = store.list_remote_jobs()
+            workers = store.list_worker_heartbeats()
+        except Exception:
+            continue
+        for j in remote_jobs:
+            if _is_active_leased_job(j, workers, ts) and (j.get("lease") or {}).get("worker_id") == machine_id:
+                active.add(_job_key(repo, j))
+    return active
 
 
 def select_next_candidate(
@@ -130,10 +174,11 @@ def select_next_candidate(
             else:
                 tier2.append(j)
         elif isinstance(lease, dict):
-            if lease.get("worker_id") == machine_id:
-                tier1.append(j)
-            elif _is_lease_expired(lease, workers, ts):
-                tier2.append(j)
+            if _is_lease_expired(lease, workers, ts):
+                if lease.get("worker_id") == machine_id:
+                    tier1.append(j)
+                else:
+                    tier2.append(j)
 
     if tier1:
         job = sorted(tier1, key=lambda x: int(x.get("issue") or 0))[0]
@@ -217,21 +262,38 @@ def run_worker(
         signal.signal(signal.SIGINT, _handle_sig)
         signal.signal(signal.SIGTERM, _handle_sig)
 
-    last_hb = 0.0
-    last_prune = 0.0
+    def _write_heartbeats(active_count: int) -> None:
+        probe_fn = (
+            probe_host_resources
+            if probe_host_resources is not _ORIG_PROBE_HOST_RESOURCES
+            else _governor.probe_host_resources
+        )
+        res = probe_fn()
+        paused = is_host_paused()
+        for store in stores.values():
+            try:
+                store.write_worker_heartbeat(
+                    active_count,
+                    host_cfg.max_workers,
+                    paused,
+                    cpu_load_pct=res.cpu_load_pct,
+                    free_ram_gb=res.free_ram_gb,
+                )
+            except Exception:
+                pass
+
+    last_hb: float | None = None
+    last_prune: float | None = None
     while not stop_event.is_set():
         active_threads = [(r, i, t) for (r, i, t) in active_threads if t.is_alive()]
+        active_local_jobs = _collect_active_local_jobs(host_cfg.machine_id, stores, active_threads)
         now = time.monotonic()
 
-        if now - last_hb >= 120.0:
-            for store in stores.values():
-                try:
-                    store.write_worker_heartbeat(len(active_threads), host_cfg.max_workers, is_host_paused())
-                except Exception:
-                    pass
+        if last_hb is None or now - last_hb >= 120.0:
+            _write_heartbeats(len(active_local_jobs))
             last_hb = now
 
-        if now - last_prune >= 86400.0:
+        if last_prune is None or now - last_prune >= 86400.0:
             for store in stores.values():
                 try:
                     store.prune_stale_refs()
@@ -253,8 +315,8 @@ def run_worker(
         except ImportError:
             admitted = True
 
-        if not admitted or len(active_threads) >= host_cfg.max_workers or not pacer.can_claim():
-            bridge.emit_status("working" if active_threads else "idle")
+        if not admitted or len(active_local_jobs) >= host_cfg.max_workers or not pacer.can_claim():
+            bridge.emit_status("working" if active_local_jobs else "idle")
             if once:
                 break
             stop_event.wait(5.0)
@@ -262,7 +324,7 @@ def run_worker(
 
         claimed_any = False
         for repo in healthy_repos:
-            if len(active_threads) >= host_cfg.max_workers or not pacer.can_claim():
+            if len(active_local_jobs) >= host_cfg.max_workers or not pacer.can_claim():
                 break
             store = stores[repo]
             if store.get_control_state().get("halted"):
@@ -274,16 +336,38 @@ def run_worker(
                 from factory.lib.governor import is_model_in_cooldown
 
                 quota_state = store.get_quota_state()
-                intake_model, _ = split_model_and_effort((cfg.get("models") or {}).get("intake", ""))
-                in_cd, _ = is_model_in_cooldown(quota_state, intake_model) if intake_model else (False, 0.0)
+                models_cfg = cfg.get("models") or {}
+                in_cd = False
+                for role in ("intake", "spec_writer", "builder"):
+                    raw_spec = str(models_cfg.get(role) or "").strip()
+                    if not raw_spec:
+                        continue
+                    base_model = split_model_and_effort(raw_spec)[0].split(":", 1)[0].split()[0]
+                    if base_model and is_model_in_cooldown(quota_state, base_model)[0]:
+                        in_cd = True
+                        break
                 if in_cd:
                     continue
             except Exception:
                 pass
-            gh = GitHubClient(repo)
-            issues = gh.list_queue_issues(cfg)
+
             remote_jobs = store.list_remote_jobs()
             workers = store.list_worker_heartbeats()
+            now_ts = time.time()
+            for j in remote_jobs:
+                if _is_active_leased_job(j, workers, now_ts) and (j.get("lease") or {}).get("worker_id") == host_cfg.machine_id:
+                    active_local_jobs.add(_job_key(repo, j))
+            if len(active_local_jobs) >= host_cfg.max_workers:
+                break
+
+            active_repo_leases = sum(
+                1 for j in remote_jobs if _is_active_leased_job(j, workers, now_ts)
+            )
+            if active_repo_leases >= int(cfg["concurrency"]):
+                continue
+
+            gh = GitHubClient(repo)
+            issues = gh.list_queue_issues(cfg)
 
             done_issues = {int(j["issue"]) for j in remote_jobs if j.get("stage") == "merged" and j.get("issue")}
             order_deps, hard_deps = _plan_queue_batch(
@@ -306,7 +390,7 @@ def run_worker(
                 )
             ]
 
-            cand = select_next_candidate(host_cfg.machine_id, remote_jobs, ready, workers)
+            cand = select_next_candidate(host_cfg.machine_id, remote_jobs, ready, workers, now_ts=now_ts)
             if not cand:
                 continue
 
@@ -321,6 +405,7 @@ def run_worker(
             if not ok:
                 continue
 
+            active_local_jobs.add((repo, job_id))
             pacer.record_claim()
             claimed_any = True
             bridge.emit_status("working")
@@ -338,18 +423,22 @@ def run_worker(
             t.start()
             active_threads.append((repo, issue_num, t))
 
-        if not claimed_any:
-            bridge.emit_status("working" if active_threads else "idle")
+        if claimed_any:
+            _write_heartbeats(len(active_local_jobs))
+            last_hb = time.monotonic()
+        else:
+            bridge.emit_status("working" if active_local_jobs else "idle")
         if once:
             for _, _, t in active_threads:
                 t.join()
             break
         stop_event.wait(host_cfg.poll_interval_sec)
 
-    for store in stores.values():
-        try:
-            store.delete_worker_heartbeat()
-        except Exception:
-            pass
+    if not once:
+        for store in stores.values():
+            try:
+                store.delete_worker_heartbeat()
+            except Exception:
+                pass
     bridge.emit_status("idle")
     return 0

@@ -12,6 +12,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from factory.lib.git_ops import _run_git, repo_lock
+import factory.lib.governor as _governor
+
+probe_host_resources = _governor.probe_host_resources
+_ORIG_PROBE_HOST_RESOURCES = _governor.probe_host_resources
 
 ZERO_SHA = "0" * 40
 WORKER_TTL_SEC = 360
@@ -227,6 +231,17 @@ class GitStateStore:
         free_ram_gb: float | None = None,
     ) -> str:
         ts = time.time() if now_ts is None else now_ts
+        if cpu_load_pct is None or free_ram_gb is None:
+            probe_fn = (
+                probe_host_resources
+                if probe_host_resources is not _ORIG_PROBE_HOST_RESOURCES
+                else _governor.probe_host_resources
+            )
+            res = probe_fn()
+            if cpu_load_pct is None:
+                cpu_load_pct = res.cpu_load_pct
+            if free_ram_gb is None:
+                free_ram_gb = res.free_ram_gb
         payload = {
             "worker_id": self.machine_id,
             "hostname": self.hostname,
@@ -303,13 +318,16 @@ class GitStateStore:
                     owner_id = lease["worker_id"]
                     workers = self.list_worker_heartbeats()
                     owner = workers.get(owner_id)
-                    if owner is not None:
+                    lease_exp = lease.get("expires_at_ts")
+                    if lease_exp is not None and ts > float(lease_exp) + SKEW_MARGIN_SEC:
+                        pass
+                    elif owner is not None:
                         expires_at = float(owner.get("expires_at_ts") or 0.0)
                         if ts <= expires_at + SKEW_MARGIN_SEC:
                             return False, None
                     else:
-                        lease_exp = float(lease.get("expires_at_ts") or 0.0)
-                        if lease_exp > 0 and ts <= lease_exp + SKEW_MARGIN_SEC:
+                        lease_exp_f = float(lease_exp or 0.0)
+                        if lease_exp_f > 0 and ts <= lease_exp_f + SKEW_MARGIN_SEC:
                             return False, None
 
                 prev_token = int(

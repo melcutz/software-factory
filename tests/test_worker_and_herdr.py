@@ -64,6 +64,15 @@ def test_select_next_candidate_tiers_and_deterministic_spread():
     cand = select_next_candidate("m1", remote_jobs, ready_issues, workers, now_ts=now)
     assert cand == ("resume", 10, remote_jobs[0])
 
+    # Active local lease (job-12) must NOT be re-claimed as Tier 1 when job-10 is absent
+    cand_active = select_next_candidate("m1", [remote_jobs[1], remote_jobs[2]], ready_issues, workers, now_ts=now)
+    assert cand_active == ("resume", 11, remote_jobs[1])
+
+    # Expired lease owned by m1 IS placed into Tier 1 even when m1 has a live worker heartbeat
+    expired_own = {"id": "job-13", "issue": 13, "stage": "build", "lease": {"worker_id": "m1", "expires_at_ts": now - 500}}
+    cand_expired_own = select_next_candidate("m1", [remote_jobs[1], expired_own], ready_issues, workers, now_ts=now)
+    assert cand_expired_own == ("resume", 13, expired_own)
+
     # Tier 2: peer orphaned job wins over Tier 3 when m2 has no Tier 1 job
     cand2 = select_next_candidate("m2", remote_jobs, ready_issues, workers, now_ts=now)
     assert cand2 == ("resume", 11, remote_jobs[1])
@@ -207,4 +216,215 @@ def test_fleet_remove_calls_hc_machine_rm(tmp_path, monkeypatch):
     assert cli.main(["fleet", "remove", "lenovo"]) == 0
     lines = log_file.read_text().splitlines()
     assert "machine rm lenovo" in lines
+
+
+def _init_repo_with_origin(tmp_path, name="repo", concurrency=4):
+    import json
+    import subprocess
+
+    bare = tmp_path / f"{name}-origin.git"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    seed = tmp_path / f"{name}-seed"
+    subprocess.run(["git", "clone", str(bare), str(seed)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.email", "t@e.com"], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.name", "T"], check=True)
+    (seed / "README.md").write_text("hi\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-m", "init"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "origin", "HEAD:main"], check=True)
+
+    repo = tmp_path / name
+    subprocess.run(["git", "clone", str(bare), str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "W"], check=True)
+    (repo / "factory").mkdir()
+    (repo / "factory" / "config.json").write_text(
+        json.dumps({"base_branch": "main", "concurrency": concurrency}),
+        encoding="utf-8",
+    )
+    return repo
+
+
+def test_write_worker_heartbeat_persists_probed_resources(tmp_path, monkeypatch):
+    from factory.lib.git_state import GitStateStore
+    from factory.lib.governor import HostResources
+
+    repo = _init_repo_with_origin(tmp_path, "hb-repo")
+    monkeypatch.setattr(
+        "factory.lib.governor.probe_host_resources",
+        lambda: HostResources(free_ram_gb=11.25, cpu_load_pct=37.5),
+    )
+    store = GitStateStore(str(repo), "m1")
+    store.write_worker_heartbeat(2, 4, False, now_ts=1_700_000_000.0)
+    hb = store.list_worker_heartbeats()["m1"]
+    assert hb["active_jobs"] == 2
+    assert hb["max_workers"] == 4
+    assert hb["cpu_load_pct"] == 37.5
+    assert hb["free_ram_gb"] == 11.25
+
+
+def test_run_worker_hc_slot_accounting_and_max_workers(tmp_path, monkeypatch):
+    import json
+    import time
+
+    from factory.lib.git_state import GitStateStore
+    from factory.lib.governor import HostResources
+    from factory.lib.worker import run_worker
+
+    repo = _init_repo_with_origin(tmp_path, "slot-repo", concurrency=4)
+    host_dir = tmp_path / "host_cfg"
+    host_dir.mkdir()
+    (host_dir / "host.json").write_text(
+        json.dumps({"machine_id": "m1", "max_workers": 2, "ramp_up_delay_sec": 0.0}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FACTORY_HOST_DIR", str(host_dir))
+
+    hc_log = tmp_path / "hc_spawn.log"
+    fake_hc = tmp_path / "hc"
+    fake_hc.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        f"with open({str(hc_log)!r}, 'a') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1:2] == ['run']:\n"
+        "    print('t42')\n",
+        encoding="utf-8",
+    )
+    fake_hc.chmod(0o755)
+    monkeypatch.setenv("HC_TERMINAL_ID", "t1")
+    monkeypatch.setenv("HC_BIN_PATH", str(fake_hc))
+
+    monkeypatch.setattr("factory.lib.worker.run_doctor", lambda _r: (True, ["ok"]))
+    monkeypatch.setattr(
+        "factory.lib.governor.probe_host_resources",
+        lambda: HostResources(free_ram_gb=8.5, cpu_load_pct=22.0),
+    )
+    monkeypatch.setattr("factory.lib.worker._plan_queue_batch", lambda *a, **kw: ({}, {}))
+    monkeypatch.setattr(
+        "factory.lib.worker.GitHubClient.list_queue_issues",
+        lambda self, cfg: [{"number": 30, "title": "New issue", "body": ""}],
+    )
+
+    store = GitStateStore(str(repo), "m1")
+    now = time.time()
+    # 2 active leases owned by m1 + 1 expired lease + 1 terminal (merged) + 1 paused (needs-human)
+    jdir = str(tmp_path / "empty_jdir")
+    store.checkpoint_job(
+        "job-10",
+        jdir,
+        {"id": "job-10", "issue": 10, "stage": "build", "lease": {"worker_id": "m1", "fencing_token": 1, "expires_at_ts": now + 300}},
+    )
+    store.checkpoint_job(
+        "job-11",
+        jdir,
+        {"id": "job-11", "issue": 11, "stage": "spec", "lease": {"worker_id": "m1", "fencing_token": 1, "expires_at_ts": now + 300}},
+    )
+    store.checkpoint_job(
+        "job-12",
+        jdir,
+        {"id": "job-12", "issue": 12, "stage": "build", "lease": {"worker_id": "m1", "fencing_token": 1, "expires_at_ts": now - 500}},
+    )
+    store.checkpoint_job(
+        "job-13",
+        jdir,
+        {"id": "job-13", "issue": 13, "stage": "merged", "lease": {"worker_id": "m1", "fencing_token": 1, "expires_at_ts": now + 300}},
+    )
+    store.checkpoint_job(
+        "job-14",
+        jdir,
+        {"id": "job-14", "issue": 14, "stage": "needs-human", "lease": {"worker_id": "m1", "fencing_token": 1, "expires_at_ts": now + 300}},
+    )
+
+    # At max_workers=2 with 2 active hc leases (job-10, job-11), worker must not claim or spawn
+    assert run_worker([str(repo)], once=True) == 0
+    assert not hc_log.exists()
+    hb = store.list_worker_heartbeats()["m1"]
+    assert hb["active_jobs"] == 2
+    assert hb["cpu_load_pct"] == 22.0
+    assert hb["free_ram_gb"] == 8.5
+
+    # Mark job-11 as merged -> now only 1 active local lease (job-10); even across 2 repos, max_workers=2 allows only 1 claim
+    repo2 = _init_repo_with_origin(tmp_path, "slot-repo-2", concurrency=4)
+    store.checkpoint_job(
+        "job-11",
+        jdir,
+        {"id": "job-11", "issue": 11, "stage": "merged", "lease": None},
+    )
+    assert run_worker([str(repo), str(repo2)], once=True) == 0
+    spawned = hc_log.read_text(encoding="utf-8").splitlines()
+    assert len(spawned) == 1
+    assert "-- _exec-job" in spawned[0] or "_exec-job" in spawned[0]
+    hb2 = store.list_worker_heartbeats()["m1"]
+    assert hb2["active_jobs"] == 2
+
+
+def test_run_worker_enforces_repo_concurrency_cap(tmp_path, monkeypatch):
+    import json
+    import time
+
+    from factory.lib.git_state import GitStateStore
+    from factory.lib.governor import HostResources
+    from factory.lib.worker import run_worker
+
+    repo = _init_repo_with_origin(tmp_path, "conc-repo", concurrency=2)
+    host_dir = tmp_path / "host_cfg_conc"
+    host_dir.mkdir()
+    (host_dir / "host.json").write_text(
+        json.dumps({"machine_id": "m1", "max_workers": 4, "ramp_up_delay_sec": 0.0}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FACTORY_HOST_DIR", str(host_dir))
+
+    hc_log = tmp_path / "hc_conc.log"
+    fake_hc = tmp_path / "hc"
+    fake_hc.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        f"with open({str(hc_log)!r}, 'a') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1:2] == ['run']:\n"
+        "    print('t55')\n",
+        encoding="utf-8",
+    )
+    fake_hc.chmod(0o755)
+    monkeypatch.setenv("HC_TERMINAL_ID", "t1")
+    monkeypatch.setenv("HC_BIN_PATH", str(fake_hc))
+
+    monkeypatch.setattr("factory.lib.worker.run_doctor", lambda _r: (True, ["ok"]))
+    monkeypatch.setattr(
+        "factory.lib.governor.probe_host_resources",
+        lambda: HostResources(free_ram_gb=8.0, cpu_load_pct=15.0),
+    )
+    monkeypatch.setattr("factory.lib.worker._plan_queue_batch", lambda *a, **kw: ({}, {}))
+    monkeypatch.setattr(
+        "factory.lib.worker.GitHubClient.list_queue_issues",
+        lambda self, cfg: [{"number": 40, "title": "Issue 40", "body": ""}],
+    )
+
+    now = time.time()
+    peer_a = GitStateStore(str(repo), "peer-a")
+    peer_b = GitStateStore(str(repo), "peer-b")
+    peer_a.write_worker_heartbeat(1, 2, False, now_ts=now)
+    peer_b.write_worker_heartbeat(1, 2, False, now_ts=now)
+    peer_a.claim_job_lease("job-20", {"id": "job-20", "issue": 20, "stage": "build"}, now_ts=now)
+    peer_b.claim_job_lease("job-21", {"id": "job-21", "issue": 21, "stage": "build"}, now_ts=now)
+
+    # Repo has 2 active non-expired leases == concurrency (2) -> m1 must not claim issue 40
+    assert run_worker([str(repo)], once=True) == 0
+    assert not hc_log.exists()
+
+    # Expire job-21 and mark job-20 as terminal merged -> active leases drop to 0 < 2 -> m1 claims
+    jdir = str(tmp_path / "empty_conc_jdir")
+    peer_a.checkpoint_job("job-20", jdir, {"id": "job-20", "issue": 20, "stage": "merged"}, release_lease=True)
+    peer_b.checkpoint_job(
+        "job-21",
+        jdir,
+        {"id": "job-21", "issue": 21, "stage": "build", "lease": {"worker_id": "peer-b", "fencing_token": 1, "expires_at_ts": now - 500}},
+    )
+    assert run_worker([str(repo)], once=True) == 0
+    assert hc_log.exists()
+    spawned = hc_log.read_text(encoding="utf-8").splitlines()
+    assert len(spawned) == 1
+
 
