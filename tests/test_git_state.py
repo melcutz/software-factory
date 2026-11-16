@@ -125,7 +125,8 @@ def test_staging_lock_control_quota_and_prune(tmp_path):
     assert "gemini-4-argon" not in s0.get_quota_state()["models"]
 
 
-def test_halt_and_resume_preserves_checkpoint_without_needs_human(tmp_path):
+def test_halt_and_resume_preserves_checkpoint_without_needs_human(tmp_path, monkeypatch):
+    monkeypatch.setenv("FACTORY_HOST_DIR", str(tmp_path / "host_cfg"))
     _, clones = _init_bare_and_clones(tmp_path, n=1)
     s0 = GitStateStore(clones[0], "m0")
     s0.write_worker_heartbeat(1, 2, False)
