@@ -425,10 +425,16 @@ class PipelineE2ETests(unittest.TestCase):
         subprocess.run(["git", "init", "--bare", "-b", "main", self.origin], check=True, capture_output=True)
         subprocess.run(["git", "clone", self.origin, self.repo], check=True, capture_output=True)
 
-        # Copy template files into test repo
+        # Copy template files into test repo (normalized to external target-repo defaults)
         ws_root = os.path.abspath(".")
         shutil.copytree(os.path.join(ws_root, "factory", "agents"), os.path.join(self.repo, "factory", "agents"))
-        shutil.copy(os.path.join(ws_root, "factory", "config.json"), os.path.join(self.repo, "factory", "config.json"))
+        with open(os.path.join(ws_root, "factory", "config.json"), encoding="utf-8") as cfg_f:
+            tmpl_cfg = json.load(cfg_f)
+        tmpl_cfg["allow_self_host"] = False
+        tmpl_cfg["auto_merge"] = "low"
+        tmpl_cfg["protected_paths"] = ["factory/", ".agents/", ".github/"]
+        with open(os.path.join(self.repo, "factory", "config.json"), "w", encoding="utf-8") as cfg_out:
+            json.dump(tmpl_cfg, cfg_out, indent=2)
         shutil.copy(os.path.join(ws_root, ".gitignore"), os.path.join(self.repo, ".gitignore"))
         os.makedirs(os.path.join(self.repo, "factory", "jobs"), exist_ok=True)
         open(os.path.join(self.repo, "factory", "jobs", ".gitkeep"), "w").close()

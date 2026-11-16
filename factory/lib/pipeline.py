@@ -450,7 +450,12 @@ def _sync_pr_with_base(
 
     if head_changed or force_full_gate:
         if cfg.get("auto_polish", True):
-            if auto_polish_worktree(worktree, base_branch, cfg.get("protected_paths", [])):
+            if auto_polish_worktree(
+                worktree,
+                base_branch,
+                cfg.get("protected_paths", []),
+                allow_self_host=bool(cfg.get("allow_self_host", False)),
+            ):
                 _log(job_id, "auto-polished formatting/assets after base sync")
         if force_full_gate:
             pre_merge_scope = "full"
@@ -1858,7 +1863,12 @@ def process_job(
                                 continue
 
                             if cfg.get("auto_polish", True):
-                                if auto_polish_worktree(worktree, base_branch, cfg.get("protected_paths", [])):
+                                if auto_polish_worktree(
+                worktree,
+                base_branch,
+                cfg.get("protected_paths", []),
+                allow_self_host=bool(cfg.get("allow_self_host", False)),
+            ):
                                     _log(job_id, f"build slice={slice_num}/{total_slices} auto-polished formatting/assets")
 
                             gate_scope = "slice" if slice_num < total_slices else "full"
@@ -2002,7 +2012,12 @@ def process_job(
                             passed, checks_md = True, existing_checks
                             break
                         if cfg.get("auto_polish", True):
-                            if auto_polish_worktree(worktree, base_branch, cfg.get("protected_paths", [])):
+                            if auto_polish_worktree(
+                worktree,
+                base_branch,
+                cfg.get("protected_paths", []),
+                allow_self_host=bool(cfg.get("allow_self_host", False)),
+            ):
                                 _log(job_id, "gate auto-polished formatting/assets before checks.sh")
                         _set_activity(jobs_dir, job_id, f"running:gate-{attempt + 1}")
                         _log(job_id, f"gate scope=full running checks.sh (attempt={attempt + 1})")

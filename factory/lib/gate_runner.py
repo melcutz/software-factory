@@ -26,6 +26,13 @@ HARDCODED_PROTECTED: tuple[str, ...] = (
     ".agents/",
 )
 
+SELF_HOST_HARDCODED_PROTECTED: tuple[str, ...] = (
+    "factory/checks.sh",
+    "factory/config.json",
+    ".agents/",
+    ".github/",
+)
+
 MAX_CHECKS_MD_LINES = 120
 
 _FULL_GATE_LOCK = threading.Lock()
@@ -126,8 +133,14 @@ def _matches_pattern(relpath: str, pattern: str) -> bool:
     return relpath == pat or relpath.startswith(pat + "/")
 
 
-def find_protected_violations(changed_files: list[str], configured_patterns: list[str]) -> list[str]:
-    patterns = list(HARDCODED_PROTECTED) + list(configured_patterns or [])
+def find_protected_violations(
+    changed_files: list[str],
+    configured_patterns: list[str],
+    *,
+    allow_self_host: bool = False,
+) -> list[str]:
+    base_protected = SELF_HOST_HARDCODED_PROTECTED if allow_self_host else HARDCODED_PROTECTED
+    patterns = list(base_protected) + list(configured_patterns or [])
     violations: list[str] = []
     for raw in changed_files:
         norm = _normalize_relpath(raw)
@@ -173,6 +186,8 @@ def auto_polish_worktree(
     worktree: str,
     base_branch: str,
     protected_paths: list[str] | None = None,
+    *,
+    allow_self_host: bool = False,
 ) -> bool:
     """Deterministically format changed Python files and rebuild stale Tailwind CSS before gate."""
     if not is_worktree_clean(worktree):
@@ -187,7 +202,7 @@ def auto_polish_worktree(
         for p in changed
         if p.endswith(".py")
         and not p.startswith("vendor/")
-        and not find_protected_violations([p], prot)
+        and not find_protected_violations([p], prot, allow_self_host=allow_self_host)
         and os.path.isfile(os.path.join(worktree, p))
     ]
 
@@ -259,7 +274,7 @@ def auto_polish_worktree(
         _run_git(worktree, "add", "-A")
         staged_raw = _run_git(worktree, "diff", "--cached", "-z", "--name-only").stdout
         staged = [s for s in staged_raw.split("\0") if s]
-        if not staged or find_protected_violations(staged, prot):
+        if not staged or find_protected_violations(staged, prot, allow_self_host=allow_self_host):
             reset_worktree_clean(worktree)
             return False
 
@@ -290,7 +305,11 @@ def run_gate(
 
     base_branch = config.get("base_branch", "main")
     changed = changed_files_against_base(worktree, base_branch)
-    violations = find_protected_violations(changed, config.get("protected_paths", []))
+    violations = find_protected_violations(
+        changed,
+        config.get("protected_paths", []),
+        allow_self_host=bool(config.get("allow_self_host", False)),
+    )
 
     if violations:
         msg = "Protected path violation(s) detected on branch:\n" + "\n".join(f"- {v}" for v in violations) + "\n"

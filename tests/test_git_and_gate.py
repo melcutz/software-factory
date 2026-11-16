@@ -260,6 +260,53 @@ class GitAndGateTests(unittest.TestCase):
             self.assertTrue(passed)
             self.assertIn("SCOPE=slice BASE=main", md)
 
+    def test_allow_self_host_unlocks_factory_lib_while_protecting_checks_and_config(self):
+        self.assertEqual(
+            find_protected_violations(["factory/lib/worker.py", "factory/cli.py"], []),
+            ["factory/lib/worker.py"],
+        )
+        self.assertEqual(
+            find_protected_violations(
+                ["factory/lib/worker.py", "factory/cli.py", "factory/bin/factory"],
+                ["factory/checks.sh", "factory/config.json", ".agents/", ".github/"],
+                allow_self_host=True,
+            ),
+            [],
+        )
+        self.assertEqual(
+            find_protected_violations(
+                ["factory/checks.sh", "factory/config.json", ".agents/skills/x.md", ".github/workflows/ci.yml"],
+                [],
+                allow_self_host=True,
+            ),
+            [
+                ".agents/skills/x.md",
+                ".github/workflows/ci.yml",
+                "factory/checks.sh",
+                "factory/config.json",
+            ],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            _, clone = self._init_origin_and_clone(tmp)
+            wt, _ = ensure_worktree(clone, "job-26", "main")
+            os.makedirs(os.path.join(wt, "factory", "lib"), exist_ok=True)
+            with open(os.path.join(wt, "factory", "lib", "mod.py"), "w", encoding="utf-8") as f:
+                f.write("x = 1\n")
+            subprocess.run(["git", "-C", wt, "add", "factory/lib/mod.py"], check=True)
+            subprocess.run(["git", "-C", wt, "commit", "-m", "self host edit"], check=True, capture_output=True)
+            cfg_locked = {"base_branch": "main", "protected_paths": ["factory/"], "gate_timeout_sec": 30}
+            passed_locked, _ = run_gate(clone, "job-26", wt, 1, cfg_locked)
+            self.assertFalse(passed_locked)
+
+            cfg_self = {
+                "base_branch": "main",
+                "allow_self_host": True,
+                "protected_paths": ["factory/checks.sh", "factory/config.json", ".agents/", ".github/"],
+                "gate_timeout_sec": 30,
+            }
+            passed_self, md_self = run_gate(clone, "job-26", wt, 1, cfg_self)
+            self.assertTrue(passed_self, md_self)
+
 
 if __name__ == "__main__":
     unittest.main()

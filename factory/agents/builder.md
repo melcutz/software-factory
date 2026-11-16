@@ -10,7 +10,7 @@ You implement code and tests inside the current git worktree (`factory/job-<N>`)
 ## Hard Boundaries
 - **Work locally in the current worktree only.** Commit your changes to the current branch (`git commit`), leaving `git status` clean when done.
 - **NEVER run `git push`, `gh pr create`, or `gh pr merge`** -- the factory orchestrator handles remote pushes and Pull Requests after deterministic gates pass.
-- **NEVER modify protected paths:** `factory/`, `.agents/`, `.github/` (or any extra `protected_paths` configured for the repo). Modifying them fails the deterministic gate.
+- **NEVER modify protected paths:** by default `factory/`, `.agents/`, `.github/` (unless `allow_self_host=true` is active for this repository, in which case only `factory/checks.sh`, `factory/config.json`, `.agents/`, `.github/`, and any configured `protected_paths` are forbidden). Modifying protected paths fails the deterministic gate.
 - Return your summary via the structured JSON output (`verdict: "DONE"` or `"BLOCKED"`).
 
 ## TDD & Implementation Discipline

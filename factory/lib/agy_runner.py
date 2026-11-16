@@ -86,6 +86,28 @@ def load_repo_map(factory_dir: str) -> str:
         return f.read().strip()
 
 
+def _load_self_host_prompt_note(factory_dir: str) -> str:
+    cfg_path = os.path.join(factory_dir, "config.json")
+    if not os.path.isfile(cfg_path):
+        return ""
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(raw, dict) or not raw.get("allow_self_host"):
+        return ""
+    prot = raw.get("protected_paths")
+    if not isinstance(prot, list) or not prot:
+        prot = ["factory/checks.sh", "factory/config.json", ".agents/", ".github/"]
+    prot_str = ", ".join(f"`{p}`" for p in prot)
+    return (
+        "## Self-Host Repository Mode (`allow_self_host=true`)\n\n"
+        "- Editing `factory/lib/`, `factory/cli.py`, `factory/bin/`, and `factory/agents/` **IS permitted** in this repository.\n"
+        f"- Active protected paths (NEVER modify): {prot_str}."
+    )
+
+
 def build_agent_prompt(
     factory_dir: str,
     stage: str,
@@ -96,6 +118,9 @@ def build_agent_prompt(
     instructions = load_agent_instructions(factory_dir, agent_name)
     parts = [f"{SUBAGENT_PREAMBLE}\n{instructions}"]
     if stage != "plan":
+        self_host_note = _load_self_host_prompt_note(factory_dir)
+        if self_host_note:
+            parts.append(self_host_note)
         repo_map = load_repo_map(factory_dir)
         if repo_map:
             parts.append(f"## Repository Architecture Map\n\n{repo_map}")

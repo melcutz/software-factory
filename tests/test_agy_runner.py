@@ -7,6 +7,7 @@ from factory.lib.agy_runner import (
      SUBAGENT_PREAMBLE,
     AgentExecutionError,
     _extract_json_envelope,
+    build_agent_prompt,
     load_agent_instructions,
     run_agent,
 )
@@ -182,6 +183,17 @@ print(json.dumps({"status": "SUCCESS", "duration_seconds": 1.0, "usage": {},
         parsed = _extract_json_envelope(raw)
         self.assertEqual(parsed["status"], "SUCCESS")
         self.assertEqual(parsed["structured_output"]["decision"], "APPROVE")
+
+    def test_build_agent_prompt_injects_self_host_protected_paths_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as f:
+                f.write(
+                    '{"allow_self_host": true, "protected_paths": ["factory/checks.sh", "factory/config.json", ".agents/", ".github/"]}\n'
+                )
+            prompt = build_agent_prompt(tmp, "build", "builder", "Implement worker slot tracking")
+            self.assertIn("allow_self_host=true", prompt)
+            self.assertIn("factory/lib/", prompt)
+            self.assertIn("factory/checks.sh", prompt)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # factory/checks.sh — deterministic verification gate run in every job worktree.
 # Receives FACTORY_GATE_SCOPE=slice|full and FACTORY_BASE_BRANCH=<branch>.
-# When installing into a target project, replace the test runner below with your
-# project's non-interactive test, typecheck, and lint suite (must not rewrite files).
+# Prepends the active worktree (`.:tests`) to PYTHONPATH so editable installs
+# never shadow the worktree's `factory/` package during unit or CLI subprocess tests.
 set -euo pipefail
+
+WORKTREE_ROOT="$(pwd -P)"
+export PYTHONPATH="${WORKTREE_ROOT}:${WORKTREE_ROOT}/tests${PYTHONPATH:+:$PYTHONPATH}"
 
 if [[ "${FACTORY_GATE_SCOPE:-full}" == "slice" ]]; then
   mapfile -t scoped_tests < <(python3 -c '
@@ -39,10 +42,10 @@ for t in sorted(targets):
 ')
   if [[ ${#scoped_tests[@]} -gt 0 ]]; then
     echo "    (slice scope: running ${#scoped_tests[@]} targeted test file(s): ${scoped_tests[*]})"
-    PYTHONPATH=".:tests${PYTHONPATH:+:$PYTHONPATH}" python3 -m unittest -v "${scoped_tests[@]}"
+    python3 -m pytest -q "${scoped_tests[@]}"
   else
-    python3 -m unittest discover -s tests -v
+    python3 -m pytest -q
   fi
 else
-  python3 -m unittest discover -s tests -v
+  python3 -m pytest -q
 fi

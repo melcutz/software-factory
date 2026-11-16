@@ -23,8 +23,12 @@ from factory.lib.schemas import (
 
 class ConfigAndSchemaTests(unittest.TestCase):
     def test_load_repo_config_and_route_all_surfaces(self):
+        default_cfg = load_config("/nonexistent-default-factory-dir")
+        self.assertEqual(default_cfg["auto_merge"], "low")
+        self.assertFalse(default_cfg["allow_self_host"])
         cfg = load_config(os.path.abspath("factory"))
-        self.assertEqual(cfg["auto_merge"], "low")
+        self.assertTrue(cfg["allow_self_host"])
+        self.assertEqual(cfg["auto_merge"], "all")
         rev = resolve_reviewers(cfg, "high", ["ui", "security"])
         self.assertEqual(set(rev.keys()), {"code", "security", "ux", "ui"})
         self.assertEqual(rev["code"], "gemini-3.8-flash-medium")

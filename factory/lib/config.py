@@ -28,6 +28,7 @@ DEFAULT_CONFIG: dict = {
     "idle_bg_grace_sec": 600,
     "auto_polish": True,
     "auto_approve_clean": True,
+    "allow_self_host": False,
     "base_branch": "main",
     "merge_method": "merge",
     "auto_merge": "low",
@@ -158,7 +159,7 @@ def load_config(factory_dir: str) -> dict:
     if not isinstance(idle_grace, int) or isinstance(idle_grace, bool) or idle_grace < 5:
         raise ValueError(f"idle_bg_grace_sec must be an integer >= 5, got {idle_grace!r}")
 
-    for bool_key in ("auto_polish", "auto_approve_clean"):
+    for bool_key in ("auto_polish", "auto_approve_clean", "allow_self_host"):
         bval = cfg.get(bool_key)
         if not isinstance(bval, bool):
             raise ValueError(f"{bool_key} must be a boolean, got {bval!r}")
