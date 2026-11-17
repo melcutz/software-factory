@@ -327,10 +327,13 @@ def run_worker(
     while not stop_event.is_set():
         active_threads = [(r, i, t) for (r, i, t) in active_threads if t.is_alive()]
         if bridge.enabled and active_hc_terminals:
-            live_names = bridge.list_live_terminal_names()
-            active_hc_terminals = {
-                k: name for k, name in active_hc_terminals.items() if name in live_names
-            }
+            try:
+                live_names = bridge.list_live_terminal_names()
+                active_hc_terminals = {
+                    k: name for k, name in active_hc_terminals.items() if name in live_names
+                }
+            except Exception:
+                pass
         active_local_jobs = _collect_active_local_jobs(host_cfg.machine_id, stores, active_threads)
         for repo_key, issue_key in active_hc_terminals:
             active_local_jobs.add((repo_key, f"job-{issue_key}"))
@@ -373,138 +376,142 @@ def run_worker(
         for repo in healthy_repos:
             if len(active_local_jobs) >= host_cfg.max_workers or not pacer.can_claim():
                 break
-            store = stores[repo]
-            if store.get_control_state().get("halted"):
-                continue
             try:
-                from factory.lib.pipeline import reconcile_ready_jobs
+                store = stores[repo]
+                if store.get_control_state().get("halted"):
+                    continue
+                try:
+                    from factory.lib.pipeline import reconcile_ready_jobs
 
-                reconcile_ready_jobs(repo, state_store=store)
-            except Exception:
-                pass
+                    reconcile_ready_jobs(repo, state_store=store)
+                except Exception:
+                    pass
 
-            cfg = load_config(os.path.join(repo, "factory"))
-            try:
-                from factory.lib.config import split_model_and_effort
-                from factory.lib.governor import is_model_in_cooldown
+                cfg = load_config(os.path.join(repo, "factory"))
+                try:
+                    from factory.lib.config import split_model_and_effort
+                    from factory.lib.governor import is_model_in_cooldown
 
-                quota_state = store.get_quota_state()
-                models_cfg = cfg.get("models") or {}
-                in_cd = False
-                for role in ("intake", "spec_writer", "builder"):
-                    raw_spec = str(models_cfg.get(role) or "").strip()
-                    if not raw_spec:
+                    quota_state = store.get_quota_state()
+                    models_cfg = cfg.get("models") or {}
+                    in_cd = False
+                    for role in ("intake", "spec_writer", "builder"):
+                        raw_spec = str(models_cfg.get(role) or "").strip()
+                        if not raw_spec:
+                            continue
+                        base_model = split_model_and_effort(raw_spec)[0].split(":", 1)[0].split()[0]
+                        if base_model and is_model_in_cooldown(quota_state, base_model)[0]:
+                            in_cd = True
+                            break
+                    if in_cd:
                         continue
-                    base_model = split_model_and_effort(raw_spec)[0].split(":", 1)[0].split()[0]
-                    if base_model and is_model_in_cooldown(quota_state, base_model)[0]:
-                        in_cd = True
-                        break
-                if in_cd:
+                except Exception:
+                    pass
+
+                remote_jobs = store.list_remote_jobs()
+                workers = store.list_worker_heartbeats()
+                now_ts = time.time()
+                for j in remote_jobs:
+                    if _is_active_leased_job(j, workers, now_ts) and (j.get("lease") or {}).get("worker_id") == host_cfg.machine_id:
+                        active_local_jobs.add(_job_key(repo, j))
+                if len(active_local_jobs) >= host_cfg.max_workers:
+                    break
+
+                active_repo_leases = sum(
+                    1 for j in remote_jobs if _is_active_leased_job(j, workers, now_ts)
+                )
+                if active_repo_leases >= int(cfg["concurrency"]):
                     continue
-            except Exception:
-                pass
 
-            remote_jobs = store.list_remote_jobs()
-            workers = store.list_worker_heartbeats()
-            now_ts = time.time()
-            for j in remote_jobs:
-                if _is_active_leased_job(j, workers, now_ts) and (j.get("lease") or {}).get("worker_id") == host_cfg.machine_id:
-                    active_local_jobs.add(_job_key(repo, j))
-            if len(active_local_jobs) >= host_cfg.max_workers:
-                break
+                gh = GitHubClient(repo)
+                issues = gh.list_queue_issues(cfg)
 
-            active_repo_leases = sum(
-                1 for j in remote_jobs if _is_active_leased_job(j, workers, now_ts)
-            )
-            if active_repo_leases >= int(cfg["concurrency"]):
-                continue
-
-            gh = GitHubClient(repo)
-            issues = gh.list_queue_issues(cfg)
-
-            done_issues = {int(j["issue"]) for j in remote_jobs if j.get("stage") == "merged" and j.get("issue")}
-            order_deps, hard_deps = _plan_queue_batch(
-                repo,
-                os.path.join(repo, "factory"),
-                os.path.join(repo, "factory", "jobs"),
-                cfg,
-                issues,
-                state_store=store,
-            ) if issues else ({}, {})
-            ready = [
-                iss
-                for iss in issues
-                if all(
-                    dep in done_issues
-                    for dep in (
-                        order_deps.get(int(iss["number"]), set())
-                        | hard_deps.get(int(iss["number"]), set())
-                    )
-                )
-            ]
-
-            local_running_issues = {
-                i for (r, i, t) in active_threads if r == repo and t.is_alive()
-            } | {
-                i for (r, i) in active_hc_terminals if r == repo
-            }
-            filtered_remote_jobs = [
-                j for j in remote_jobs if int(j.get("issue") or -1) not in local_running_issues
-            ]
-            filtered_ready = [
-                iss for iss in ready if int(iss["number"]) not in local_running_issues
-            ]
-            cand = select_next_candidate(
-                host_cfg.machine_id,
-                filtered_remote_jobs,
-                filtered_ready,
-                workers,
-                now_ts=now_ts,
-            )
-            if not cand:
-                continue
-
-            kind, issue_num, payload = cand
-            job_id = f"job-{issue_num}"
-            initial = (
-                None
-                if kind == "resume"
-                else {"id": job_id, "issue": issue_num, "stage": "intake", "last_worker_id": host_cfg.machine_id}
-            )
-            ok, _ = store.claim_job_lease(job_id, initial)
-            if not ok:
-                continue
-
-            active_local_jobs.add((repo, job_id))
-            pacer.record_claim()
-            claimed_any = True
-            bridge.emit_status("working")
-            name = f"{os.path.basename(repo)}-{issue_num}"
-            if bridge.enabled:
-                factory_bin = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
-                    "bin",
-                    "factory",
-                )
-                exec_cmd = (
-                    [factory_bin]
-                    if os.path.isfile(factory_bin) and os.access(factory_bin, os.X_OK)
-                    else [sys.executable, "-m", "factory.cli"]
-                )
-                tid = bridge.spawn_job_terminal(
-                    name,
+                done_issues = {int(j["issue"]) for j in remote_jobs if j.get("stage") == "merged" and j.get("issue")}
+                order_deps, hard_deps = _plan_queue_batch(
                     repo,
-                    [*exec_cmd, "_exec-job", "--repo", repo, str(issue_num)],
-                )
-                if tid:
-                    from factory.lib.herdr_bridge import sanitize_hc_name
+                    os.path.join(repo, "factory"),
+                    os.path.join(repo, "factory", "jobs"),
+                    cfg,
+                    issues,
+                    state_store=store,
+                ) if issues else ({}, {})
+                ready = [
+                    iss
+                    for iss in issues
+                    if all(
+                        dep in done_issues
+                        for dep in (
+                            order_deps.get(int(iss["number"]), set())
+                            | hard_deps.get(int(iss["number"]), set())
+                        )
+                    )
+                ]
 
-                    active_hc_terminals[(repo, issue_num)] = sanitize_hc_name(name)
+                local_running_issues = {
+                    i for (r, i, t) in active_threads if r == repo and t.is_alive()
+                } | {
+                    i for (r, i) in active_hc_terminals if r == repo
+                }
+                filtered_remote_jobs = [
+                    j for j in remote_jobs if int(j.get("issue") or -1) not in local_running_issues
+                ]
+                filtered_ready = [
+                    iss for iss in ready if int(iss["number"]) not in local_running_issues
+                ]
+                cand = select_next_candidate(
+                    host_cfg.machine_id,
+                    filtered_remote_jobs,
+                    filtered_ready,
+                    workers,
+                    now_ts=now_ts,
+                )
+                if not cand:
                     continue
 
-            t = threading.Thread(target=exec_job_command, args=(repo, issue_num), daemon=True)
-            t.start()
-            active_threads.append((repo, issue_num, t))
+                kind, issue_num, payload = cand
+                job_id = f"job-{issue_num}"
+                initial = (
+                    None
+                    if kind == "resume"
+                    else {"id": job_id, "issue": issue_num, "stage": "intake", "last_worker_id": host_cfg.machine_id}
+                )
+                ok, _ = store.claim_job_lease(job_id, initial)
+                if not ok:
+                    continue
+
+                active_local_jobs.add((repo, job_id))
+                pacer.record_claim()
+                claimed_any = True
+                bridge.emit_status("working")
+                name = f"{os.path.basename(repo)}-{issue_num}"
+                if bridge.enabled:
+                    factory_bin = os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                        "bin",
+                        "factory",
+                    )
+                    exec_cmd = (
+                        [factory_bin]
+                        if os.path.isfile(factory_bin) and os.access(factory_bin, os.X_OK)
+                        else [sys.executable, "-m", "factory.cli"]
+                    )
+                    tid = bridge.spawn_job_terminal(
+                        name,
+                        repo,
+                        [*exec_cmd, "_exec-job", "--repo", repo, str(issue_num)],
+                    )
+                    if tid:
+                        from factory.lib.herdr_bridge import sanitize_hc_name
+
+                        active_hc_terminals[(repo, issue_num)] = sanitize_hc_name(name)
+                        continue
+
+                t = threading.Thread(target=exec_job_command, args=(repo, issue_num), daemon=True)
+                t.start()
+                active_threads.append((repo, issue_num, t))
+            except Exception as exc:
+                print(f"[worker] warning: poll error for {repo}: {exc}", file=sys.stderr)
+                continue
 
         if claimed_any:
             _write_heartbeats(len(active_local_jobs))

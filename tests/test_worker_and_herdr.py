@@ -643,5 +643,41 @@ def test_qa_external_blocker_escalates_immediately(tmp_path, monkeypatch):
     assert "Disable Cloudflare Speed Brain" in gh.comment_issue.call_args[0][1]
 
 
+def test_run_worker_survives_transient_github_error(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / "factory").mkdir(parents=True)
+    monkeypatch.setenv("FACTORY_HOST_DIR", str(tmp_path))
+    monkeypatch.setattr("factory.lib.worker.run_doctor", lambda r: (True, ["OK"]))
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.write_worker_heartbeat", lambda *a, **kw: "m1")
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.prune_stale_refs", lambda *a, **kw: 0)
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.get_control_state", lambda *a, **kw: {"halted": False})
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.get_quota_state", lambda *a, **kw: {})
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.list_remote_jobs", lambda *a, **kw: [])
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.list_worker_heartbeats", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        "factory.lib.worker.GitHubClient.list_queue_issues",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("error connecting to api.github.com")),
+    )
+
+    from factory.lib.worker import run_worker
+    assert run_worker([str(repo)], once=True) == 0
+
+
+def test_cross_process_full_gate_slot_prunes_dead_pids(tmp_path):
+    import os
+    from factory.lib.gate_runner import _full_gate_slot
+
+    sdir = tmp_path / "slots"
+    sdir.mkdir()
+    # Dead PID file should be pruned; live os.getpid() file from another slot id should count
+    (sdir / "99999999-111").write_text("99999999\n", encoding="utf-8")
+    (sdir / f"{os.getpid()}-999999").write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    with _full_gate_slot(str(sdir)) as active:
+        assert active >= 2
+        assert not (sdir / "99999999-111").exists()
+
+
+
 
 

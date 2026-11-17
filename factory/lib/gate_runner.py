@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from typing import Iterator
 
@@ -62,17 +63,65 @@ def compute_pytest_workers(active_full_gates: int, cpu_count: int | None = None)
     return min(8, max(2, cpus // slots))
 
 
+def _gate_slots_dir() -> str:
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return os.path.join(tempfile.gettempdir(), f"factory-gate-slots-{uid}")
+
+
+def _count_and_prune_cross_process_gates(slots_dir: str) -> int:
+    count = 0
+    try:
+        entries = os.listdir(slots_dir)
+    except OSError:
+        return 0
+    for name in entries:
+        pid_part = name.split("-", 1)[0]
+        if not pid_part.isdigit():
+            continue
+        pid = int(pid_part)
+        alive = True
+        if pid != os.getpid():
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                alive = False
+            except PermissionError:
+                alive = True
+        if alive:
+            count += 1
+        else:
+            try:
+                os.unlink(os.path.join(slots_dir, name))
+            except OSError:
+                pass
+    return count
+
+
 @contextlib.contextmanager
-def _full_gate_slot() -> Iterator[int]:
+def _full_gate_slot(slots_dir: str | None = None) -> Iterator[int]:
     global _ACTIVE_FULL_GATES
+    sdir = slots_dir or _gate_slots_dir()
+    slot_file = os.path.join(sdir, f"{os.getpid()}-{threading.get_ident()}")
     with _FULL_GATE_LOCK:
         _ACTIVE_FULL_GATES += 1
-        active = _ACTIVE_FULL_GATES
+        in_proc = _ACTIVE_FULL_GATES
+        try:
+            os.makedirs(sdir, exist_ok=True)
+            with open(slot_file, "w", encoding="utf-8") as f:
+                f.write(f"{os.getpid()}\n")
+            cross_proc = _count_and_prune_cross_process_gates(sdir)
+        except OSError:
+            cross_proc = in_proc
+        active = max(in_proc, cross_proc)
     try:
         yield active
     finally:
         with _FULL_GATE_LOCK:
             _ACTIVE_FULL_GATES = max(0, _ACTIVE_FULL_GATES - 1)
+            try:
+                os.unlink(slot_file)
+            except OSError:
+                pass
 
 
 def select_pre_merge_gate_scope(
@@ -344,7 +393,10 @@ def run_gate(
             "FACTORY_BASE_BRANCH": str(base_branch),
         }
         if scope == "full":
-            gate_env.setdefault("PYTEST_WORKERS", str(compute_pytest_workers(active_gates)))
+            bounded_workers = max(2, compute_pytest_workers(active_gates) // 2)
+            gate_env.setdefault("PYTEST_WORKERS", str(bounded_workers))
+        else:
+            gate_env.setdefault("PYTEST_WORKERS", "2")
         try:
             proc = subprocess.run(
                 ["bash", checks_script],
