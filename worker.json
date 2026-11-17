@@ -1,12 +1,12 @@
 {
   "worker_id": "Base",
   "hostname": "Base",
-  "active_jobs": 1,
+  "active_jobs": 0,
   "max_workers": 6,
   "paused": false,
-  "heartbeat_at": "2026-11-17T09:50:23.180122+00:00",
-  "heartbeat_ts": 1794909023.1801224,
-  "expires_at_ts": 1794909383.1801224,
-  "cpu_load_pct": 0.6,
-  "free_ram_gb": 14.02
+  "heartbeat_at": "2026-11-17T09:52:50.334790+00:00",
+  "heartbeat_ts": 1794909170.3347902,
+  "expires_at_ts": 1794909530.3347902,
+  "cpu_load_pct": 1.6,
+  "free_ram_gb": 14.46
 }
