@@ -920,14 +920,33 @@ def main(argv: list[str] | None = None) -> int:
         if multi:
             print("Error: logs requires a single repository.", file=sys.stderr)
             return 1
-        jobs_dir = os.path.join(repos[0], "factory", "jobs")
+        repo = repos[0]
+        jobs_dir = os.path.join(repo, "factory", "jobs")
+        job: dict | None = None
         try:
             job = load_job(jobs_dir, args.job_id)
         except FileNotFoundError:
+            job = None
+        remote_check = _run_git(repo, "remote", "get-url", "origin", check=False)
+        if remote_check.returncode == 0:
+            try:
+                store = GitStateStore(repo, "logs-viewer")
+                for rj in store.list_remote_jobs():
+                    if rj.get("id") == args.job_id:
+                        if job is None or int(rj.get("round") or 0) >= int(job.get("round") or 0):
+                            job = rj
+                        break
+            except Exception:
+                pass
+        if job is None:
             print(f"Error: job {args.job_id!r} not found in {jobs_dir}", file=sys.stderr)
             return 1
         jdir = os.path.join(jobs_dir, args.job_id)
-        print(f"Job: {job.get('id')} | Issue: #{job.get('issue')} | Stage: {job.get('stage')} | Round: {job.get('round')}")
+        worker_info = f" | Worker: {job['last_worker_id']}" if job.get("last_worker_id") else ""
+        print(
+            f"Job: {job.get('id')} | Issue: #{job.get('issue')} | Stage: {job.get('stage')} | "
+            f"Round: {job.get('round')}{worker_info}"
+        )
         if job.get("last_error"):
             print(f"Last error: {job['last_error']}")
         rnum = args.round if args.round is not None else max(1, int(job.get("round") or 1))
@@ -963,6 +982,17 @@ def main(argv: list[str] | None = None) -> int:
             with open(qa_fail, encoding="utf-8") as f:
                 print("\n--- qa-failure.md ---")
                 print(f.read().strip())
+        else:
+            qa_dirs = sorted(
+                glob.glob(os.path.join(jdir, "qa-*")),
+                key=lambda p: int(os.path.basename(p).split("-", 1)[1]) if os.path.basename(p).split("-", 1)[1].isdigit() else 0,
+            )
+            if qa_dirs:
+                qa_md = os.path.join(qa_dirs[-1], "qa.md")
+                if os.path.isfile(qa_md):
+                    with open(qa_md, encoding="utf-8") as f:
+                        print(f"\n--- {os.path.basename(qa_dirs[-1])}/qa.md ---")
+                        print(f.read().strip())
         return 0
 
     if args.command == "patrol":

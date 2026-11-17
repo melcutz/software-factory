@@ -256,6 +256,38 @@ def _format_activity(job: dict) -> str:
     return "stale"
 
 
+def _format_escalation_comment(job: dict, job_id: str, reason: str, labels: dict, resume_stage: str | None) -> str:
+    clean_reason = (reason or "").strip()
+    first_line = next((ln.strip() for ln in clean_reason.splitlines() if ln.strip()), "Unknown failure")
+    if len(first_line) > 220:
+        first_line = first_line[:217].rstrip() + "..."
+    meta_parts = [f"Round: `{job.get('round', 0)}/{job.get('round_limit', 0)}`"]
+    stage_label = resume_stage or job.get("escalated_from")
+    if stage_label:
+        meta_parts.insert(0, f"Failed at: `{stage_label}`")
+    if job.get("last_worker_id"):
+        meta_parts.append(f"Host: `{job['last_worker_id']}`")
+    if job.get("pr_url"):
+        meta_parts.append(f"PR: {job['pr_url']}")
+    meta_line = " | ".join(meta_parts)
+
+    if len(clean_reason) > 260 or "\n" in clean_reason:
+        body = (
+            f"**Summary:** {first_line}\n\n"
+            f"<details>\n<summary>Full failure details</summary>\n\n{clean_reason}\n\n</details>"
+        )
+    else:
+        body = f"**Summary:** {clean_reason}"
+
+    return (
+        f"### Factory Escalation (`{job_id}`)\n\n"
+        f"{meta_line}\n\n"
+        f"{body}\n\n"
+        f"**Inspect:** `factory status {job_id}` / `factory logs {job_id}`\n"
+        f"**Resume:** Reply on this issue and swap `{labels['needs_human']}` -> `{labels['queue']}`."
+    )
+
+
 def _escalate_to_human(
     jobs_dir: str,
     job_id: str,
@@ -271,11 +303,9 @@ def _escalate_to_human(
         job = update_job(jobs_dir, job_id, escalated_from=resume_stage)
     try:
         gh.edit_labels(issue_number, add=[labels["needs_human"]], remove=[labels["queue"]])
-        pr_note = f"\nPR: {job['pr_url']}" if job.get("pr_url") else ""
         gh.comment_issue(
             issue_number,
-            f"### Factory Escalation (`{job_id}`)\n\n{reason}{pr_note}\n\n"
-            f"Reply on this issue and re-add the `{labels['queue']}` label (removing `{labels['needs_human']}`) to resume.",
+            _format_escalation_comment(job, job_id, reason, labels, resume_stage),
         )
     except Exception as exc:
         print(f"[{job_id}] warning: failed to update GitHub on escalation: {exc}", file=sys.stderr)

@@ -590,5 +590,51 @@ class CliHelpTests(unittest.TestCase):
                 self.assertIn("How it works:", out)
 
 
+    def test_logs_falls_back_to_remote_job_and_reads_latest_qa_md(self):
+        from unittest.mock import MagicMock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(os.path.join(repo, "factory", "jobs", "job-77", "qa-2"), exist_ok=True)
+            with open(os.path.join(repo, "factory", "jobs", "job-77", "qa-2", "qa.md"), "w", encoding="utf-8") as f:
+                f.write("VERDICT: FAIL\nCloudflare Speed Brain 503\n")
+
+            remote_job = {
+                "id": "job-77",
+                "issue": 77,
+                "stage": "needs-human",
+                "round": 3,
+                "last_worker_id": "Base",
+                "last_error": "Staging QA failed 3/3 rounds",
+            }
+            fake_git = MagicMock(returncode=0, stdout="https://example.com/repo.git\n", stderr="")
+            fake_store = MagicMock()
+            fake_store.list_remote_jobs.return_value = [remote_job]
+
+            buf = io.StringIO()
+            with patch("factory.cli._run_git", return_value=fake_git), patch("factory.cli.GitStateStore", return_value=fake_store):
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.main(["logs", "--repo", repo, "job-77"])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("Stage: needs-human | Round: 3 | Worker: Base", out)
+            self.assertIn("Last error: Staging QA failed 3/3 rounds", out)
+            self.assertIn("--- qa-2/qa.md ---", out)
+            self.assertIn("Cloudflare Speed Brain 503", out)
+
+    def test_escalation_comment_includes_summary_metadata_and_details_fold(self):
+        from factory.lib.pipeline import _format_escalation_comment
+
+        job = {"round": 2, "round_limit": 3, "last_worker_id": "Base", "pr_url": "https://github.com/o/r/pull/9"}
+        labels = {"queue": "factory", "needs_human": "factory:needs-human"}
+        long_reason = "Staging QA failed 3/3 rounds.\n\n### Details\n" + ("x" * 300)
+        comment = _format_escalation_comment(job, "job-9", long_reason, labels, "staging_qa")
+        self.assertIn("### Factory Escalation (`job-9`)", comment)
+        self.assertIn("Failed at: `staging_qa` | Round: `2/3` | Host: `Base` | PR: https://github.com/o/r/pull/9", comment)
+        self.assertIn("**Summary:** Staging QA failed 3/3 rounds.", comment)
+        self.assertIn("<details>", comment)
+        self.assertIn("`factory logs job-9`", comment)
+
+
 if __name__ == "__main__":
     unittest.main()
