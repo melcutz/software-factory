@@ -154,7 +154,12 @@ class GitStateStore:
     def _ls_remote_one(self, ref: str) -> str | None:
         return self._ls_remote(ref).get(ref)
 
-    def _fetch_ref(self, ref: str) -> str | None:
+    def _fetch_ref(self, ref: str, expected_sha: str | None = None) -> str | None:
+        exp = (expected_sha or "").strip()
+        if exp and exp != ZERO_SHA:
+            chk = _run_git(self.repo_root, "cat-file", "-e", f"{exp}^{{commit}}", check=False)
+            if chk.returncode == 0:
+                return exp
         with repo_lock(self.repo_root):
             res = _run_git(self.repo_root, "fetch", "--no-tags", "--quiet", self.remote, ref, check=False)
             if res.returncode != 0:
@@ -284,7 +289,7 @@ class GitStateStore:
         refs = self._ls_remote("refs/factory/workers/*")
         workers: dict[str, dict] = {}
         for ref in sorted(refs):
-            commit_sha = self._fetch_ref(ref)
+            commit_sha = self._fetch_ref(ref, expected_sha=refs[ref])
             if not commit_sha:
                 continue
             data = self._read_json_from_commit(commit_sha, "worker.json")
@@ -305,8 +310,9 @@ class GitStateStore:
         now = time.time() if now_ts is None else now_ts
         pruned: list[str] = []
 
-        for ref in sorted(self._ls_remote("refs/factory/workers/*")):
-            commit_sha = self._fetch_ref(ref)
+        worker_refs = self._ls_remote("refs/factory/workers/*")
+        for ref in sorted(worker_refs):
+            commit_sha = self._fetch_ref(ref, expected_sha=worker_refs[ref])
             expired = True
             if commit_sha:
                 data = self._read_json_from_commit(commit_sha, "worker.json") or {}
@@ -364,7 +370,7 @@ class GitStateStore:
                 job_data = dict(initial_job)
                 prev_token = int(job_data.get("_last_fencing_token") or 0)
             else:
-                fetched = self._fetch_ref(ref)
+                fetched = self._fetch_ref(ref, expected_sha=old_sha)
                 if not fetched:
                     return False, None
                 old_sha = fetched
@@ -425,11 +431,22 @@ class GitStateStore:
         """Extend an active job lease owned by this machine so long runs stay claimed."""
         ts = time.time() if now_ts is None else now_ts
         ref = f"refs/factory/jobs/{job_id}"
-        with self._repo_lock():
-            old_sha = self._fetch_ref(ref)
+        with self._lock:
+            old_sha = self._ls_remote_one(ref)
             if not old_sha:
                 return False
-            job_data = self._read_json_from_commit(old_sha, "job.json")
+            fetched = self._fetch_ref(ref, expected_sha=old_sha)
+            if not fetched:
+                return False
+            old_sha = fetched
+            files = self._read_tree_files(old_sha)
+            raw_job = files.get("job.json")
+            if not raw_job:
+                return False
+            try:
+                job_data = json.loads(raw_job.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return False
             if not isinstance(job_data, dict):
                 return False
             lease = job_data.get("lease")
@@ -437,13 +454,14 @@ class GitStateStore:
                 return False
             lease["expires_at_ts"] = ts + WORKER_TTL_SEC
             job_data["lease"] = lease
-            return self._push_json_ref(
-                ref,
-                "job.json",
-                job_data,
+            files["job.json"] = json.dumps(job_data, indent=2).encode("utf-8")
+            tree_sha = self._build_tree(files)
+            commit_sha = self._commit_tree(
+                tree_sha,
                 f"renew lease {job_id} by {self.machine_id}",
-                old_sha,
+                parent_sha=old_sha,
             )
+            return self._cas_push(commit_sha, ref, old_sha)
 
     def _collect_checkpoint_files(self, jdir: str, job_payload: dict) -> dict[str, bytes]:
         files: dict[str, bytes] = {
@@ -547,7 +565,7 @@ class GitStateStore:
         refs = self._ls_remote("refs/factory/jobs/*")
         jobs: list[dict] = []
         for ref in sorted(refs):
-            commit_sha = self._fetch_ref(ref)
+            commit_sha = self._fetch_ref(ref, expected_sha=refs[ref])
             if not commit_sha:
                 continue
             data = self._read_json_from_commit(commit_sha, "job.json")
@@ -597,7 +615,7 @@ class GitStateStore:
         refs = self._ls_remote("refs/factory/train/*")
         tickets: list[dict] = []
         for ref in sorted(refs):
-            commit_sha = self._fetch_ref(ref)
+            commit_sha = self._fetch_ref(ref, expected_sha=refs[ref])
             if not commit_sha:
                 continue
             data = self._read_json_from_commit(commit_sha, "ticket.json")
@@ -783,7 +801,7 @@ class GitStateStore:
         deleted = 0
         job_refs = self._ls_remote("refs/factory/jobs/*")
         for ref in sorted(job_refs):
-            commit_sha = self._fetch_ref(ref)
+            commit_sha = self._fetch_ref(ref, expected_sha=job_refs[ref])
             if not commit_sha:
                 continue
             job_data = self._read_json_from_commit(commit_sha, "job.json") or {}

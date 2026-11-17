@@ -9,6 +9,7 @@ import os
 import statistics
 import subprocess
 import sys
+import time
 
 from factory.lib.batch import format_batch_plan, triage_and_plan_queue
 from factory.lib.config import load_config
@@ -693,14 +694,43 @@ def main(argv: list[str] | None = None) -> int:
             merged_by_id = {j["id"]: j for j in local_jobs if j.get("id")}
             fleet_banner = ""
             try:
+                from factory.lib.git_state import SKEW_MARGIN_SEC, TERMINAL_STAGES
+                from factory.lib.pipeline import _is_pid_alive
+                from factory.lib.worker import _is_lease_expired
+
+                now_ts = time.time()
                 store = GitStateStore(repo, "status-viewer")
                 ctrl = store.get_control_state()
-                workers = store.list_worker_heartbeats()
+                all_workers = store.list_worker_heartbeats()
+                workers = {
+                    wid: w
+                    for wid, w in all_workers.items()
+                    if w.get("expires_at_ts") is None or now_ts <= float(w.get("expires_at_ts") or 0.0) + SKEW_MARGIN_SEC
+                }
                 quota = store.get_quota_state().get("models") or {}
                 for rj in store.list_remote_jobs():
                     rid = rj.get("id")
                     if rid:
-                        merged_by_id[rid] = rj
+                        lease = rj.get("lease")
+                        lease_active = (
+                            isinstance(lease, dict)
+                            and bool(lease.get("worker_id"))
+                            and not _is_lease_expired(lease, all_workers, now_ts)
+                        )
+                        local_j = merged_by_id.get(rid)
+                        if (
+                            local_j
+                            and _is_pid_alive(local_j.get("pid"))
+                            and rj.get("stage") not in TERMINAL_STAGES
+                        ):
+                            merged_by_id[rid] = {
+                                **rj,
+                                **local_j,
+                                "lease": lease or local_j.get("lease"),
+                                "_lease_active": True,
+                            }
+                        else:
+                            merged_by_id[rid] = {**rj, "_lease_active": lease_active}
                 if ctrl.get("halted") or workers or quota:
                     state_word = f"HALTED ({ctrl.get('reason') or 'operator'})" if ctrl.get("halted") else "RUNNING"
                     parts = [f"Fleet: {state_word}"]

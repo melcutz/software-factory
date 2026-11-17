@@ -678,6 +678,72 @@ def test_cross_process_full_gate_slot_prunes_dead_pids(tmp_path):
         assert not (sdir / "99999999-111").exists()
 
 
+def test_renew_job_lease_extends_expiry_and_preserves_checkpoint_files(tmp_path):
+    from factory.lib.git_state import GitStateStore
+
+    repo = _init_repo_with_origin(tmp_path, "renew-repo")
+    store = GitStateStore(str(repo), "m1")
+    ok, claimed = store.claim_job_lease("job-77", {"id": "job-77", "issue": 77, "stage": "build"}, now_ts=1000.0)
+    assert ok and claimed is not None
+
+    jdir = repo / "factory" / "jobs" / "job-77"
+    jdir.mkdir(parents=True)
+    (jdir / "spec.md").write_text("# Spec 77\n", encoding="utf-8")
+    assert store.checkpoint_job("job-77", str(jdir), claimed)
+
+    assert store.renew_job_lease("job-77", now_ts=1500.0) is True
+    out_dir = tmp_path / "hydrated"
+    hydrated = store.hydrate_job("job-77", str(out_dir))
+    assert hydrated is not None
+    assert hydrated["lease"]["expires_at_ts"] > claimed["lease"]["expires_at_ts"]
+    assert (out_dir / "spec.md").read_text(encoding="utf-8") == "# Spec 77\n"
+
+
+def test_cross_process_repo_lock_blocks_other_process(tmp_path):
+    import subprocess
+    from factory.lib.git_ops import repo_lock
+
+    target = tmp_path / "locked-repo"
+    target.mkdir()
+    lk = repo_lock(str(target))
+    with lk:
+        # Re-entrant in same thread
+        with lk:
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    f"from factory.lib.git_ops import repo_lock; "
+                    f"print(repo_lock({str(target)!r}).acquire(blocking=False))",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            assert res.stdout.strip() == "False"
+
+
+def test_status_reports_remote_leased_jobs_as_live(tmp_path):
+    from factory.lib.pipeline import factory_runner_status, format_status_table
+
+    jobs = [
+        {
+            "id": "job-88",
+            "stage": "merging",
+            "activity": "running:pre-merge-gate:full",
+            "pid": 99999999,
+            "lease": {"worker_id": "Base", "hostname": "Base"},
+            "_lease_active": True,
+        }
+    ]
+    banner = factory_runner_status(str(tmp_path), jobs)
+    table = format_status_table(jobs)
+    assert "RUNNING (1 live worker(s))" in banner
+    assert "running:pre-merge-gate:full" in table
+    assert "stale" not in table
+
+
+
 
 
 

@@ -236,13 +236,19 @@ def _is_pid_alive(pid: int | None) -> bool:
         return False
 
 
+def _is_job_live(job: dict) -> bool:
+    pid = job.get("pid")
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and _is_pid_alive(pid):
+        return True
+    return bool(job.get("_lease_active"))
+
+
 def _format_activity(job: dict) -> str:
     stage = str(job.get("stage", ""))
     if stage in TERMINAL_OR_READY_STAGES:
         return "-"
     activity = job.get("activity")
-    pid = job.get("pid")
-    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and _is_pid_alive(pid):
+    if _is_job_live(job):
         return str(activity or ("queued" if stage == "queued" else "running"))
     if stage in {"needs-human", "needs-info"}:
         return "-"
@@ -3741,7 +3747,7 @@ def factory_runner_status(jobs_dir: str, jobs: list[dict] | None = None) -> str:
         if j.get("stage") not in TERMINAL_OR_READY_STAGES
         and j.get("stage") not in {"needs-human", "needs-info", "queued"}
     ]
-    live_workers = sum(1 for j in active_jobs if _is_pid_alive(j.get("pid")))
+    live_workers = sum(1 for j in active_jobs if _is_job_live(j))
 
     if _is_pid_alive(runner_pid):
         if queued_jobs:

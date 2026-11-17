@@ -2,25 +2,89 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 from typing import Callable
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
 _REPO_LOCK_GUARD = threading.Lock()
-_REPO_LOCKS: dict[str, threading.RLock] = {}
+_REPO_LOCKS: dict[str, _CrossProcessRepoLock] = {}
 
 
-def repo_lock(repo_root: str) -> threading.RLock:
-    """Per-repository RLock serializing shared git ref updates (`fetch`, `worktree add`, `merging`)."""
-    key = os.path.abspath(repo_root)
+class _CrossProcessRepoLock:
+    """Re-entrant thread + OS flock lock serializing shared repo git operations across processes."""
+
+    def __init__(self, lock_path: str) -> None:
+        self._lock_path = lock_path
+        self._rlock = threading.RLock()
+        self._depth = 0
+        self._fd: int | None = None
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        acquired = self._rlock.acquire(blocking=blocking, timeout=timeout)
+        if not acquired:
+            return False
+        try:
+            if self._depth == 0 and fcntl is not None:
+                os.makedirs(os.path.dirname(self._lock_path), exist_ok=True)
+                fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fd, flags)
+                except BaseException:
+                    os.close(fd)
+                    raise
+                self._fd = fd
+            self._depth += 1
+            return True
+        except BaseException:
+            self._rlock.release()
+            if not blocking:
+                return False
+            raise
+
+    def release(self) -> None:
+        self._depth -= 1
+        try:
+            if self._depth == 0 and self._fd is not None:
+                fd = self._fd
+                self._fd = None
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+        finally:
+            self._rlock.release()
+
+    def __enter__(self) -> _CrossProcessRepoLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
+def repo_lock(repo_root: str) -> _CrossProcessRepoLock:
+    """Per-repository re-entrant lock serializing shared git ref updates across threads and OS processes."""
+    key = os.path.realpath(os.path.abspath(repo_root))
     with _REPO_LOCK_GUARD:
         lock = _REPO_LOCKS.get(key)
         if lock is None:
-            lock = threading.RLock()
+            uid = os.getuid() if hasattr(os, "getuid") else 0
+            digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+            lock_dir = os.path.join(tempfile.gettempdir(), f"factory-repo-locks-{uid}")
+            lock = _CrossProcessRepoLock(os.path.join(lock_dir, f"{digest}.lock"))
             _REPO_LOCKS[key] = lock
         return lock
 
