@@ -170,10 +170,14 @@ def load_config(factory_dir: str) -> dict:
     if not isinstance(idle_grace, int) or isinstance(idle_grace, bool) or idle_grace < 5:
         raise ValueError(f"idle_bg_grace_sec must be an integer >= 5, got {idle_grace!r}")
 
-    for bool_key in ("auto_polish", "auto_approve_clean", "allow_self_host"):
+    for bool_key in ("auto_polish", "allow_self_host"):
         bval = cfg.get(bool_key)
         if not isinstance(bval, bool):
             raise ValueError(f"{bool_key} must be a boolean, got {bval!r}")
+
+    aac = cfg.get("auto_approve_clean")
+    if not isinstance(aac, bool) and aac != "all":
+        raise ValueError(f"auto_approve_clean must be a boolean or 'all', got {aac!r}")
 
     max_cost = cfg.get("max_job_cost_usd", 0.0)
     if not isinstance(max_cost, (int, float)) or isinstance(max_cost, bool) or max_cost < 0:

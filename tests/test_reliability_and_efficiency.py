@@ -228,6 +228,11 @@ class ReliabilityAndEfficiencyTests(unittest.TestCase):
             should_auto_approve_clean(cfg, job_high, "VERDICT: PASS\n", reviews_high)
         )
 
+        cfg_all = {**cfg, "auto_approve_clean": "all"}
+        self.assertTrue(should_auto_approve_clean(cfg_all, job_r2, "VERDICT: PASS\n", reviews))
+        self.assertTrue(should_auto_approve_clean(cfg_all, job_high, "VERDICT: PASS\n", reviews_high))
+        self.assertFalse(should_auto_approve_clean(cfg_all, job_high, "VERDICT: PASS\n", reviews_high, "QA failed"))
+
     def test_tailwind_conflict_auto_resolver_and_auto_polish_guard(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             bare = os.path.join(d, "origin.git")

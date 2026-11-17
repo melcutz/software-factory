@@ -522,7 +522,8 @@ def run_worker(
             for _, _, t in active_threads:
                 t.join()
             break
-        stop_event.wait(host_cfg.poll_interval_sec)
+        wait_sec = host_cfg.ramp_up_delay_sec if claimed_any else host_cfg.poll_interval_sec
+        stop_event.wait(wait_sec)
 
     if not once:
         for store in stores.values():

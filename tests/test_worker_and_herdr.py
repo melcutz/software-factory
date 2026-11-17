@@ -743,6 +743,69 @@ def test_status_reports_remote_leased_jobs_as_live(tmp_path):
     assert "stale" not in table
 
 
+def test_run_worker_uses_ramp_up_delay_after_claim(tmp_path, monkeypatch):
+    import json
+    import threading
+    from factory.lib.worker import HostConfig
+
+    repo = _init_repo_with_origin(tmp_path, "ramp-repo")
+    monkeypatch.delenv("HC_TERMINAL_ID", raising=False)
+    monkeypatch.setenv("FACTORY_HOST_DIR", str(tmp_path))
+    monkeypatch.setattr("factory.lib.worker.run_doctor", lambda r: (True, ["OK"]))
+    monkeypatch.setattr(
+        "factory.lib.worker.load_host_config",
+        lambda: HostConfig(
+            machine_id="m1",
+            max_workers=4,
+            min_free_ram_gb=1.0,
+            max_cpu_load_pct=95.0,
+            ramp_up_delay_sec=7.5,
+            poll_interval_sec=45.0,
+        ),
+    )
+    monkeypatch.setattr("factory.lib.governor.check_host_admission", lambda cfg: (True, "ok"))
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.write_worker_heartbeat", lambda *a, **kw: "m1")
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.prune_stale_refs", lambda *a, **kw: 0)
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.get_control_state", lambda *a, **kw: {"halted": False})
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.get_quota_state", lambda *a, **kw: {})
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.list_remote_jobs", lambda *a, **kw: [])
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.list_worker_heartbeats", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        "factory.lib.worker.GitHubClient.list_queue_issues",
+        lambda *a, **kw: [{"number": 42, "title": "Ready issue"}],
+    )
+    monkeypatch.setattr("factory.lib.worker._plan_queue_batch", lambda *a, **kw: ({}, {}))
+    monkeypatch.setattr("factory.lib.worker.GitStateStore.claim_job_lease", lambda *a, **kw: (True, {"id": "job-42"}))
+    monkeypatch.setattr("factory.lib.worker.exec_job_command", lambda *a, **kw: 0)
+
+    waited: list[float] = []
+    real_event = threading.Event
+
+    class _FakeEvent:
+        def __init__(self):
+            self._ev = real_event()
+            self._calls = 0
+
+        def is_set(self):
+            return self._calls >= 1
+
+        def set(self):
+            self._ev.set()
+
+        def wait(self, timeout=None):
+            if timeout is None:
+                return self._ev.wait(timeout)
+            waited.append(float(timeout))
+            self._calls += 1
+            return True
+
+    monkeypatch.setattr("factory.lib.worker.threading.Event", _FakeEvent)
+    from factory.lib.worker import run_worker
+
+    assert run_worker([str(repo)], once=False) == 0
+    assert waited == [7.5]
+
+
 
 
 

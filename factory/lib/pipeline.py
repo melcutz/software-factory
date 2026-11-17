@@ -383,14 +383,19 @@ def should_auto_approve_clean(
     reviews_dict: dict[str, dict],
     qa_failure_md: str = "",
 ) -> bool:
-    """Return True when a clean Round-1 PR can be deterministically approved without an LLM call."""
-    if not cfg.get("auto_approve_clean", True):
+    """Return True when a clean PR can be deterministically approved without an LLM call."""
+    mode = cfg.get("auto_approve_clean", True)
+    if not mode:
         return False
-    if int(job.get("round", 0) or 0) != 1:
-        return False
-    if job.get("risk") == "high":
-        return False
-    if job.get("last_error") or (qa_failure_md or "").strip():
+    approve_all_clean = mode == "all"
+    if not approve_all_clean:
+        if int(job.get("round", 0) or 0) != 1:
+            return False
+        if job.get("risk") == "high":
+            return False
+        if job.get("last_error"):
+            return False
+    if (qa_failure_md or "").strip():
         return False
     if not (checks_md or "").startswith("VERDICT: PASS"):
         return False
@@ -1482,6 +1487,9 @@ def _execute_staging_train_batch(
                             f"staging_qa browser_qa=start round={qa_attempt}/{qa_limit} ({_fmt_model_tag(qa_model)})",
                         )
                         spec_md = _read_text(os.path.join(t.jdir, "spec.md"))
+                        t_job = _read_json(os.path.join(t.jdir, "job.json"))
+                        surfaces = t_job.get("surfaces") or []
+                        qa_mode = "browser" if "ui" in surfaces else "http_fast"
                         merged_stat = _run_git(
                             deploy_wt, "show", "--stat", t.merged_sha, check=False
                         ).stdout.strip()
@@ -1495,6 +1503,8 @@ def _execute_staging_train_batch(
                                 f"MERGED_COMMIT_SHA: {t.merged_sha}",
                                 f"STAGING_BASE_URL: {base_url}",
                                 f"STAGING_OPS_BASE_URL: {ops_url}",
+                                f"SURFACES: {', '.join(surfaces) or 'none'}",
+                                f"QA_MODE: {qa_mode}",
                                 "",
                                 "## Merged Commit Stat",
                                 merged_stat or "(none)",
