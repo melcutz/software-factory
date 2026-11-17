@@ -786,22 +786,45 @@ def _handle_qa_failure_for_ticket(
 
     ext_blocker = str((qa_out or {}).get("external_blocker") or "").strip()
     if qa_attempt >= qa_limit or ext_blocker:
+        restored_branch: str | None = None
+        if os.path.isdir(ticket.worktree):
+            try:
+                restored_branch = prepare_qa_fix_branch(
+                    repo_root,
+                    ticket.worktree,
+                    ticket.job_id,
+                    qa_attempt + 1,
+                    base_branch,
+                    revert_sha,
+                    pre_train_head_sha=ticket.pre_train_head_sha,
+                )
+            except Exception as exc:
+                print(
+                    f"[{ticket.job_id}] warning: failed to prepare QA resume branch on escalation: {exc}",
+                    file=sys.stderr,
+                )
+        esc_updates: dict = {
+            "qa_round": qa_attempt,
+            "pr_number": None,
+            "pr_url": None,
+            "pre_merge_main_sha": "",
+            "merged_commit_sha": "",
+            "solo_staging_qa": False,
+            "prior_prs": prior_prs,
+        }
+        if restored_branch:
+            esc_updates["branch"] = restored_branch
         update_job(
             jobs_dir,
             ticket.job_id,
-            qa_round=qa_attempt,
-            pr_number=None,
-            pr_url=None,
-            pre_merge_main_sha="",
-            merged_commit_sha="",
-            solo_staging_qa=False,
-            prior_prs=prior_prs,
+            **esc_updates,
         )
         prefix = (
             f"External/infra blocker detected on QA round {qa_attempt}/{qa_limit}: {ext_blocker}."
             if ext_blocker
             else f"Staging QA failed {qa_attempt}/{qa_limit} rounds."
         )
+        branch_note = f" Restored changes on `{restored_branch}` for resume." if restored_branch else ""
         esc_job = _escalate_to_human(
             jobs_dir,
             ticket.job_id,
@@ -810,7 +833,7 @@ def _handle_qa_failure_for_ticket(
             cfg,
             f"{prefix} "
             f"Reverted `{ticket.merged_sha[:7]}` on `{base_branch}` (`{revert_sha[:7]}`) and rolled back "
-            f"staging cleanly.\n\n{failure_md}",
+            f"staging cleanly.{branch_note}\n\n{failure_md}",
             resume_stage="staging_qa",
         )
         ticket.outcome = TrainOutcome(action="return", job=esc_job)
@@ -1150,18 +1173,29 @@ def _run_distributed_staging_train(
                 )
 
                 for t in batch:
+                    t_saved = load_job(jobs_dir, t.job_id)
+                    t_wt_ckpt = (
+                        t.worktree
+                        if t_saved.get("stage") not in TERMINAL_OR_READY_STAGES
+                        and os.path.isdir(t.worktree)
+                        and commits_ahead(t.worktree, base_branch) > 0
+                        else None
+                    )
                     _checkpoint_if_store(
                         state_store,
                         t.job_id,
                         t.jdir,
                         jobs_dir,
+                        worktree=t_wt_ckpt,
                         release_lease=(t.job_id != job_id),
                     )
+                    if t_saved.get("stage") in TERMINAL_OR_READY_STAGES:
+                        state_store.delete_slice_checkpoint(t.job_id)
                     state_store.delete_train_ticket(t.job_id)
 
                 if any(t.job_id == job_id for t in batch):
                     updated = load_job(jobs_dir, job_id)
-                    if updated["stage"] == "build" or (
+                    if updated["stage"] in {"build", "merging"} or (
                         updated["stage"] == "staging_qa" and updated.get("solo_staging_qa")
                     ):
                         return TrainOutcome(action="continue")
@@ -1173,9 +1207,26 @@ def _run_distributed_staging_train(
             while True:
                 if not state_store._ls_remote_one(f"refs/factory/train/{job_id}"):
                     hydrated = state_store.hydrate_job(job_id, jdir) or load_job(jobs_dir, job_id)
-                    if hydrated["stage"] == "build" or (
+                    if hydrated["stage"] in {"build", "merging"} or (
                         hydrated["stage"] == "staging_qa" and hydrated.get("solo_staging_qa")
                     ):
+                        new_br = str(hydrated.get("branch") or f"factory/{job_id}")
+                        if os.path.isdir(worktree):
+                            ensure_worktree(repo_root, job_id, base_branch, branch=new_br)
+                            if not state_store.fetch_slice_checkpoint(job_id, worktree):
+                                res_br = subprocess.run(
+                                    ["git", "fetch", state_store.remote, f"refs/heads/{new_br}"],
+                                    cwd=worktree,
+                                    capture_output=True,
+                                    text=True,
+                                )
+                                if res_br.returncode == 0:
+                                    subprocess.run(
+                                        ["git", "reset", "--hard", "FETCH_HEAD"],
+                                        cwd=worktree,
+                                        capture_output=True,
+                                        text=True,
+                                    )
                         return TrainOutcome(action="continue")
                     return TrainOutcome(action="exit", job=hydrated)
                 if not state_store._ls_remote_one("refs/factory/locks/staging"):
@@ -2714,6 +2765,14 @@ def process_job(
                                 "",
                                 "## Latest Issue & Human Comments",
                                 issue_md,
+                            ]
+                        )
+                    if qa_failure_md.strip():
+                        prompt_parts.extend(
+                            [
+                                "",
+                                "## Staging QA Failure (Must Fix)",
+                                qa_failure_md,
                             ]
                         )
                     prompt_parts.extend(
