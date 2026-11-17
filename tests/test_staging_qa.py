@@ -792,3 +792,58 @@ def test_staging_qa_escalation_at_limit_restores_qa_branch_and_checkpoints_for_r
     assert resumed_state["f26_exists_before_edit"] is True
     assert "## Staging QA Failure (Must Fix)" in resumed_state["prompt"]
     assert "GET /library/unread returned 503" in resumed_state["prompt"]
+
+
+def test_run_doctor_honors_configured_wrangler_command_from_staging_hooks(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from factory.lib.pipeline import run_doctor
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "https://example.com/r.git"], check=True)
+    (repo / ".gitignore").write_text("/factory/jobs/*\n/.worktrees/\n", encoding="utf-8")
+    fdir = repo / "factory"
+    fdir.mkdir()
+    (fdir / "config.json").write_text(
+        json.dumps(
+            {
+                "auto_merge": "all",
+                "staging_qa": {
+                    "enabled": True,
+                    "base_url": "https://staging.example.com",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    checks = fdir / "checks.sh"
+    checks.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    checks.chmod(0o755)
+    (fdir / "staging_hooks.py").write_text(
+        f"def build_deploy_env(secrets, staging_cfg, repo_root=None):\n"
+        f"    return {{'WRANGLER': '{sys.executable} -c \"print(\\'4.147.0\\')\"'}}\n",
+        encoding="utf-8",
+    )
+
+    real_which = __import__("shutil").which
+    monkeypatch.setattr(
+        "factory.lib.pipeline.shutil.which",
+        lambda name: None if name in {"wrangler", "npx"} else (sys.executable if name in {"gh", "agy", sys.executable} else real_which(name)),
+    )
+    orig_run = subprocess.run
+
+    def fake_run(cmd, *a, **kw):
+        if isinstance(cmd, list) and len(cmd) >= 2 and cmd[1] == "-c" and "sync_playwright" in cmd[2]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if isinstance(cmd, list) and len(cmd) >= 2 and cmd[0] == sys.executable and cmd[1:] in (["auth", "status"], ["--version"]):
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
+        return orig_run(cmd, *a, **kw)
+
+    monkeypatch.setattr("factory.lib.pipeline.subprocess.run", fake_run)
+    ok, messages = run_doctor(str(repo))
+    assert ok is True, messages
+    assert "OK: wrangler available" in messages

@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -4020,12 +4021,31 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
             messages.append("OK: playwright headless chromium")
 
         wrangler_ok = bool(shutil.which("wrangler"))
+        if not wrangler_ok:
+            try:
+                dep_env = build_deploy_env({}, sqa, repo_root=repo_root)
+            except Exception:
+                dep_env = {}
+            configured_wrangler = str(dep_env.get("WRANGLER") or "").strip()
+            if configured_wrangler:
+                wr_argv = shlex.split(configured_wrangler)
+                if wr_argv and shutil.which(wr_argv[0]):
+                    wr = subprocess.run(
+                        [*wr_argv, "--version"],
+                        cwd=repo_root,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                    )
+                    wrangler_ok = wr.returncode == 0
         if not wrangler_ok and shutil.which("npx"):
             wr = subprocess.run(
                 ["npx", "--no-install", "wrangler", "--version"],
                 cwd=repo_root,
                 capture_output=True,
                 text=True,
+                timeout=30,
                 check=False,
             )
             wrangler_ok = wr.returncode == 0
