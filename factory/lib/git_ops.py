@@ -80,7 +80,18 @@ def ensure_worktree(
             check=False,
         )
         if branch_exists.returncode == 0:
-            _run_git(repo_root, "worktree", "add", wt_path, target_branch)
+            is_merged = _run_git(
+                repo_root,
+                "merge-base",
+                "--is-ancestor",
+                f"refs/heads/{target_branch}",
+                f"origin/{base_branch}",
+                check=False,
+            )
+            if is_merged.returncode == 0:
+                _run_git(repo_root, "worktree", "add", "-B", target_branch, wt_path, f"origin/{base_branch}")
+            else:
+                _run_git(repo_root, "worktree", "add", wt_path, target_branch)
         else:
             _run_git(repo_root, "worktree", "add", "-b", target_branch, wt_path, f"origin/{base_branch}")
         return wt_path, target_branch

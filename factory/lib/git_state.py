@@ -128,8 +128,14 @@ class GitStateStore:
 
     def _commit_tree(self, tree_sha: str, message: str, parent_sha: str | None = None) -> str:
         args = ["commit-tree", tree_sha]
-        if parent_sha and parent_sha != ZERO_SHA:
-            args.extend(["-p", parent_sha])
+        parent = (parent_sha or "").strip()
+        if parent and parent != ZERO_SHA:
+            chk = _run_git(self.repo_root, "cat-file", "-e", f"{parent}^{{commit}}", check=False)
+            if chk.returncode != 0:
+                _run_git(self.repo_root, "fetch", "--no-tags", "--quiet", self.remote, parent, check=False)
+                chk = _run_git(self.repo_root, "cat-file", "-e", f"{parent}^{{commit}}", check=False)
+            if chk.returncode == 0:
+                args.extend(["-p", parent])
         args.extend(["-m", message])
         res = self._git_raw(*args)
         return res.stdout.decode("utf-8").strip()
@@ -324,14 +330,7 @@ class GitStateStore:
 
         for ref in sorted(self._ls_remote("refs/factory/jobs/*")):
             jid = ref.rsplit("/", 1)[-1]
-            prune_job_ref = jid in closed_job_ids
-            if not prune_job_ref and jid in terminal_job_ids:
-                commit_sha = self._fetch_ref(ref)
-                if commit_sha:
-                    data = self._read_json_from_commit(commit_sha, "job.json") or {}
-                    if str(data.get("stage") or "") not in ("merged", "rejected"):
-                        prune_job_ref = True
-            if prune_job_ref:
+            if jid in closed_job_ids or jid in terminal_job_ids:
                 pruned.append(ref)
                 if not dry_run:
                     self._delete_remote_ref(ref)
@@ -791,7 +790,11 @@ class GitStateStore:
             stage = job_data.get("stage")
             if stage not in TERMINAL_STAGES:
                 continue
-            updated_ts = _parse_ts(job_data.get("updated_at")) or _parse_ts((job_data.get("lease") or {}).get("claimed_at"))
+            updated_ts = _parse_ts(
+                job_data.get("updated_at")
+                or job_data.get("updated")
+                or (job_data.get("lease") or {}).get("claimed_at")
+            )
             if updated_ts and updated_ts < cutoff:
                 job_id = ref.rsplit("/", 1)[-1]
                 self._delete_remote_ref(ref)

@@ -12,7 +12,15 @@ import sys
 
 from factory.lib.batch import format_batch_plan, triage_and_plan_queue
 from factory.lib.config import load_config
-from factory.lib.fleet import fleet_pause, fleet_remove, fleet_status, fleet_unpause, fleet_update, fleet_wake
+from factory.lib.fleet import (
+    fleet_pause,
+    fleet_remove,
+    fleet_restart,
+    fleet_status,
+    fleet_unpause,
+    fleet_update,
+    fleet_wake,
+)
 from factory.lib.gate_runner import run_gate
 from factory.lib.git_ops import GitHubClient, _run_git, remove_worktree
 from factory.lib.onboarding import generate_repo_map, init_repository, learn_from_jobs
@@ -344,14 +352,26 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Manage peer worker machines in the fleet via `hc machine`.\n\n"
             "How it works:\n"
-            "  Dispatches `status`, `wake`, `pause`, `unpause`, `update`, or `remove`\n"
-            "  to one named machine or all configured fleet peers."
+            "  Dispatches `status`, `wake`, `pause`, `unpause`, `update`, `restart`, or\n"
+            "  `remove` to one named machine or all configured fleet peers."
         ),
-        epilog="Examples:\n  factory fleet status\n  factory fleet pause Base --drain\n  factory fleet wake Rocket",
+        epilog=(
+            "Examples:\n"
+            "  factory fleet status\n"
+            "  factory fleet pause Base --drain\n"
+            "  factory fleet update --restart\n"
+            "  factory fleet restart\n"
+            "  factory fleet wake Rocket"
+        ),
     )
-    p_fleet.add_argument("action", choices=["status", "wake", "pause", "unpause", "update", "remove"], help="Fleet action")
+    p_fleet.add_argument(
+        "action",
+        choices=["status", "wake", "pause", "unpause", "update", "restart", "remove"],
+        help="Fleet action",
+    )
     p_fleet.add_argument("machine", nargs="?", help="Optional target machine name")
     p_fleet.add_argument("--drain", action="store_true", help="Drain active jobs when pausing")
+    p_fleet.add_argument("--restart", action="store_true", help="Restart worker processes after `fleet update`")
 
     p_clean = sub.add_parser(
         "clean",
@@ -552,7 +572,7 @@ def main(argv: list[str] | None = None) -> int:
                     print("  ".join("-" * w for w in widths))
             return 0
         if args.action == "wake":
-            for name, rc, out in fleet_wake():
+            for name, rc, out in fleet_wake(args.machine):
                 print(_format_fleet_result(name, rc, out))
             return 0
         if args.action == "pause":
@@ -564,9 +584,24 @@ def main(argv: list[str] | None = None) -> int:
                 print(_format_fleet_result(name, rc, out))
             return 0
         if args.action == "update":
+            exit_code = 0
             for name, rc, out in fleet_update(args.machine):
                 print(_format_fleet_result(name, rc, out))
-            return 0
+                if rc != 0:
+                    exit_code = 1
+            if args.restart and exit_code == 0:
+                for name, rc, out in fleet_restart(args.machine):
+                    print(_format_fleet_result(name, rc, out))
+                    if rc != 0:
+                        exit_code = 1
+            return exit_code
+        if args.action == "restart":
+            exit_code = 0
+            for name, rc, out in fleet_restart(args.machine):
+                print(_format_fleet_result(name, rc, out))
+                if rc != 0:
+                    exit_code = 1
+            return exit_code
         if args.action == "remove":
             if not args.machine:
                 print("Error: 'factory fleet remove <machine>' requires a machine name.", file=sys.stderr)

@@ -17,3 +17,4 @@ If you return `FAIL`, the factory orchestrator rolls back the staging deployment
 ## Verdict Rules
 - **`PASS`:** Every acceptance criterion in `spec.md` and core staging user flows work cleanly on live staging with zero unexpected errors. List every concrete scenario executed in `scenarios_tested` and every persona used in `personas_used`.
 - **`FAIL`:** Any acceptance criterion fails or regressions appear. Populate `failures` with exact `scenario`, `expected`, `actual`, `url`, and `evidence`, and populate `reproduction_steps`.
+- **External / Infra Blocker:** If `FAIL` is caused by an external infrastructure or account setting that repository code cannot fix (e.g. Cloudflare zone/edge settings, DNS, missing external credentials, third-party outage), set `external_blocker` to a concise one-line description of the blocker and required operator action so the factory escalates immediately without burning retries.

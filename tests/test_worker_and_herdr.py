@@ -574,5 +574,74 @@ def test_exec_job_needs_human_does_not_hang_in_tty_shell(tmp_path, monkeypatch):
     assert shell_called == []
 
 
+def test_fleet_restart_stops_and_wakes(tmp_path, monkeypatch):
+    log_file = tmp_path / "hc_restart.log"
+    fake_hc = tmp_path / "hc"
+    fake_hc.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"with open({str(log_file)!r}, 'a') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1:3] == ['machine', 'ls']:\n"
+        "    print(json.dumps({'machines': [{'name': 'lenovo', 'state': 'connected'}]}))\n"
+        "else:\n"
+        "    print('ok')\n",
+        encoding="utf-8",
+    )
+    fake_hc.chmod(0o755)
+    monkeypatch.setenv("HC_BIN_PATH", str(fake_hc))
+    monkeypatch.setenv("FACTORY_HOST_DIR", str(tmp_path))
+
+    from factory import cli
+    assert cli.main(["fleet", "restart"]) == 0
+    lines = log_file.read_text().splitlines()
+    assert any("kill lenovo/factory-worker-lenovo" in ln for ln in lines)
+    assert any("run --on lenovo --bg --name factory-worker-lenovo" in ln for ln in lines)
+
+
+def test_qa_external_blocker_escalates_immediately(tmp_path, monkeypatch):
+    import os
+    from unittest.mock import MagicMock
+    from factory.lib.pipeline import _handle_qa_failure_for_ticket
+    from factory.lib.staging_qa import TrainTicket
+    from factory.lib.state import create_or_resume_job
+
+    jobs_dir = str(tmp_path / "jobs")
+    qa_dir = str(tmp_path / "jobs" / "job-640" / "qa-1")
+    os.makedirs(qa_dir, exist_ok=True)
+    create_or_resume_job(jobs_dir, {"number": 640, "title": "503", "url": "https://x/640"}, 3)
+
+    gh = MagicMock()
+    cfg = {"labels": {"queue": "factory", "needs_info": "factory:needs-info", "needs_human": "factory:needs-human"}}
+    tk = TrainTicket(
+        job_id="job-640",
+        issue_number=640,
+        jdir=os.path.join(jobs_dir, "job-640"),
+        worktree=str(tmp_path),
+        branch="factory/job-640",
+        issue_md="",
+        initial_stage="staging_qa",
+        solo=True,
+        merged_sha="abc12345",
+    )
+    qa_out = {
+        "verdict": "FAIL",
+        "summary": ["CF Speed Brain"],
+        "scenarios_tested": ["tab click"],
+        "personas_used": ["pro"],
+        "failures": [],
+        "reproduction_steps": ["click tab"],
+        "external_blocker": "Disable Cloudflare Speed Brain on keepfor.me zone",
+    }
+    _handle_qa_failure_for_ticket(
+        str(tmp_path), jobs_dir, "main", cfg, gh, {}, tk, 1, 3, qa_dir, "QA failed", qa_out, "def67890", True, "ok"
+    )
+    assert tk.outcome is not None
+    assert tk.outcome.action == "return"
+    assert tk.outcome.job["stage"] == "needs-human"
+    gh.comment_issue.assert_called_once()
+    assert "Disable Cloudflare Speed Brain" in gh.comment_issue.call_args[0][1]
+
+
 
 

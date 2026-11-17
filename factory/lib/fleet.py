@@ -144,9 +144,12 @@ def _factory_shell_cmd(*args: str) -> list[str]:
     return ["sh", "-lc", f'export PATH="$HOME/.local/bin:$PATH"; exec factory {quoted}']
 
 
-def fleet_wake() -> list[tuple[str, int, str]]:
+def fleet_wake(machine: str | None = None) -> list[tuple[str, int, str]]:
     results: list[tuple[str, int, str]] = []
-    for m in discover_machines():
+    machines = discover_machines()
+    if machine:
+        machines = [m for m in machines if m["name"] == machine]
+    for m in machines:
         rc, out = _run_on_machine(
             m,
             _factory_shell_cmd("worker", "--all"),
@@ -203,6 +206,23 @@ def fleet_update(machine: str | None = None) -> list[tuple[str, int, str]]:
         rc, out = _run_on_machine(m, ["sh", "-lc", update_script])
         results.append((m["name"], rc, out))
     return results
+
+
+def fleet_restart(machine: str | None = None) -> list[tuple[str, int, str]]:
+    """Stop running factory worker terminals/processes on fleet machine(s) and wake them fresh."""
+    hc = _hc_bin()
+    stop_script = 'pkill -f "factory(\\.cli)? worker" 2>/dev/null || true'
+    machines = discover_machines()
+    if machine:
+        machines = [m for m in machines if m["name"] == machine]
+    for m in machines:
+        term_name = sanitize_hc_name(f"factory-worker-{m['name']}")
+        if hc and m.get("via") in ("local", "hc"):
+            term_ref = term_name if m.get("via") == "local" else f"{m['name']}/{term_name}"
+            subprocess.run([hc, "kill", term_ref], capture_output=True, text=True, timeout=15.0, check=False)
+        else:
+            _run_on_machine(m, ["sh", "-lc", stop_script])
+    return fleet_wake(machine)
 
 
 def fleet_remove(machine: str) -> tuple[int, str]:

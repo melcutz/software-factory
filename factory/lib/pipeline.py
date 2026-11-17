@@ -773,7 +773,8 @@ def _handle_qa_failure_for_ticket(
         ticket.done_event.set()
         return
 
-    if qa_attempt >= qa_limit:
+    ext_blocker = str((qa_out or {}).get("external_blocker") or "").strip()
+    if qa_attempt >= qa_limit or ext_blocker:
         update_job(
             jobs_dir,
             ticket.job_id,
@@ -785,15 +786,21 @@ def _handle_qa_failure_for_ticket(
             solo_staging_qa=False,
             prior_prs=prior_prs,
         )
+        prefix = (
+            f"External/infra blocker detected on QA round {qa_attempt}/{qa_limit}: {ext_blocker}."
+            if ext_blocker
+            else f"Staging QA failed {qa_attempt}/{qa_limit} rounds."
+        )
         esc_job = _escalate_to_human(
             jobs_dir,
             ticket.job_id,
             ticket.issue_number,
             gh_client,
             cfg,
-            f"Staging QA failed {qa_attempt}/{qa_limit} rounds. "
+            f"{prefix} "
             f"Reverted `{ticket.merged_sha[:7]}` on `{base_branch}` (`{revert_sha[:7]}`) and rolled back "
             f"staging cleanly.\n\n{failure_md}",
+            resume_stage="staging_qa",
         )
         ticket.outcome = TrainOutcome(action="return", job=esc_job)
         ticket.done_event.set()
@@ -3868,6 +3875,12 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
                 checks_content = f.read()
         except Exception:
             checks_content = ""
+        if "uv " in checks_content or "uv\n" in checks_content:
+            if not shutil.which("uv"):
+                ok = False
+                messages.append("MISSING: `uv` not found on PATH (required by factory/checks.sh)")
+            else:
+                messages.append("OK: `uv` found")
         if "pytest" in checks_content:
             try:
                 res_pytest = subprocess.run(
@@ -3910,5 +3923,41 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
         except Exception as exc:
             ok = False
             messages.append(f"FAIL: staging_qa secret loading failed: {exc}")
+
+        pw_probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from playwright.sync_api import sync_playwright; "
+                "p = sync_playwright().start(); "
+                "b = p.chromium.launch(headless=True); "
+                "b.close(); p.stop()",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if pw_probe.returncode != 0:
+            ok = False
+            detail = (pw_probe.stderr or pw_probe.stdout or "").strip().splitlines()[-1:] or ["failed"]
+            messages.append(f"FAIL: playwright headless chromium check failed ({detail[0]})")
+        else:
+            messages.append("OK: playwright headless chromium")
+
+        wrangler_ok = bool(shutil.which("wrangler"))
+        if not wrangler_ok and shutil.which("npx"):
+            wr = subprocess.run(
+                ["npx", "--no-install", "wrangler", "--version"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            wrangler_ok = wr.returncode == 0
+        if wrangler_ok:
+            messages.append("OK: wrangler available")
+        else:
+            ok = False
+            messages.append("MISSING: wrangler (install globally or via npm/npx for staging_qa deploy)")
 
     return ok, messages

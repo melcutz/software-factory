@@ -266,6 +266,7 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "reproduction_steps": {"type": "array", "items": {"type": "string"}},
+            "external_blocker": {"type": "string"},
         },
     },
 }
