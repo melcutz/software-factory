@@ -407,6 +407,128 @@ class FallbackChainsTest(unittest.TestCase):
             self.assertEqual(job["usage"]["by_tier"]["free"]["calls"], 1)
             self.assertEqual(job["usage"]["by_provider"]["opencode"]["calls"], 1)
 
+    def test_factory_stats_reports_per_tier_and_provider_breakdown(self) -> None:
+        import contextlib
+        import io
+        import tempfile
+
+        from factory import cli
+        from factory.lib.state import record_usage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, "stats-repo")
+            jobs_dir = os.path.join(repo, "factory", "jobs")
+            os.makedirs(jobs_dir, exist_ok=True)
+            enqueue_job(jobs_dir, {"number": 1, "title": "Issue 1", "body": "", "url": "http://example/1"}, max_rounds=3)
+            enqueue_job(jobs_dir, {"number": 2, "title": "Issue 2", "body": "", "url": "http://example/2"}, max_rounds=3)
+
+            record_usage(
+                jobs_dir,
+                "job-1",
+                {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "model": "gpu:jev",
+                },
+                0.5,
+                cost_usd=0.0,
+            )
+            record_usage(
+                jobs_dir,
+                "job-1",
+                {
+                    "input_tokens": 1000,
+                    "output_tokens": 200,
+                    "total_tokens": 1200,
+                    "model": "opencode/deepseek-v4.1-flash-free",
+                },
+                3.0,
+                cost_usd=0.0,
+            )
+            record_usage(
+                jobs_dir,
+                "job-2",
+                {
+                    "input_tokens": 2000,
+                    "output_tokens": 500,
+                    "total_tokens": 2500,
+                    "model": "opencode-go/glm-5.3",
+                },
+                4.0,
+                cost_usd=0.0,
+            )
+            record_usage(
+                jobs_dir,
+                "job-2",
+                {
+                    "input_tokens": 3000,
+                    "output_tokens": 600,
+                    "total_tokens": 3600,
+                    "model": "gemini-4-hydrogen-medium",
+                },
+                5.0,
+                cost_usd=0.009,
+            )
+
+            buf_json = io.StringIO()
+            with contextlib.redirect_stdout(buf_json):
+                rc = cli.main(["stats", "--repo", repo, "--json"])
+            self.assertEqual(rc, 0)
+            summary = json.loads(buf_json.getvalue())
+            self.assertEqual(summary["by_tier"]["local"]["calls"], 1)
+            self.assertEqual(summary["by_tier"]["free"]["calls"], 1)
+            self.assertEqual(summary["by_tier"]["free"]["total_tokens"], 1200)
+            self.assertEqual(summary["by_tier"]["subscription"]["calls"], 1)
+            self.assertEqual(summary["by_tier"]["subscription"]["total_tokens"], 2500)
+            self.assertEqual(summary["by_tier"]["paid"]["calls"], 1)
+            self.assertAlmostEqual(summary["by_tier"]["paid"]["cost_usd"], 0.009)
+            self.assertEqual(summary["by_provider"]["gpu"]["calls"], 1)
+            self.assertEqual(summary["by_provider"]["opencode"]["calls"], 1)
+            self.assertEqual(summary["by_provider"]["opencode-go"]["calls"], 1)
+            self.assertEqual(summary["by_provider"]["agy"]["calls"], 1)
+
+            buf_txt = io.StringIO()
+            with contextlib.redirect_stdout(buf_txt):
+                rc2 = cli.main(["stats", "--repo", repo])
+            self.assertEqual(rc2, 0)
+            txt = buf_txt.getvalue()
+            self.assertIn("Tiers:", txt)
+            self.assertIn("Providers:", txt)
+            self.assertIn("opencode-go: calls=1", txt)
+
+    def test_worker_chain_cooldown_gate_requires_all_models_in_chain_cooled_down(self) -> None:
+        from factory.lib.governor import is_model_in_cooldown
+
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["models"]["intake"] = ["opencode/deepseek-v4.1-flash-free", "gemini-4-hydrogen-low"]
+        cfg["models"]["spec_writer"] = ["gemini-4-hydrogen-medium"]
+        cfg["models"]["builder"] = ["opencode-go/glm-5.3", "gemini-4-argon-high"]
+
+        partial_quota = {
+            "models": {
+                "opencode-free": {"cooldown_until_ts": time.time() + 600},
+                "opencode-go": {"cooldown_until_ts": time.time() + 600},
+            }
+        }
+        in_cd_partial = any(
+            bool(model_chain(cfg, role)) and all(is_model_in_cooldown(partial_quota, m)[0] for m in model_chain(cfg, role))
+            for role in ("intake", "spec_writer", "builder")
+        )
+        self.assertFalse(in_cd_partial)
+
+        full_intake_quota = {
+            "models": {
+                "opencode-free": {"cooldown_until_ts": time.time() + 600},
+                "gemini-4-hydrogen": {"cooldown_until_ts": time.time() + 600},
+            }
+        }
+        in_cd_full = any(
+            bool(model_chain(cfg, role)) and all(is_model_in_cooldown(full_intake_quota, m)[0] for m in model_chain(cfg, role))
+            for role in ("intake", "spec_writer", "builder")
+        )
+        self.assertTrue(in_cd_full)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -939,6 +939,33 @@ def main(argv: list[str] | None = None) -> int:
         llm_dur = 0.0
         gate_dur = 0.0
         deploy_dur = 0.0
+        by_tier: dict[str, dict] = {}
+        by_provider: dict[str, dict] = {}
+
+        def _merge_bucket(dest: dict[str, dict], src: dict) -> None:
+            for k, v in (src or {}).items():
+                if not isinstance(v, dict):
+                    continue
+                cur_b = dest.setdefault(
+                    k,
+                    {
+                        "calls": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                        "duration_seconds": 0.0,
+                        "cost_usd": 0.0,
+                    },
+                )
+                cur_b["calls"] += int(v.get("calls", 0) or 0)
+                cur_b["input_tokens"] += int(v.get("input_tokens", 0) or 0)
+                cur_b["output_tokens"] += int(v.get("output_tokens", 0) or 0)
+                cur_b["total_tokens"] += int(v.get("total_tokens", 0) or 0)
+                cur_b["duration_seconds"] = round(
+                    cur_b["duration_seconds"] + float(v.get("duration_seconds", 0.0) or 0.0), 3
+                )
+                cur_b["cost_usd"] = round(cur_b["cost_usd"] + float(v.get("cost_usd", 0.0) or 0.0), 6)
+
         for j in all_jobs:
             st = str(j.get("stage") or "unknown")
             counts_by_stage[st] = counts_by_stage.get(st, 0) + 1
@@ -953,6 +980,10 @@ def main(argv: list[str] | None = None) -> int:
             llm_dur += float(u.get("duration_seconds") or 0.0)
             gate_dur += float(m.get("gate_duration_seconds") or 0.0)
             deploy_dur += float(m.get("deploy_duration_seconds") or 0.0)
+            if isinstance(u.get("by_tier"), dict):
+                _merge_bucket(by_tier, u["by_tier"])
+            if isinstance(u.get("by_provider"), dict):
+                _merge_bucket(by_provider, u["by_provider"])
         total_jobs = len(all_jobs)
         merged_count = counts_by_stage.get("merged", 0)
         merge_rate = round(merged_count / total_jobs, 4) if total_jobs else 0.0
@@ -971,6 +1002,8 @@ def main(argv: list[str] | None = None) -> int:
                 "gate": round(gate_dur, 3),
                 "deploy": round(deploy_dur, 3),
             },
+            "by_tier": by_tier,
+            "by_provider": by_provider,
         }
         if args.json:
             print(json.dumps(summary, indent=2))
@@ -979,6 +1012,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Stages: {counts_by_stage}")
             print(f"Cost: total=${summary['total_cost_usd']:.4f} | median_merged=${median_merged_cost:.4f} | cache_hit={cache_hit_pct:.1f}%")
             print(f"Durations: llm={llm_dur:.1f}s | gate={gate_dur:.1f}s | deploy={deploy_dur:.1f}s")
+            if by_tier:
+                tier_parts = [
+                    f"{t}: calls={d['calls']} tokens={d['total_tokens']:,} cost=${d['cost_usd']:.4f}"
+                    for t, d in sorted(by_tier.items())
+                ]
+                print("Tiers: " + " | ".join(tier_parts))
+            if by_provider:
+                prov_parts = [
+                    f"{p}: calls={d['calls']} tokens={d['total_tokens']:,} cost=${d['cost_usd']:.4f}"
+                    for p, d in sorted(by_provider.items())
+                ]
+                print("Providers: " + " | ".join(prov_parts))
         return 0
 
     if args.command == "logs":
