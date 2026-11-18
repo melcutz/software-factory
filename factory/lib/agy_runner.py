@@ -786,3 +786,186 @@ def run_agent(
                 break
 
     raise AgentExecutionError(f"Stage {stage} ({agent_name}) failed after 2 attempts: {last_err}")
+
+
+def run_agent_chain(
+    factory_dir: str,
+    job_dir: str,
+    worktree: str,
+    stage: str,
+    agent_name: str,
+    models: str | list[str],
+    task_prompt: str,
+    schema: dict,
+    timeout_sec: int,
+    *,
+    config: dict | None = None,
+    state_store: object | None = None,
+    runner_fn: Callable[..., tuple[dict, dict, float]] | None = None,
+    log_fn: Callable[[str], None] | None = None,
+    abort_check: Callable[[], BaseException | None] | None = None,
+    **run_kwargs,
+) -> tuple[dict, dict, float]:
+    """Try each model in a fallback chain in order according to SPEC fallthrough rules.
+
+    Moves on after:
+      - active provider cooldown in refs/factory/quota (skips without calling)
+      - GpuAbstain
+      - QuotaExhaustedError (records bucket cooldown in state_store if provided)
+      - AgentExecutionError (EXCEPT "illegally moved HEAD")
+      - TimeoutError / subprocess.TimeoutExpired
+    Never moves on after:
+      - JobHaltedError, LeaseLostError, abort_check exceptions, or "illegally moved HEAD"
+    """
+    from factory.lib.config import provider_timeout_sec
+    from factory.lib.governor import is_model_in_cooldown, quota_bucket_for_model
+
+    if isinstance(models, str):
+        chain = [models.strip()] if models.strip() else []
+    elif isinstance(models, list):
+        chain = [str(m).strip() for m in models if isinstance(m, str) and m.strip()]
+    else:
+        chain = []
+    if not chain:
+        raise ValueError(f"Empty model chain for stage {stage!r} ({agent_name!r})")
+
+    runner = runner_fn or run_agent
+    quota_state: dict = {"models": {}}
+    if state_store is not None and hasattr(state_store, "get_quota_state"):
+        try:
+            quota_state = state_store.get_quota_state()
+        except Exception:
+            quota_state = {"models": {}}
+
+    last_err: Exception | None = None
+    last_quota_err: QuotaExhaustedError | None = None
+    attempted = 0
+    all_quota = True
+    cooldown_remainings: list[float] = []
+
+    for idx, model_spec in enumerate(chain):
+        if len(chain) > 1 and isinstance(quota_state, dict) and quota_state.get("models"):
+            in_cd, rem = is_model_in_cooldown(quota_state, model_spec)
+            if in_cd:
+                cooldown_remainings.append(rem)
+                if log_fn is not None:
+                    bucket = quota_bucket_for_model(model_spec)
+                    log_fn(
+                        f"chain stage={stage} skipping {model_spec} (bucket={bucket} in cooldown for {int(rem)}s)"
+                    )
+                continue
+
+        eff_timeout = provider_timeout_sec(config, model_spec, timeout_sec)
+        attempted += 1
+        aborted_exc: BaseException | None = None
+
+        def _wrapped_abort() -> BaseException | None:
+            nonlocal aborted_exc
+            if abort_check is None:
+                return None
+            try:
+                exc = abort_check()
+            except BaseException as raised:
+                aborted_exc = raised
+                raise
+            if exc is not None:
+                aborted_exc = exc
+            return exc
+
+        call_kwargs = dict(run_kwargs)
+        if abort_check is not None:
+            call_kwargs["abort_check"] = _wrapped_abort
+
+        try:
+            out, usage, dur = runner(
+                factory_dir,
+                job_dir,
+                worktree,
+                stage,
+                agent_name,
+                model_spec,
+                task_prompt,
+                schema,
+                eff_timeout,
+                **call_kwargs,
+            )
+            usage_dict = dict(usage) if isinstance(usage, dict) else {}
+            prov, tier = classify_model_provider(model_spec)
+            usage_dict.setdefault("provider", prov)
+            usage_dict.setdefault("tier", tier)
+            usage_dict["model"] = model_spec
+            if state_store is not None and hasattr(state_store, "clear_quota_cooldown"):
+                bucket = quota_bucket_for_model(model_spec)
+                q_models = (quota_state.get("models") or {}) if isinstance(quota_state, dict) else {}
+                if bucket and (bucket in q_models or model_spec in q_models):
+                    try:
+                        state_store.clear_quota_cooldown(bucket)
+                    except Exception:
+                        pass
+            return out, usage_dict, dur
+        except Exception as exc:
+            if aborted_exc is not None and exc is aborted_exc:
+                raise
+            if type(exc).__name__ in {"JobHaltedError", "LeaseLostError"}:
+                raise
+            if isinstance(exc, AgentExecutionError) and "illegally moved HEAD" in str(exc):
+                raise
+
+            if type(exc).__name__ == "GpuAbstain":
+                all_quota = False
+                last_err = exc
+                if log_fn is not None and idx + 1 < len(chain):
+                    log_fn(f"chain stage={stage} model={model_spec} abstained ({exc}); trying {chain[idx + 1]}")
+                continue
+
+            if isinstance(exc, QuotaExhaustedError):
+                last_err = exc
+                last_quota_err = exc
+                bucket = exc.bucket or quota_bucket_for_model(exc.model_spec or model_spec)
+                if state_store is not None and hasattr(state_store, "record_quota_cooldown") and idx + 1 < len(chain):
+                    try:
+                        quota_state = state_store.record_quota_cooldown(
+                            bucket or model_spec,
+                            str(exc),
+                            exc.retry_after_sec,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # Also update local quota_state snapshot so later models sharing the same bucket are skipped immediately
+                    if bucket:
+                        quota_state.setdefault("models", {})[bucket] = {
+                            "cooldown_until_ts": time.time() + float(exc.retry_after_sec or 300),
+                        }
+                if log_fn is not None and idx + 1 < len(chain):
+                    log_fn(f"chain stage={stage} model={model_spec} quota exhausted; trying {chain[idx + 1]}")
+                continue
+
+            if isinstance(exc, (AgentExecutionError, TimeoutError, subprocess.TimeoutExpired)):
+                all_quota = False
+                if not isinstance(exc, AgentExecutionError):
+                    exc = AgentExecutionError(f"Stage {stage} ({agent_name}) timed out on {model_spec}: {exc}")
+                last_err = exc
+                if log_fn is not None and idx + 1 < len(chain):
+                    log_fn(f"chain stage={stage} model={model_spec} failed ({exc}); trying {chain[idx + 1]}")
+                continue
+
+            raise
+
+    if attempted == 0:
+        min_rem = int(min(cooldown_remainings)) if cooldown_remainings else None
+        first_bucket = quota_bucket_for_model(chain[0])
+        raise QuotaExhaustedError(
+            chain[0],
+            retry_after_sec=min_rem,
+            message=f"All models in chain {chain!r} are in quota cooldown",
+            bucket=first_bucket,
+        )
+
+    if all_quota and last_quota_err is not None:
+        raise last_quota_err
+    if last_err is not None:
+        if type(last_err).__name__ == "GpuAbstain":
+            raise AgentExecutionError(f"All models in chain {chain!r} abstained: {last_err}")
+        raise last_err
+    raise AgentExecutionError(f"All models in chain {chain!r} failed for stage {stage}")

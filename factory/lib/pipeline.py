@@ -17,13 +17,21 @@ import time
 from datetime import datetime
 
 import factory.lib.governor as _governor
-from factory.lib.agy_runner import AgentExecutionError, QuotaExhaustedError, resolve_agent_path, run_agent
+from factory.lib.agy_runner import (
+    AgentExecutionError,
+    QuotaExhaustedError,
+    classify_model_provider,
+    resolve_agent_path,
+    run_agent,
+    run_agent_chain,
+)
 from factory.lib.batch import run_batch_factory
 
 _ORIG_RUN_AGENT = run_agent
 from factory.lib.config import (
     estimate_usage_cost_usd,
     load_config,
+    model_chain,
     resolve_reviewers,
     split_model_and_effort,
 )
@@ -161,46 +169,65 @@ def _fmt_duration(seconds: float) -> str:
     return f"{mins}m{rem:02d}s ({sec:.1f}s)"
 
 
-def _fmt_model_tag(model_spec: str) -> str:
+def _fmt_model_tag(model_spec: str | list[str]) -> str:
+    if isinstance(model_spec, list):
+        first = str(model_spec[0]).strip() if model_spec else ""
+        base_model, effort = split_model_and_effort(first)
+        if len(model_spec) > 1:
+            return f"model={base_model} effort={effort} chain={len(model_spec)}"
+        return f"model={base_model} effort={effort}"
     base_model, effort = split_model_and_effort(model_spec)
     return f"model={base_model} effort={effort}"
 
 
 def _clear_quota_cooldown_if_needed(
     state_store: GitStateStore | None,
-    model_spec: str,
+    model_spec: str | list[str],
 ) -> None:
     if state_store is None:
         return
-    raw_spec = (model_spec or "").strip()
+    if isinstance(model_spec, list):
+        raw_spec = str(model_spec[0]).strip() if model_spec else ""
+    else:
+        raw_spec = (model_spec or "").strip()
     if not raw_spec:
         return
-    base_model = split_model_and_effort(raw_spec)[0].split(":", 1)[0].split()[0]
-    if not base_model:
+    bucket = _governor.quota_bucket_for_model(raw_spec)
+    if not bucket:
         return
     models = state_store.get_quota_state().get("models")
-    if isinstance(models, dict) and base_model in models:
-        state_store.clear_quota_cooldown(base_model)
+    if isinstance(models, dict) and (bucket in models or raw_spec in models):
+        state_store.clear_quota_cooldown(bucket)
 
 
 def _record_and_format_step(
     jobs_dir: str,
     job_id: str,
-    model_spec: str,
+    model_spec: str | list[str],
     usage: dict,
     duration_sec: float,
     config: dict,
 ) -> str:
-    step_cost = estimate_usage_cost_usd(model_spec, usage, config)
-    updated_job = record_usage(jobs_dir, job_id, usage, duration_sec, cost_usd=step_cost)
-    u = usage or {}
+    u = dict(usage) if isinstance(usage, dict) else {}
+    if isinstance(model_spec, list):
+        default_spec = str(model_spec[0]).strip() if model_spec else ""
+    else:
+        default_spec = (model_spec or "").strip()
+    effective_spec = str(u.get("model") or default_spec).strip()
+    if effective_spec:
+        prov, tier = classify_model_provider(effective_spec)
+        u.setdefault("provider", prov)
+        u.setdefault("tier", tier)
+        u.setdefault("model", effective_spec)
+    step_cost = estimate_usage_cost_usd(effective_spec, u, config)
+    updated_job = record_usage(jobs_dir, job_id, u, duration_sec, cost_usd=step_cost)
     in_tok = int(u.get("input_tokens", 0) or 0)
     cache_tok = int(u.get("cache_read_tokens", 0) or 0)
     out_tok = int(u.get("output_tokens", 0) or 0)
     think_tok = int(u.get("thinking_tokens", 0) or 0)
     tot_tok = int(u.get("total_tokens", 0) or (in_tok + out_tok))
     parts = [
-        _fmt_model_tag(model_spec),
+        _fmt_model_tag(effective_spec),
         f"dur={_fmt_duration(duration_sec)}",
         f"tokens={tot_tok:,} (in={in_tok:,} cache={cache_tok:,} out={out_tok:,} think={think_tok:,})",
     ]
@@ -484,7 +511,7 @@ def _sync_pr_with_base(
             _set_activity(jobs_dir, job_id, "running:conflict-resolve")
             _log(job_id, f"merge-conflict resolve start files={len(conflicts)} ({_fmt_model_tag(builder_model)})")
             try:
-                resolve_out, usage, dur = run_agent(
+                resolve_out, usage, dur = _call_run_agent(
                     factory_dir,
                     jdir,
                     worktree,
@@ -494,6 +521,9 @@ def _sync_pr_with_base(
                     conflict_prompt,
                     SCHEMAS["build"],
                     timeout_sec,
+                    config=cfg,
+                    state_store=state_store,
+                    job_id=job_id,
                     sandbox=False,
                     log_name=f"r{round_num}-merge-conflict",
                 )
@@ -504,8 +534,9 @@ def _sync_pr_with_base(
                     f"Merge conflict resolution failed while syncing `{branch}` with `origin/{base_branch}`: {exc}",
                 )
 
-            _clear_quota_cooldown_if_needed(state_store, builder_model)
-            metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
+            used_model = (usage or {}).get("model") or builder_model
+            _clear_quota_cooldown_if_needed(state_store, used_model)
+            metrics_str = _record_and_format_step(jobs_dir, job_id, used_model, usage, dur, cfg)
             _log(job_id, f"merge-conflict resolve verdict={resolve_out['verdict']} ({metrics_str})")
 
             if resolve_out["verdict"] == "BLOCKED":
@@ -1568,7 +1599,7 @@ def _execute_staging_train_batch(
                                 t.issue_md,
                             ]
                         )
-                        qa_out, usage, dur = run_agent(
+                        qa_out, usage, dur = _call_run_agent(
                             factory_dir,
                             t.jdir,
                             deploy_wt,
@@ -1578,15 +1609,19 @@ def _execute_staging_train_batch(
                             qa_prompt,
                             SCHEMAS["qa"],
                             qa_timeout_sec,
+                            config=cfg,
+                            state_store=state_store,
+                            job_id=t.job_id,
                             sandbox=False,
                             clean_worktree=False,
                             log_name=f"qa-{qa_attempt}",
                             extra_env=qa_env,
                             protect_head=True,
                         )
-                        _clear_quota_cooldown_if_needed(state_store, qa_model)
+                        used_qa_model = (usage or {}).get("model") or qa_model
+                        _clear_quota_cooldown_if_needed(state_store, used_qa_model)
                         metrics_str = _record_and_format_step(
-                            jobs_dir, t.job_id, qa_model, usage, dur, cfg
+                            jobs_dir, t.job_id, used_qa_model, usage, dur, cfg
                         )
                         _log(
                             t.job_id,
@@ -2039,7 +2074,7 @@ def _make_abort_check(
     return _check
 
 
-def _call_run_agent(*args, abort_check=None, **kwargs):
+def _call_single_run_agent(*args, abort_check=None, **kwargs):
     """Invoke `run_agent`, passing `abort_check` when accepted by the callable."""
     try:
         sig = inspect.signature(run_agent)
@@ -2050,6 +2085,43 @@ def _call_run_agent(*args, abort_check=None, **kwargs):
     except (ValueError, TypeError):
         pass
     return run_agent(*args, **kwargs)
+
+
+def _call_run_agent(
+    factory_dir: str,
+    job_dir: str,
+    worktree: str,
+    stage: str,
+    agent_name: str,
+    models: str | list[str],
+    task_prompt: str,
+    schema: dict,
+    timeout_sec: int,
+    *,
+    config: dict | None = None,
+    state_store: GitStateStore | None = None,
+    job_id: str = "",
+    abort_check=None,
+    **kwargs,
+):
+    """Invoke `run_agent_chain` across one or more models in `models`, using `pipeline.run_agent` as the runner."""
+    return run_agent_chain(
+        factory_dir,
+        job_dir,
+        worktree,
+        stage,
+        agent_name,
+        models,
+        task_prompt,
+        schema,
+        timeout_sec,
+        config=config,
+        state_store=state_store,
+        runner_fn=_call_single_run_agent,
+        log_fn=(lambda msg: _log(job_id, msg)) if job_id else None,
+        abort_check=abort_check,
+        **kwargs,
+    )
 
 
 def _checkpoint_if_store(
@@ -2075,6 +2147,27 @@ def _checkpoint_if_store(
         update_job(jobs_dir, job_id, **updates)
 
 
+def select_builder_chain(
+    cfg: dict,
+    job: dict,
+    *,
+    attempt: int,
+    is_fix_round: bool = False,
+    is_conflict: bool = False,
+) -> list[str]:
+    """Select fast builder_low chain on clean low-risk attempt 0, otherwise models['builder'] chain."""
+    low_chain = model_chain(cfg, "builder_low")
+    if (
+        low_chain
+        and (job.get("risk") or "") == "low"
+        and attempt == 0
+        and not is_fix_round
+        and not is_conflict
+    ):
+        return low_chain
+    return model_chain(cfg, "builder")
+
+
 def select_builder_model(
     cfg: dict,
     job: dict,
@@ -2082,20 +2175,23 @@ def select_builder_model(
     attempt: int,
     is_fix_round: bool = False,
     is_conflict: bool = False,
-) -> str:
+) -> str | list[str]:
     """Select fast builder_low on clean low-risk attempt 0, otherwise escalate to models['builder']."""
     models = cfg.get("models") or {}
     low_model = models.get("builder_low")
+    has_low = (isinstance(low_model, str) and bool(low_model.strip())) or (
+        isinstance(low_model, list) and any(isinstance(s, str) and s.strip() for s in low_model)
+    )
     if (
-        isinstance(low_model, str)
-        and low_model.strip()
+        has_low
         and (job.get("risk") or "") == "low"
         and attempt == 0
         and not is_fix_round
         and not is_conflict
     ):
-        return low_model.strip()
-    return models["builder"]
+        return low_model.strip() if isinstance(low_model, str) else [str(s).strip() for s in low_model if str(s).strip()]
+    b_val = models["builder"]
+    return b_val.strip() if isinstance(b_val, str) else [str(s).strip() for s in b_val if str(s).strip()]
 
 
 def _check_cost_budget(
@@ -2380,12 +2476,16 @@ def process_job(
                     prompt,
                     SCHEMAS["intake"],
                     timeout_sec,
+                    config=cfg,
+                    state_store=state_store,
+                    job_id=job_id,
                     sandbox=True,
                     log_name="intake",
                     abort_check=abort_check,
                 )
-                _clear_quota_cooldown_if_needed(state_store, intake_model)
-                metrics_str = _record_and_format_step(jobs_dir, job_id, intake_model, usage, dur, cfg)
+                used_intake_model = (usage or {}).get("model") or intake_model
+                _clear_quota_cooldown_if_needed(state_store, used_intake_model)
+                metrics_str = _record_and_format_step(jobs_dir, job_id, used_intake_model, usage, dur, cfg)
                 _log(job_id, f"intake done decision={intake_out['decision']} ({metrics_str})")
                 _write_json(os.path.join(jdir, "intake.json"), intake_out)
                 _write_text(os.path.join(jdir, "intake.md"), render_intake_md(intake_out))
@@ -2445,12 +2545,16 @@ def process_job(
                     prompt,
                     SCHEMAS["spec"],
                     timeout_sec,
+                    config=cfg,
+                    state_store=state_store,
+                    job_id=job_id,
                     sandbox=True,
                     log_name="spec",
                     abort_check=abort_check,
                 )
-                _clear_quota_cooldown_if_needed(state_store, spec_model)
-                metrics_str = _record_and_format_step(jobs_dir, job_id, spec_model, usage, dur, cfg)
+                used_spec_model = (usage or {}).get("model") or spec_model
+                _clear_quota_cooldown_if_needed(state_store, used_spec_model)
+                metrics_str = _record_and_format_step(jobs_dir, job_id, used_spec_model, usage, dur, cfg)
                 _log(job_id, f"spec done slices={len(spec_out['slices'])} ({metrics_str})")
 
                 allow_self_host = bool(cfg.get("allow_self_host", False))
@@ -2488,12 +2592,16 @@ def process_job(
                         retry_prompt,
                         SCHEMAS["spec"],
                         timeout_sec,
+                        config=cfg,
+                        state_store=state_store,
+                        job_id=job_id,
                         sandbox=True,
                         log_name="spec-retry",
                         abort_check=abort_check,
                     )
-                    _clear_quota_cooldown_if_needed(state_store, spec_model)
-                    metrics_str = _record_and_format_step(jobs_dir, job_id, spec_model, usage, dur, cfg)
+                    used_retry_spec_model = (usage or {}).get("model") or spec_model
+                    _clear_quota_cooldown_if_needed(state_store, used_retry_spec_model)
+                    metrics_str = _record_and_format_step(jobs_dir, job_id, used_retry_spec_model, usage, dur, cfg)
                     _log(job_id, f"spec retry done slices={len(spec_out['slices'])} ({metrics_str})")
                     planned_files = [
                         str(f)
@@ -2609,12 +2717,16 @@ def process_job(
                                 "\n".join(prompt_parts),
                                 SCHEMAS["build"],
                                 timeout_sec,
+                                config=cfg,
+                                state_store=state_store,
+                                job_id=job_id,
                                 sandbox=False,
                                 log_name=f"r{round_num}-slice-{slice_num}-a{attempt + 1}",
                                 abort_check=abort_check,
                             )
-                            _clear_quota_cooldown_if_needed(state_store, builder_model)
-                            metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
+                            used_builder_model = (usage or {}).get("model") or builder_model
+                            _clear_quota_cooldown_if_needed(state_store, used_builder_model)
+                            metrics_str = _record_and_format_step(jobs_dir, job_id, used_builder_model, usage, dur, cfg)
                             _log(
                                 job_id,
                                 f"build slice={slice_num}/{total_slices} attempt={attempt + 1} verdict={build_out['verdict']} ({metrics_str})",
@@ -2799,12 +2911,16 @@ def process_job(
                         "\n".join(prompt_parts),
                         SCHEMAS["build"],
                         timeout_sec,
+                        config=cfg,
+                        state_store=state_store,
+                        job_id=job_id,
                         sandbox=False,
                         log_name=f"r{round_num}-fix-build",
                         abort_check=abort_check,
                     )
-                    _clear_quota_cooldown_if_needed(state_store, builder_model)
-                    metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
+                    used_fix_model = (usage or {}).get("model") or builder_model
+                    _clear_quota_cooldown_if_needed(state_store, used_fix_model)
+                    metrics_str = _record_and_format_step(jobs_dir, job_id, used_fix_model, usage, dur, cfg)
                     _log(job_id, f"build fix-round={round_num} verdict={build_out['verdict']} ({metrics_str})")
                     if build_out["verdict"] == "BLOCKED":
                         esc_job = _escalate_to_human(
@@ -2899,12 +3015,16 @@ def process_job(
                         fix_prompt,
                         SCHEMAS["build"],
                         timeout_sec,
+                        config=cfg,
+                        state_store=state_store,
+                        job_id=job_id,
                         sandbox=False,
                         log_name=f"r{round_num}-gate-fix-{attempt + 1}",
                         abort_check=abort_check,
                     )
-                    _clear_quota_cooldown_if_needed(state_store, builder_model)
-                    metrics_str = _record_and_format_step(jobs_dir, job_id, builder_model, usage, dur, cfg)
+                    used_gate_fix_model = (usage or {}).get("model") or builder_model
+                    _clear_quota_cooldown_if_needed(state_store, used_gate_fix_model)
+                    metrics_str = _record_and_format_step(jobs_dir, job_id, used_gate_fix_model, usage, dur, cfg)
                     _log(job_id, f"gate-fix attempt={attempt + 1} verdict={fix_out['verdict']} ({metrics_str})")
                     if fix_out["verdict"] == "BLOCKED":
                         esc_job = _escalate_to_human(
@@ -2995,7 +3115,7 @@ def process_job(
                     ]
                 )
 
-                def _run_single_reviewer(item: tuple[str, str]) -> tuple[str, dict]:
+                def _run_single_reviewer(item: tuple[str, str | list[str]]) -> tuple[str, dict]:
                     rev_name, rev_model = item
                     agent_file = f"reviewer-{rev_name}"
                     _log(job_id, f"review={rev_name} start ({_fmt_model_tag(rev_model)})")
@@ -3009,13 +3129,17 @@ def process_job(
                         review_prompt,
                         SCHEMAS["review"],
                         timeout_sec,
+                        config=cfg,
+                        state_store=state_store,
+                        job_id=job_id,
                         sandbox=True,
                         clean_worktree=False,
                         log_name=f"r{round_num}-review-{rev_name}",
                         abort_check=_make_abort_check(repo_root, job_id, jobs_dir, state_store),
                     )
-                    _clear_quota_cooldown_if_needed(state_store, rev_model)
-                    metrics_str = _record_and_format_step(jobs_dir, job_id, rev_model, u, d, cfg)
+                    used_rev_model = (u or {}).get("model") or rev_model
+                    _clear_quota_cooldown_if_needed(state_store, used_rev_model)
+                    metrics_str = _record_and_format_step(jobs_dir, job_id, used_rev_model, u, d, cfg)
                     _write_json(os.path.join(round_dir, f"review-{rev_name}.json"), out)
                     _write_text(
                         os.path.join(round_dir, f"review-{rev_name}.md"),
@@ -3127,12 +3251,16 @@ def process_job(
                         "\n".join(approve_parts),
                         SCHEMAS["approve"],
                         timeout_sec,
+                        config=cfg,
+                        state_store=state_store,
+                        job_id=job_id,
                         sandbox=True,
                         log_name=f"r{round_num}-approve",
                         abort_check=abort_check,
                     )
-                    _clear_quota_cooldown_if_needed(state_store, approver_model)
-                    metrics_str = _record_and_format_step(jobs_dir, job_id, approver_model, usage, dur, cfg)
+                    used_approve_model = (usage or {}).get("model") or approver_model
+                    _clear_quota_cooldown_if_needed(state_store, used_approve_model)
+                    metrics_str = _record_and_format_step(jobs_dir, job_id, used_approve_model, usage, dur, cfg)
                     _log(job_id, f"approve decision={approve_out['decision']} ({metrics_str})")
                 _write_json(os.path.join(round_dir, "approve.json"), approve_out)
                 _write_text(os.path.join(round_dir, "approve.md"), render_approve_md(approve_out))
@@ -3318,9 +3446,8 @@ def process_job(
             reset_worktree_clean(worktree)
         _set_activity(jobs_dir, job_id, "cooldown: quota")
         if state_store is not None:
-            base_model, _ = split_model_and_effort(exc.model_spec)
-            base_model = base_model.split(":", 1)[0].split()[0]
-            state_store.record_quota_cooldown(base_model, str(exc), exc.retry_after_sec)
+            bucket = exc.bucket or _governor.quota_bucket_for_model(exc.model_spec)
+            state_store.record_quota_cooldown(bucket or exc.model_spec, str(exc), exc.retry_after_sec)
             _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, release_lease=True)
         return load_job(jobs_dir, job_id)
     except LeaseLostError:
@@ -3398,7 +3525,7 @@ def _plan_queue_batch(
         plan_dir = os.path.join(jobs_dir, "_planner")
         os.makedirs(plan_dir, exist_ok=True)
         try:
-            out, _, _ = run_agent(
+            out, u, _ = _call_run_agent(
                 factory_dir,
                 plan_dir,
                 repo_root,
@@ -3411,8 +3538,12 @@ def _plan_queue_batch(
                 sandbox=True,
                 clean_worktree=False,
                 log_name="queue-plan",
+                config=cfg,
+                state_store=state_store,
+                job_id="_planner",
             )
-            _clear_quota_cooldown_if_needed(state_store, planner_model)
+            used_planner_model = (u or {}).get("model") or planner_model
+            _clear_quota_cooldown_if_needed(state_store, used_planner_model)
             return out
         except Exception as exc:
             print(f"[factory] warning: queue planner failed, using explicit dependencies only: {exc}", file=sys.stderr)

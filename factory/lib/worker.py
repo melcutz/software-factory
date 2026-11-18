@@ -389,18 +389,16 @@ def run_worker(
 
                 cfg = load_config(os.path.join(repo, "factory"))
                 try:
-                    from factory.lib.config import split_model_and_effort
+                    from factory.lib.config import model_chain
                     from factory.lib.governor import is_model_in_cooldown
 
                     quota_state = store.get_quota_state()
-                    models_cfg = cfg.get("models") or {}
                     in_cd = False
                     for role in ("intake", "spec_writer", "builder"):
-                        raw_spec = str(models_cfg.get(role) or "").strip()
-                        if not raw_spec:
+                        chain = model_chain(cfg, role)
+                        if not chain:
                             continue
-                        base_model = split_model_and_effort(raw_spec)[0].split(":", 1)[0].split()[0]
-                        if base_model and is_model_in_cooldown(quota_state, base_model)[0]:
+                        if all(is_model_in_cooldown(quota_state, m)[0] for m in chain):
                             in_cd = True
                             break
                     if in_cd:
