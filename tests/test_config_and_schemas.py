@@ -6,6 +6,8 @@ import unittest
 from factory.lib.config import (
     estimate_usage_cost_usd,
     load_config,
+    model_chain,
+    provider_timeout_sec,
     resolve_reviewers,
     split_model_and_effort,
 )
@@ -198,15 +200,15 @@ class ConfigAndSchemaTests(unittest.TestCase):
                 "total_tokens": 110_000,
             },
         )
-        # 0.1M * 1.25 + 1.0M * 0.3125 + 0.01M * 10.0 = 0.5375 (thinking_tokens not double-counted)
-        self.assertAlmostEqual(cost, 0.5375)
+        # 0.1M * 2.00 + 1.0M * 0.50 + 0.01M * 10.0 = 0.80 (thinking_tokens not double-counted)
+        self.assertAlmostEqual(cost, 0.80)
 
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "model_pricing": {
-                            "custom-pro": {"input_per_m": 2.0, "cached_per_m": 0.5, "output_per_m": 8.0}
+                            "gemini-custom-pro": {"input_per_m": 2.0, "cached_per_m": 0.5, "output_per_m": 8.0}
                         }
                     },
                     f,
@@ -214,7 +216,7 @@ class ConfigAndSchemaTests(unittest.TestCase):
             cfg = load_config(d)
             self.assertIn("gemini-4-argon", cfg["model_pricing"])
             custom_cost = estimate_usage_cost_usd(
-                "custom-pro-high",
+                "gemini-custom-pro-high",
                 {"input_tokens": 500_000, "cache_read_tokens": 200_000, "output_tokens": 50_000},
                 cfg,
             )
@@ -320,6 +322,133 @@ class ConfigAndSchemaTests(unittest.TestCase):
                     "notes": "",
                 },
             )
+
+    def test_config_validation_chains_prefixes_gpu_roles_timeouts_and_mcp_url(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg_file = os.path.join(d, "config.json")
+            with open(cfg_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "models": {
+                            "intake": ["gpu:jev", "gemini-4-hydrogen-low"],
+                            "approver": ["gpu:jev", "gemini-4-argon-medium"],
+                            "planner": ["gpu:jev", "gemini-4-hydrogen-low"],
+                            "builder": ["opencode/deepseek-v4.1-flash-free", "gemini-4-hydrogen-medium"],
+                            "code_low": ["openrouter/cohere/north-mini-code:free", "gemini-4-hydrogen-low"],
+                        },
+                        "provider_timeouts": {
+                            "agy": None,
+                            "opencode": 1800,
+                            "opencode-go": 1800,
+                            "openrouter": 1200,
+                            "gpu": 60,
+                        },
+                        "gpu": {"mcp_url": "http://rocket-ubuntu:8000/mcp", "min_confidence": 0.9},
+                    },
+                    f,
+                )
+            cfg = load_config(d)
+            self.assertEqual(model_chain(cfg, "intake"), ["gpu:jev", "gemini-4-hydrogen-low"])
+            self.assertEqual(model_chain(cfg, "builder_low"), [])
+            self.assertEqual(model_chain(cfg, "spec_writer"), ["gemini-3.8-flash-medium"])
+            self.assertEqual(provider_timeout_sec(cfg, "gpu:jev", 900), 60)
+            self.assertEqual(provider_timeout_sec(cfg, "opencode/deepseek-v4.1-flash-free", 900), 1800)
+            self.assertEqual(provider_timeout_sec(cfg, "openrouter/cohere/north-mini-code:free", 900), 1200)
+            self.assertEqual(provider_timeout_sec(cfg, "gemini-4-hydrogen-medium", 900), 900)
+
+            rev = resolve_reviewers(cfg, "low", [])
+            self.assertEqual(rev["code"], ["openrouter/cohere/north-mini-code:free", "gemini-4-hydrogen-low"])
+
+            # Empty list chain rejected
+            with open(cfg_file, "w", encoding="utf-8") as f:
+                json.dump({"models": {"builder": []}}, f)
+            with self.assertRaisesRegex(ValueError, "non-empty list"):
+                load_config(d)
+
+            # Empty string in chain rejected
+            with open(cfg_file, "w", encoding="utf-8") as f:
+                json.dump({"models": {"builder": ["gemini-4-hydrogen-medium", "  "]}}, f)
+            with self.assertRaisesRegex(ValueError, "non-empty model strings"):
+                load_config(d)
+
+            # Unknown prefix rejected
+            with open(cfg_file, "w", encoding="utf-8") as f:
+                json.dump({"models": {"builder": ["anthropic/claude-4"]}}, f)
+            with self.assertRaisesRegex(ValueError, "unknown model prefix"):
+                load_config(d)
+
+            # gpu: rejected in disallowed roles
+            for bad_role in ("builder", "batch_builder", "builder_low", "spec_writer", "qa", "code_low", "security", "ux", "ui"):
+                with open(cfg_file, "w", encoding="utf-8") as f:
+                    json.dump({"models": {bad_role: ["gpu:jev", "gemini-4-hydrogen-low"]}}, f)
+                with self.assertRaisesRegex(ValueError, "gpu:"):
+                    load_config(d)
+
+            # Invalid provider_timeouts
+            for bad_pt in ({"opencode": 0}, {"opencode": -5}, {"opencode": True}, {"opencode": "1800"}):
+                with open(cfg_file, "w", encoding="utf-8") as f:
+                    json.dump({"provider_timeouts": bad_pt}, f)
+                with self.assertRaisesRegex(ValueError, "provider_timeouts"):
+                    load_config(d)
+
+            # Invalid gpu.mcp_url
+            for bad_url in ("", "ftp://rocket:8000/mcp", "not-a-url"):
+                with open(cfg_file, "w", encoding="utf-8") as f:
+                    json.dump({"gpu": {"mcp_url": bad_url}}, f)
+                with self.assertRaisesRegex(ValueError, "gpu.mcp_url"):
+                    load_config(d)
+
+    def test_pricing_gemini4_free_subscription_and_local(self):
+        # Gemini 4 Hydrogen: 1.50 / 7.50 (cached 0.375)
+        self.assertAlmostEqual(
+            estimate_usage_cost_usd(
+                "gemini-4-hydrogen-medium",
+                {"input_tokens": 1_000_000, "cache_read_tokens": 1_000_000, "output_tokens": 1_000_000},
+            ),
+            1.50 + 0.375 + 7.50,
+        )
+        # Gemini 4 Argon & Carbon: 2.00 / 10.00 (cached 0.50)
+        for model in ("gemini-4-argon-high", "gemini-4-carbon-medium"):
+            self.assertAlmostEqual(
+                estimate_usage_cost_usd(
+                    model,
+                    {"input_tokens": 1_000_000, "cache_read_tokens": 1_000_000, "output_tokens": 1_000_000},
+                ),
+                2.00 + 0.50 + 10.00,
+            )
+        # cached_per_m defaults to 25% of input_per_m when omitted
+        custom_cfg = {"model_pricing": {"gemini-custom": {"input_per_m": 4.0, "output_per_m": 12.0}}}
+        self.assertAlmostEqual(
+            estimate_usage_cost_usd(
+                "gemini-custom-low",
+                {"input_tokens": 0, "cache_read_tokens": 1_000_000, "output_tokens": 0},
+                custom_cfg,
+            ),
+            1.0,
+        )
+        # Free, local GPU, and subscription Go models -> $0.0 marginal cost
+        for zero_model in (
+            "opencode/deepseek-v4.1-flash-free",
+            "opencode/big-pickle",
+            "openrouter/cohere/north-mini-code:free",
+            "gpu:jev",
+            "opencode-go/glm-5.3",
+        ):
+            self.assertEqual(
+                estimate_usage_cost_usd(
+                    zero_model,
+                    {"input_tokens": 500_000, "output_tokens": 100_000, "total_tokens": 600_000},
+                ),
+                0.0,
+            )
+        # Direct step_finish cost > 0 takes precedence
+        self.assertAlmostEqual(
+            estimate_usage_cost_usd(
+                "opencode/deepseek-v4.1-flash-free",
+                {"input_tokens": 1000, "output_tokens": 500, "cost_usd": 0.012345},
+            ),
+            0.012345,
+        )
 
 
 if __name__ == "__main__":

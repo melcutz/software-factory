@@ -6,17 +6,46 @@ import json
 import os
 from urllib.parse import urlparse
 
+from factory.lib.agy_runner import classify_model_provider
+
 VALID_MERGE_METHODS = {"merge", "squash", "rebase"}
 VALID_AUTO_MERGE = {"low", "all", "none"}
 VALID_RISKS = {"low", "medium", "high"}
 VALID_SURFACES = {"ui", "security"}
 EFFORT_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max", "none"}
+KNOWN_MODEL_PREFIXES = ("gemini-", "opencode/", "opencode-go/", "openrouter/", "gpu:")
+GPU_ALLOWED_ROLES = {"intake", "approver", "planner"}
+MODEL_ROLES = (
+    "planner",
+    "intake",
+    "spec_writer",
+    "builder",
+    "batch_builder",
+    "builder_low",
+    "approver",
+    "qa",
+    "code_low",
+    "code_medium",
+    "code_high",
+    "security",
+    "ux",
+    "ui",
+)
+
+DEFAULT_PROVIDER_TIMEOUTS: dict[str, int | None] = {
+    "agy": None,
+    "opencode": 1800,
+    "opencode-go": 1800,
+    "openrouter": 1200,
+    "gpu": 60,
+}
 
 DEFAULT_MODEL_PRICING: dict[str, dict[str, float]] = {
     "gemini-3.6-flash": {"input_per_m": 0.15, "cached_per_m": 0.0375, "output_per_m": 0.60},
     "gemini-3.8-flash": {"input_per_m": 0.30, "cached_per_m": 0.075, "output_per_m": 2.50},
-    "gemini-4-hydrogen": {"input_per_m": 0.30, "cached_per_m": 0.075, "output_per_m": 2.50},
-    "gemini-4-argon": {"input_per_m": 1.25, "cached_per_m": 0.3125, "output_per_m": 10.00},
+    "gemini-4-hydrogen": {"input_per_m": 1.50, "cached_per_m": 0.375, "output_per_m": 7.50},
+    "gemini-4-argon": {"input_per_m": 2.00, "cached_per_m": 0.50, "output_per_m": 10.00},
+    "gemini-4-carbon": {"input_per_m": 2.00, "cached_per_m": 0.50, "output_per_m": 10.00},
 }
 
 DEFAULT_CONFIG: dict = {
@@ -58,6 +87,11 @@ DEFAULT_CONFIG: dict = {
         "ux": "gemini-3.8-flash-medium",
         "ui": "gemini-3.6-flash-low",
     },
+    "provider_timeouts": copy.deepcopy(DEFAULT_PROVIDER_TIMEOUTS),
+    "gpu": {
+        "mcp_url": "http://rocket-ubuntu:8000/mcp",
+        "min_confidence": 0.9,
+    },
     "model_pricing": copy.deepcopy(DEFAULT_MODEL_PRICING),
     "max_job_cost_usd": 0.0,
     "batch": {
@@ -80,6 +114,33 @@ DEFAULT_CONFIG: dict = {
         "env_files": [],
     },
 }
+
+
+def model_chain(config: dict, role: str) -> list[str]:
+    """Return the normalized fallback chain for ``models.<role>`` as a list of model specs."""
+    models = (config or {}).get("models") if isinstance(config, dict) else None
+    if not isinstance(models, dict):
+        return []
+    val = models.get(role)
+    if val is None:
+        return []
+    if isinstance(val, str):
+        s = val.strip()
+        return [s] if s else []
+    if isinstance(val, list):
+        return [str(s).strip() for s in val if isinstance(s, str) and s.strip()]
+    return []
+
+
+def provider_timeout_sec(config: dict | None, model_spec: str, default_timeout_sec: int) -> int:
+    """Resolve per-provider timeout from ``config['provider_timeouts']``, falling back to ``default_timeout_sec``."""
+    provider, _ = classify_model_provider(model_spec)
+    pt = (config or {}).get("provider_timeouts") if isinstance(config, dict) else None
+    if isinstance(pt, dict) and provider in pt and pt[provider] is not None:
+        val = pt[provider]
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            return val
+    return int(default_timeout_sec)
 
 
 def split_model_and_effort(model_spec: str) -> tuple[str, str]:
@@ -107,9 +168,14 @@ def estimate_usage_cost_usd(
         if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
             return round(float(val), 6)
 
+    effective_spec = (model_spec or str(usage.get("model") or "")).strip()
+    provider, tier = classify_model_provider(effective_spec)
+    if tier in {"free", "local", "subscription"} or provider in {"gpu", "opencode-go"}:
+        return 0.0
+
     pricing_map = ((config or {}).get("model_pricing") if isinstance(config, dict) else None) or DEFAULT_MODEL_PRICING
-    base_model, _ = split_model_and_effort(model_spec)
-    rates = pricing_map.get(model_spec) or pricing_map.get(base_model)
+    base_model, _ = split_model_and_effort(effective_spec)
+    rates = pricing_map.get(effective_spec) or pricing_map.get(base_model)
     if not isinstance(rates, dict):
         return None
 
@@ -140,26 +206,84 @@ def _validate_non_prod_url(url: str, field_name: str, forbidden_hosts: set[str])
         raise ValueError(f"Refusing production URL in {field_name}: {url!r}")
 
 
+def _validate_model_spec(role: str, spec: str) -> None:
+    if not isinstance(spec, str) or not spec.strip():
+        raise ValueError(f"models.{role} must contain non-empty model strings, got {spec!r}")
+    clean = spec.strip()
+    if not clean.startswith(KNOWN_MODEL_PREFIXES):
+        raise ValueError(
+            f"models.{role} has unknown model prefix in {clean!r} (expected one of {KNOWN_MODEL_PREFIXES})"
+        )
+    if clean.startswith("gpu:") and role not in GPU_ALLOWED_ROLES:
+        raise ValueError(
+            f"models.{role} cannot use 'gpu:' model {clean!r}; gpu: is only allowed in {sorted(GPU_ALLOWED_ROLES)}"
+        )
+
+
 def load_config(factory_dir: str) -> dict:
     """Load and validate factory/config.json merged with DEFAULT_CONFIG."""
     cfg = copy.deepcopy(DEFAULT_CONFIG)
+    raw_models: dict = {}
     path = os.path.join(factory_dir, "config.json")
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
         if not isinstance(raw, dict):
             raise ValueError("config.json root must be a JSON object")
+        if isinstance(raw.get("models"), dict):
+            raw_models = raw["models"]
         for key, value in raw.items():
-            if key in {"labels", "models", "model_pricing", "batch", "staging_qa"} and isinstance(value, dict):
+            if key in {"labels", "models", "model_pricing", "batch", "staging_qa", "provider_timeouts", "gpu"} and isinstance(value, dict):
                 cfg[key].update(value)
             else:
                 cfg[key] = value
-    cfg["models"].setdefault("batch_builder", cfg["models"]["builder"])
+    if "batch_builder" not in raw_models:
+        cfg["models"]["batch_builder"] = copy.deepcopy(cfg["models"]["builder"])
+    else:
+        cfg["models"].setdefault("batch_builder", copy.deepcopy(cfg["models"]["builder"]))
 
     if cfg["merge_method"] not in VALID_MERGE_METHODS:
         raise ValueError(f"Invalid merge_method: {cfg['merge_method']!r}")
     if cfg["auto_merge"] not in VALID_AUTO_MERGE:
         raise ValueError(f"Invalid auto_merge: {cfg['auto_merge']!r}")
+
+    models_cfg = cfg.get("models")
+    if not isinstance(models_cfg, dict):
+        raise ValueError("models must be a JSON object")
+    for role, val in models_cfg.items():
+        if val is None:
+            if role != "builder_low":
+                raise ValueError(f"models.{role} cannot be null")
+            continue
+        if isinstance(val, str):
+            _validate_model_spec(role, val)
+        elif isinstance(val, list):
+            if not val:
+                raise ValueError(f"models.{role} chain must be a non-empty list")
+            for item in val:
+                _validate_model_spec(role, item)
+        else:
+            raise ValueError(f"models.{role} must be a string or non-empty list of strings, got {val!r}")
+
+    pt_cfg = cfg.get("provider_timeouts")
+    if not isinstance(pt_cfg, dict):
+        raise ValueError("provider_timeouts must be a JSON object")
+    for prov, tval in pt_cfg.items():
+        if tval is not None and (not isinstance(tval, int) or isinstance(tval, bool) or tval < 1):
+            raise ValueError(f"provider_timeouts.{prov} must be null or a positive integer, got {tval!r}")
+
+    gpu_cfg = cfg.get("gpu")
+    if not isinstance(gpu_cfg, dict):
+        raise ValueError("gpu must be a JSON object")
+    mcp_url = gpu_cfg.get("mcp_url")
+    if not isinstance(mcp_url, str) or not mcp_url.strip():
+        raise ValueError("gpu.mcp_url must be a non-empty http(s) URL")
+    parsed_mcp = urlparse(mcp_url.strip())
+    if parsed_mcp.scheme not in {"http", "https"} or not parsed_mcp.hostname:
+        raise ValueError(f"gpu.mcp_url must be an http(s) URL, got {mcp_url!r}")
+    min_conf = gpu_cfg.get("min_confidence", 0.9)
+    if not isinstance(min_conf, (int, float)) or isinstance(min_conf, bool) or not (0.0 < float(min_conf) <= 1.0):
+        raise ValueError(f"gpu.min_confidence must be a number in (0.0, 1.0], got {min_conf!r}")
 
     for int_key in ("concurrency", "max_rounds", "max_slice_retries", "agent_timeout_sec", "gate_timeout_sec"):
         val = cfg.get(int_key)
@@ -228,14 +352,14 @@ def load_config(factory_dir: str) -> dict:
     return cfg
 
 
-def resolve_reviewers(config: dict, risk: str, surfaces: list[str]) -> dict[str, str]:
-    """Deterministically resolve reviewer roles to model IDs for a given risk and surface set."""
+def resolve_reviewers(config: dict, risk: str, surfaces: list[str]) -> dict[str, str | list[str]]:
+    """Deterministically resolve reviewer roles to model IDs (or chains) for a given risk and surface set."""
     norm_risk = (risk or "low").strip().lower()
     if norm_risk not in VALID_RISKS:
         norm_risk = "low"
 
     models = config["models"]
-    reviewers: dict[str, str] = {
+    reviewers: dict[str, str | list[str]] = {
         "code": models[f"code_{norm_risk}"],
     }
 

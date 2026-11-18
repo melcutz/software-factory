@@ -103,6 +103,24 @@ def normalize_base_model(model_spec: str) -> str:
     return base.split(":", 1)[0].split()[0] if base else ""
 
 
+def quota_bucket_for_model(model_spec: str) -> str:
+    """Normalize a model spec to its shared quota cooldown bucket."""
+    spec = (model_spec or "").strip()
+    if not spec:
+        return ""
+    if spec in {"opencode-free", "openrouter-free", "opencode-go", "gpu"}:
+        return spec
+    if spec.startswith("gpu:"):
+        return "gpu"
+    if spec.startswith("opencode-go/"):
+        return "opencode-go"
+    if spec.startswith("openrouter/") and spec.endswith(":free"):
+        return "openrouter-free"
+    if spec.startswith("opencode/") and (spec.endswith("-free") or spec == "opencode/big-pickle"):
+        return "opencode-free"
+    return normalize_base_model(spec)
+
+
 def is_model_in_cooldown(
     quota_state: dict,
     base_model: str,
@@ -112,8 +130,13 @@ def is_model_in_cooldown(
     """Return (in_cooldown, remaining_sec) for base_model from refs/factory/quota."""
     ts = time.time() if now_ts is None else now_ts
     models = quota_state.get("models") or {}
+    bucket = quota_bucket_for_model(base_model)
     norm = normalize_base_model(base_model)
-    entry = models.get(base_model) or (models.get(norm) if norm else None)
+    entry = (
+        models.get(base_model)
+        or (models.get(bucket) if bucket else None)
+        or (models.get(norm) if norm else None)
+    )
     if not isinstance(entry, dict):
         return False, 0.0
     until = float(entry.get("cooldown_until_ts") or 0.0)
