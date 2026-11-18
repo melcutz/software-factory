@@ -2,6 +2,7 @@
 !/factory/jobs/.gitkeep
 /.worktrees/
 factory/config.local.json
+factory/leak-denylist.local.json
 __pycache__/
 *.py[cod]
 .coverage
