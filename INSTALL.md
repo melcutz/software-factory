@@ -81,7 +81,7 @@ In each repository you want the factory to manage, run `factory init --repo /pat
    > **Coder Tiers (`opencode` & `gpu:`):**
    > - Model-id prefixes route to `agy` (`gemini-*`), OpenCode (`opencode/*`, `opencode-go/*`, `openrouter/*`), or local GPU MCP (`gpu:*`, allowed only in `intake`, `approver`, `planner` and always abstain-safe).
    > - `models.<role>` can be a single string or a list-valued fallback chain; chains fall through on `GpuAbstain`, `QuotaExhaustedError`, active cooldowns, `AgentExecutionError`, or `provider_timeouts`, and abort immediately on halt/lease-loss/HEAD mutation.
-   > - Cooldowns in `refs/factory/quota` share buckets (`opencode-free` 3h, `openrouter-free` 3h, `opencode-go` 24h, `gpu`, or base Gemini model). Pricing counts `$0` marginal cost for free/local/subscription tiers (`opencode-go` tokens still tracked) and breaks down by tier/provider in `factory stats`.
+   > - Cooldowns in `refs/factory/quota` share configurable buckets (`opencode-free`, `openrouter-free`, `opencode-go`, `gpu`, or base Gemini model). Pricing counts `$0` marginal cost for unpriced/free/local tiers and breaks down by tier/provider in `factory stats`.
    > - Install `opencode` into `~/.opencode/bin` (workers prepend `~/.opencode/bin` and `~/.local/bin` to `PATH`). `factory doctor` fails if `opencode --version` is missing when configured, and emits `WARN` (non-fatal) if `gpu.mcp_url` is unreachable or lacks `minicpm5`.
 
 6. *(Optional)* **Create a GitHub ProjectV2 Board:**
@@ -99,8 +99,8 @@ List all repositories on this machine that `factory worker --all` / `factory sta
 
 ```json
 [
-  "~/work/repo-a",
-  "~/work/repo-b"
+  "~/src/my-app",
+  "~/src/my-api"
 ]
 ```
 
@@ -123,7 +123,7 @@ If free RAM drops below `min_free_ram_gb` or 1-minute CPU load exceeds `max_cpu_
 On your primary workstation (e.g., over Tailscale SSH or WSL):
 
 ```bash
-hc machine add user@100.64.0.2 --name ryzen-box --install
+hc machine add user@host-b --name myhost --install
 # Or for Windows WSL2 without an SSH server:
 hc machine add --via 'wsl.exe -d Ubuntu -e sh -c' --name wsl
 hc machine ls
