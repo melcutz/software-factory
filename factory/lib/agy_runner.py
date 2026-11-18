@@ -653,6 +653,7 @@ def run_agent(
     protect_head: bool = False,
     idle_bg_grace_sec: float | None = None,
     abort_check: Callable[[], BaseException | None] | None = None,
+    gpu_context: dict | None = None,
 ) -> tuple[dict, dict, float]:
     """Run one headless agent turn across agy/opencode/gpu with schema validation and guards."""
     effective_idle_grace = _resolve_idle_bg_grace_sec(factory_dir, idle_bg_grace_sec)
@@ -715,6 +716,7 @@ def run_agent(
                         mcp_url=mcp_url,
                         min_confidence=min_conf,
                         timeout_sec=float(timeout_sec),
+                        gpu_context=gpu_context,
                     )
                 else:
                     envelope = _run_agy_provider(

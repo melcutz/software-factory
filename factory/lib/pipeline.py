@@ -2074,14 +2074,15 @@ def _make_abort_check(
     return _check
 
 
-def _call_single_run_agent(*args, abort_check=None, **kwargs):
-    """Invoke `run_agent`, passing `abort_check` when accepted by the callable."""
+def _call_single_run_agent(*args, abort_check=None, gpu_context=None, **kwargs):
+    """Invoke `run_agent`, passing `abort_check` and `gpu_context` when accepted by the callable."""
     try:
         sig = inspect.signature(run_agent)
-        if "abort_check" in sig.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-        ):
-            return run_agent(*args, abort_check=abort_check, **kwargs)
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if "abort_check" in sig.parameters or has_varkw:
+            kwargs["abort_check"] = abort_check
+        if gpu_context is not None and ("gpu_context" in sig.parameters or has_varkw):
+            kwargs["gpu_context"] = gpu_context
     except (ValueError, TypeError):
         pass
     return run_agent(*args, **kwargs)
@@ -2102,9 +2103,12 @@ def _call_run_agent(
     state_store: GitStateStore | None = None,
     job_id: str = "",
     abort_check=None,
+    gpu_context: dict | None = None,
     **kwargs,
 ):
     """Invoke `run_agent_chain` across one or more models in `models`, using `pipeline.run_agent` as the runner."""
+    if gpu_context is not None:
+        kwargs["gpu_context"] = gpu_context
     return run_agent_chain(
         factory_dir,
         job_dir,
@@ -3239,6 +3243,23 @@ def process_job(
                         ]
                     )
                     approver_model = cfg["models"]["approver"]
+                    expected_reviewers = resolve_reviewers(cfg, job.get("risk", "low"), job.get("surfaces") or [])
+                    all_reviews_passed = bool(expected_reviewers) and all(
+                        isinstance(reviews_dict.get(r), dict)
+                        and reviews_dict[r].get("verdict") == "PASS"
+                        and not any(
+                            isinstance(f, dict) and f.get("severity") in {"must_fix", "should_fix"}
+                            for f in (reviews_dict[r].get("findings") or ())
+                        )
+                        for r in expected_reviewers
+                    )
+                    approve_gpu_context = {
+                        "risk": job.get("risk") or (intake_data.get("risk") if isinstance(intake_data, dict) else None) or "",
+                        "gate_passed": (checks_md or "").startswith("VERDICT: PASS") and not (qa_failure_md or "").strip(),
+                        "all_reviews_passed": all_reviews_passed,
+                        "prior_escalation": bool(job.get("last_error")),
+                        "round": round_num,
+                    }
                     _set_activity(jobs_dir, job_id, "running:approve")
                     _log(job_id, f"approve start ({_fmt_model_tag(approver_model)})")
                     approve_out, usage, dur = _call_run_agent(
@@ -3257,6 +3278,7 @@ def process_job(
                         sandbox=True,
                         log_name=f"r{round_num}-approve",
                         abort_check=abort_check,
+                        gpu_context=approve_gpu_context,
                     )
                     used_approve_model = (usage or {}).get("model") or approver_model
                     _clear_quota_cooldown_if_needed(state_store, used_approve_model)

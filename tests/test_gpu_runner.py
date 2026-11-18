@@ -331,13 +331,22 @@ def test_gpu_approve_only_low_risk_clean_reviews_high_confidence():
         },
     }
     server, url = _start_fake_mcp_server(state)
-    clean_prompt = (
-        "PR #12\nRISK: low\n\n"
-        "## Gate Status\nVERDICT: PASS\n\n"
-        "## Reviews\n- code: VERDICT: PASS\n"
-    )
+    clean_ctx = {
+        "risk": "low",
+        "gate_passed": True,
+        "all_reviews_passed": True,
+        "prior_escalation": False,
+        "round": 1,
+    }
     try:
-        env = run_gpu_stage("approve", "gpu:jev", clean_prompt, mcp_url=url, min_confidence=0.90)
+        env = run_gpu_stage(
+            "approve",
+            "gpu:jev",
+            "PR #12 summary",
+            mcp_url=url,
+            min_confidence=0.90,
+            gpu_context=clean_ctx,
+        )
         assert env["structured_output"]["decision"] == "APPROVE"
         assert env["usage"]["cost_usd"] == 0.0
     finally:
@@ -345,7 +354,7 @@ def test_gpu_approve_only_low_risk_clean_reviews_high_confidence():
         server.server_close()
 
 
-def test_gpu_approve_abstains_on_high_risk_danger_or_low_confidence():
+def test_gpu_approve_abstains_for_each_reason():
     state = _FakeMcpState(sse_mode=False)
     state.decide_payload = {
         "decisions": {
@@ -354,25 +363,51 @@ def test_gpu_approve_abstains_on_high_risk_danger_or_low_confidence():
         }
     }
     server, url = _start_fake_mcp_server(state)
+    clean_ctx = {
+        "risk": "low",
+        "gate_passed": True,
+        "all_reviews_passed": True,
+        "prior_escalation": False,
+        "round": 1,
+    }
     try:
-        # High risk -> abstain before decide()
-        with pytest.raises(GpuAbstain):
+        # 1. Missing gpu_context -> abstain
+        with pytest.raises(GpuAbstain, match="missing gpu_context"):
+            run_gpu_stage("approve", "gpu:jev", "PR #12", mcp_url=url, gpu_context=None)
+
+        # 2. risk != "low" -> abstain
+        with pytest.raises(GpuAbstain, match="risk="):
+            run_gpu_stage("approve", "gpu:jev", "PR #12", mcp_url=url, gpu_context={**clean_ctx, "risk": "high"})
+
+        # 3. gate_passed False -> abstain
+        with pytest.raises(GpuAbstain, match="gate"):
+            run_gpu_stage("approve", "gpu:jev", "PR #12", mcp_url=url, gpu_context={**clean_ctx, "gate_passed": False})
+
+        # 4. all_reviews_passed False -> abstain
+        with pytest.raises(GpuAbstain, match="reviews"):
             run_gpu_stage(
                 "approve",
                 "gpu:jev",
-                "RISK: high\n## Gate Status\nVERDICT: PASS\n## Reviews\nVERDICT: PASS\n",
+                "PR #12",
                 mcp_url=url,
+                gpu_context={**clean_ctx, "all_reviews_passed": False},
             )
-        # Review requested changes -> abstain
-        with pytest.raises(GpuAbstain):
+
+        # 5. prior_escalation True -> abstain
+        with pytest.raises(GpuAbstain, match="prior escalation"):
             run_gpu_stage(
                 "approve",
                 "gpu:jev",
-                "RISK: low\n## Gate Status\nVERDICT: PASS\n## Reviews\nVERDICT: CHANGES\n",
+                "PR #12",
                 mcp_url=url,
+                gpu_context={**clean_ctx, "prior_escalation": True},
             )
-        # High merge_danger -> abstain
-        clean_prompt = "RISK: low\n## Gate Status\nVERDICT: PASS\n## Reviews\nVERDICT: PASS\n"
+
+        # 6. round != 1 -> abstain
+        with pytest.raises(GpuAbstain, match="round="):
+            run_gpu_stage("approve", "gpu:jev", "PR #12", mcp_url=url, gpu_context={**clean_ctx, "round": 2})
+
+        # 7. High merge_danger -> abstain
         state.decide_payload = {
             "decisions": {
                 "safe_to_merge": {"type": "bool", "true_probability": 0.95},
@@ -380,9 +415,9 @@ def test_gpu_approve_abstains_on_high_risk_danger_or_low_confidence():
             }
         }
         with pytest.raises(GpuAbstain):
-            run_gpu_stage("approve", "gpu:jev", clean_prompt, mcp_url=url)
+            run_gpu_stage("approve", "gpu:jev", "PR #12", mcp_url=url, gpu_context=clean_ctx)
 
-        # Low safe_to_merge -> abstain
+        # 8. Low safe_to_merge -> abstain
         state.decide_payload = {
             "decisions": {
                 "safe_to_merge": {"type": "bool", "true_probability": 0.85},
@@ -390,12 +425,51 @@ def test_gpu_approve_abstains_on_high_risk_danger_or_low_confidence():
             }
         }
         with pytest.raises(GpuAbstain):
-            run_gpu_stage("approve", "gpu:jev", clean_prompt, mcp_url=url)
+            run_gpu_stage("approve", "gpu:jev", "PR #12", mcp_url=url, gpu_context=clean_ctx)
 
-        # Error payload -> abstain
+        # 9. Error payload -> abstain
         state.decide_payload = {"error": "gpu oom", "tool": "local_system1_jev_decide"}
         with pytest.raises(GpuAbstain):
-            run_gpu_stage("approve", "gpu:jev", clean_prompt, mcp_url=url)
+            run_gpu_stage("approve", "gpu:jev", "PR #12", mcp_url=url, gpu_context=clean_ctx)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_call_run_agent_threads_gpu_context_to_run_gpu_stage(tmp_path: Path, monkeypatch):
+    from factory.lib.pipeline import _call_run_agent
+
+    wt = _init_git_wt(tmp_path)
+    state = _FakeMcpState(sse_mode=False)
+    state.decide_payload = {
+        "decisions": {
+            "safe_to_merge": {"type": "bool", "true_probability": 0.97},
+            "merge_danger": {"type": "bool", "true_probability": 0.01},
+        }
+    }
+    server, url = _start_fake_mcp_server(state)
+    monkeypatch.setenv("FACTORY_GPU_MCP_URL", url)
+    try:
+        out, usage, _ = _call_run_agent(
+            os.path.abspath("factory"),
+            str(tmp_path / "job-approve"),
+            str(wt),
+            "approve",
+            "approver",
+            ["gpu:jev"],
+            "PR #99",
+            SCHEMAS["approve"],
+            60,
+            gpu_context={
+                "risk": "low",
+                "gate_passed": True,
+                "all_reviews_passed": True,
+                "prior_escalation": False,
+                "round": 1,
+            },
+        )
+        assert out["decision"] == "APPROVE"
+        assert usage["provider"] == "gpu"
     finally:
         server.shutdown()
         server.server_close()

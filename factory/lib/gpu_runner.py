@@ -317,22 +317,19 @@ def _run_intake_gpu(
     }
 
 
-def _check_approve_prompt_clean(task_prompt: str) -> None:
-    if _RISK_HIGH_MED_RE.search(task_prompt) or not _RISK_LOW_RE.search(task_prompt):
-        raise GpuAbstain("GPU approve abstains when job risk is not explicitly low")
-
-    gate_idx = task_prompt.find("## Gate Status")
-    reviews_idx = task_prompt.find("## Reviews")
-    if gate_idx == -1 or reviews_idx == -1:
-        raise GpuAbstain("GPU approve abstains: missing Gate Status or Reviews section")
-
-    gate_section = task_prompt[gate_idx:reviews_idx] if reviews_idx > gate_idx else task_prompt[gate_idx:]
-    reviews_section = task_prompt[reviews_idx:]
-
-    if "VERDICT: PASS" not in gate_section or "VERDICT: FAIL" in gate_section:
+def _check_approve_context(gpu_context: dict | None) -> None:
+    if not isinstance(gpu_context, dict):
+        raise GpuAbstain("GPU approve abstains: missing gpu_context")
+    if gpu_context.get("risk") != "low":
+        raise GpuAbstain(f"GPU approve abstains: risk={gpu_context.get('risk')!r} != 'low'")
+    if not gpu_context.get("gate_passed"):
         raise GpuAbstain("GPU approve abstains: gate did not pass")
-    if "VERDICT: PASS" not in reviews_section or "VERDICT: CHANGES" in reviews_section or "VERDICT: FAIL" in reviews_section:
+    if not gpu_context.get("all_reviews_passed"):
         raise GpuAbstain("GPU approve abstains: reviews did not all pass")
+    if gpu_context.get("prior_escalation"):
+        raise GpuAbstain("GPU approve abstains: prior escalation present")
+    if gpu_context.get("round") != 1:
+        raise GpuAbstain(f"GPU approve abstains: round={gpu_context.get('round')!r} != 1")
 
 
 def _run_approve_gpu(
@@ -341,8 +338,9 @@ def _run_approve_gpu(
     mcp_url: str,
     min_confidence: float,
     timeout_sec: float,
+    gpu_context: dict | None = None,
 ) -> dict:
-    _check_approve_prompt_clean(task_prompt)
+    _check_approve_context(gpu_context)
     try:
         resp = decide(
             mcp_url,
@@ -392,6 +390,7 @@ def run_gpu_stage(
     mcp_url: str,
     min_confidence: float = 0.90,
     timeout_sec: float = 60.0,
+    gpu_context: dict | None = None,
 ) -> dict:
     """Execute a supported stage on the local GPU MCP tier, or raise GpuAbstain."""
     del model  # currently all gpu:* specs route to the configured MCP server
@@ -415,6 +414,7 @@ def run_gpu_stage(
             mcp_url=mcp_url,
             min_confidence=min_confidence,
             timeout_sec=timeout_sec,
+            gpu_context=gpu_context,
         )
     else:
         structured = _run_plan_gpu(task_prompt)
