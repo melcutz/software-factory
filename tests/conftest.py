@@ -34,6 +34,7 @@ def _hermetic_coder_tiers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     )
     fake_agy.chmod(0o755)
 
+    monkeypatch.setenv("FACTORY_USER_CONFIG", str(tmp_path / "_nonexistent_user_config.json"))
     monkeypatch.setenv("FACTORY_OPENCODE_BIN", str(fake_oc))
     monkeypatch.setenv("FACTORY_GPU_MCP_URL", "http://127.0.0.1:9/mcp")
 

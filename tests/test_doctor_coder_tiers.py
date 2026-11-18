@@ -160,3 +160,34 @@ def test_doctor_warns_on_unreachable_or_missing_gpu_without_failing(tmp_path: Pa
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_doctor_reports_loaded_config_layers_without_leaking_values(tmp_path: Path, monkeypatch):
+    clear_gpu_availability_cache()
+    git_dir = Path(subprocess.check_output(["which", "git"], text=True).strip()).parent
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    bin_dir = tmp_path / "bin"
+    _install_fake_cli_bins(bin_dir, opencode_rc=0)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{git_dir}")
+
+    user_cfg = tmp_path / "user-config.json"
+    user_cfg.write_text(
+        json.dumps({"base_branch": "secret-branch-value-xyz", "concurrency": 7}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FACTORY_USER_CONFIG", str(user_cfg))
+
+    repo = _init_doctor_repo(tmp_path, models={"intake": "gemini-3.8-flash-low"})
+    local_cfg = repo / "factory" / "config.local.json"
+    local_cfg.write_text(json.dumps({"concurrency": 3}), encoding="utf-8")
+
+    ok, msgs = run_doctor(str(repo))
+    assert ok is True
+    joined = "\n".join(msgs)
+    assert str(user_cfg) in joined
+    assert str(repo / "factory" / "config.json") in joined
+    assert str(local_cfg) in joined
+    assert "secret-branch-value-xyz" not in joined

@@ -1,6 +1,7 @@
 /factory/jobs/*
 !/factory/jobs/.gitkeep
 /.worktrees/
+factory/config.local.json
 __pycache__/
 *.py[cod]
 .coverage

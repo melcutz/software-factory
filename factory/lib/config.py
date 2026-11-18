@@ -220,24 +220,81 @@ def _validate_model_spec(role: str, spec: str) -> None:
         )
 
 
-def load_config(factory_dir: str) -> dict:
-    """Load and validate factory/config.json merged with DEFAULT_CONFIG."""
+def _user_config_path() -> str:
+    """Return path to optional user/host-level config file."""
+    env_path = (os.environ.get("FACTORY_USER_CONFIG") or "").strip()
+    if env_path:
+        return os.path.expanduser(env_path)
+    return os.path.expanduser("~/.config/factory/config.json")
+
+
+def _strip_comment_keys(obj):
+    """Recursively remove dict keys starting with '_' (e.g. '_comment')."""
+    if isinstance(obj, dict):
+        return {
+            k: _strip_comment_keys(v)
+            for k, v in obj.items()
+            if not (isinstance(k, str) and k.startswith("_"))
+        }
+    if isinstance(obj, list):
+        return [_strip_comment_keys(item) for item in obj]
+    return obj
+
+
+def _deep_merge_config(base: dict, overlay: dict) -> dict:
+    """Recursively deep-merge dict sections; scalars and lists replace."""
+    merged = copy.deepcopy(base)
+    for key, value in overlay.items():
+        if isinstance(key, str) and key.startswith("_"):
+            continue
+        clean_val = _strip_comment_keys(value)
+        if isinstance(merged.get(key), dict) and isinstance(clean_val, dict):
+            merged[key] = _deep_merge_config(merged[key], clean_val)
+        else:
+            merged[key] = copy.deepcopy(clean_val)
+    return merged
+
+
+def load_config_with_layers(factory_dir: str) -> tuple[dict, list[str]]:
+    """Load and validate layered configuration, returning (merged_config, loaded_layer_paths).
+
+    Precedence (lowest to highest):
+      1. DEFAULT_CONFIG
+      2. User/host file ($FACTORY_USER_CONFIG or ~/.config/factory/config.json)
+      3. <repo>/factory/config.json
+      4. <repo>/factory/config.local.json
+    """
     cfg = copy.deepcopy(DEFAULT_CONFIG)
-    raw_models: dict = {}
-    path = os.path.join(factory_dir, "config.json")
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
+    loaded_layers: list[str] = []
+    explicit_batch_builder = False
+
+    candidate_paths: list[str] = []
+    user_path = _user_config_path()
+    if user_path:
+        candidate_paths.append(user_path)
+    if factory_dir:
+        candidate_paths.append(os.path.join(factory_dir, "config.json"))
+        candidate_paths.append(os.path.join(factory_dir, "config.local.json"))
+
+    seen_real: set[str] = set()
+    for layer_path in candidate_paths:
+        if not layer_path or not os.path.exists(layer_path):
+            continue
+        real_p = os.path.realpath(layer_path)
+        if real_p in seen_real:
+            continue
+        seen_real.add(real_p)
+        with open(layer_path, encoding="utf-8") as f:
             raw = json.load(f)
         if not isinstance(raw, dict):
-            raise ValueError("config.json root must be a JSON object")
-        if isinstance(raw.get("models"), dict):
-            raw_models = raw["models"]
-        for key, value in raw.items():
-            if key in {"labels", "models", "model_pricing", "batch", "staging_qa", "provider_timeouts", "gpu"} and isinstance(value, dict):
-                cfg[key].update(value)
-            else:
-                cfg[key] = value
-    if "batch_builder" not in raw_models:
+            raise ValueError(f"{os.path.basename(layer_path)} root must be a JSON object")
+        clean_raw = _strip_comment_keys(raw)
+        if isinstance(clean_raw.get("models"), dict) and "batch_builder" in clean_raw["models"]:
+            explicit_batch_builder = True
+        cfg = _deep_merge_config(cfg, clean_raw)
+        loaded_layers.append(layer_path)
+
+    if not explicit_batch_builder:
         cfg["models"]["batch_builder"] = copy.deepcopy(cfg["models"]["builder"])
     else:
         cfg["models"].setdefault("batch_builder", copy.deepcopy(cfg["models"]["builder"]))
@@ -349,6 +406,12 @@ def load_config(factory_dir: str) -> dict:
     if not isinstance(sqa.get("env_files"), list) or any(not isinstance(p, str) for p in sqa["env_files"]):
         raise ValueError("staging_qa.env_files must be a list of file paths")
 
+    return cfg, loaded_layers
+
+
+def load_config(factory_dir: str) -> dict:
+    """Load and validate layered configuration merged with DEFAULT_CONFIG."""
+    cfg, _ = load_config_with_layers(factory_dir)
     return cfg
 
 

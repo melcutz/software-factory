@@ -31,6 +31,7 @@ _ORIG_RUN_AGENT = run_agent
 from factory.lib.config import (
     estimate_usage_cost_usd,
     load_config,
+    load_config_with_layers,
     model_chain,
     resolve_reviewers,
     split_model_and_effort,
@@ -4086,8 +4087,9 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
 
     cfg: dict | None = None
     try:
-        cfg = load_config(factory_dir)
-        messages.append(f"OK: factory/config.json valid (auto_merge={cfg['auto_merge']}, concurrency={cfg['concurrency']})")
+        cfg, loaded_layers = load_config_with_layers(factory_dir)
+        layers_str = ", ".join(loaded_layers) if loaded_layers else "defaults only"
+        messages.append(f"OK: factory/config.json valid (layers: {layers_str})")
     except Exception as exc:
         ok = False
         messages.append(f"FAIL: factory/config.json invalid: {exc}")

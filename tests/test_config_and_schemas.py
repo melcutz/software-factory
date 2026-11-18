@@ -6,11 +6,13 @@ import unittest
 from factory.lib.config import (
     estimate_usage_cost_usd,
     load_config,
+    load_config_with_layers,
     model_chain,
     provider_timeout_sec,
     resolve_reviewers,
     split_model_and_effort,
 )
+from factory.lib.onboarding import init_repository
 from factory.lib.schemas import (
     SCHEMAS,
     render_approve_md,
@@ -449,6 +451,104 @@ class ConfigAndSchemaTests(unittest.TestCase):
             ),
             0.012345,
         )
+
+    def test_config_layering_precedence_deep_merge_comments_and_init_gitignore(self):
+        with tempfile.TemporaryDirectory() as d:
+            user_cfg_path = os.path.join(d, "user-config.json")
+            fdir = os.path.join(d, "repo", "factory")
+            os.makedirs(fdir, exist_ok=True)
+            repo_cfg_path = os.path.join(fdir, "config.json")
+            local_cfg_path = os.path.join(fdir, "config.local.json")
+
+            old_env = os.environ.get("FACTORY_USER_CONFIG")
+            try:
+                # Layer 1 only: DEFAULT_CONFIG
+                os.environ["FACTORY_USER_CONFIG"] = user_cfg_path
+                cfg1, layers1 = load_config_with_layers(fdir)
+                self.assertEqual(layers1, [])
+                self.assertEqual(cfg1["concurrency"], 4)
+                self.assertEqual(cfg1["auto_merge"], "low")
+
+                # Layer 2: User config overrides defaults and supports _comment keys
+                with open(user_cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "_comment": "user level defaults",
+                            "concurrency": 6,
+                            "labels": {"_comment": "lbl", "queue": "user-queue"},
+                            "models": {"builder": "gemini-4-hydrogen-medium", "intake": "gemini-3.6-flash-low"},
+                            "protected_paths": ["user-only/"],
+                        },
+                        f,
+                    )
+                cfg2, layers2 = load_config_with_layers(fdir)
+                self.assertEqual(layers2, [user_cfg_path])
+                self.assertNotIn("_comment", cfg2)
+                self.assertNotIn("_comment", cfg2["labels"])
+                self.assertEqual(cfg2["concurrency"], 6)
+                self.assertEqual(cfg2["labels"]["queue"], "user-queue")
+                self.assertEqual(cfg2["labels"]["needs_human"], "factory:needs-human")
+                self.assertEqual(cfg2["models"]["builder"], "gemini-4-hydrogen-medium")
+                self.assertEqual(cfg2["models"]["batch_builder"], "gemini-4-hydrogen-medium")
+                self.assertEqual(cfg2["protected_paths"], ["user-only/"])
+
+                # Layer 3: Repo config.json overrides user config; dicts deep-merge, lists/scalars replace
+                with open(repo_cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "_note": "repo config",
+                            "concurrency": 2,
+                            "labels": {"needs_info": "repo-needs-info"},
+                            "models": {"builder": ["opencode/deepseek-v4.1-flash-free", "gemini-3.8-flash-medium"]},
+                            "protected_paths": ["factory/", "custom/"],
+                        },
+                        f,
+                    )
+                cfg3, layers3 = load_config_with_layers(fdir)
+                self.assertEqual(layers3, [user_cfg_path, repo_cfg_path])
+                self.assertEqual(cfg3["concurrency"], 2)
+                self.assertEqual(cfg3["labels"]["queue"], "user-queue")
+                self.assertEqual(cfg3["labels"]["needs_info"], "repo-needs-info")
+                self.assertEqual(cfg3["models"]["intake"], "gemini-3.6-flash-low")
+                self.assertEqual(
+                    cfg3["models"]["builder"],
+                    ["opencode/deepseek-v4.1-flash-free", "gemini-3.8-flash-medium"],
+                )
+                self.assertEqual(
+                    cfg3["models"]["batch_builder"],
+                    ["opencode/deepseek-v4.1-flash-free", "gemini-3.8-flash-medium"],
+                )
+                self.assertEqual(cfg3["protected_paths"], ["factory/", "custom/"])
+
+                # Layer 4: Repo config.local.json overrides repo config.json and user config
+                with open(local_cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "_comment": "local machine override",
+                            "concurrency": 8,
+                            "models": {"builder": "gemini-4-argon-high"},
+                        },
+                        f,
+                    )
+                cfg4, layers4 = load_config_with_layers(fdir)
+                self.assertEqual(layers4, [user_cfg_path, repo_cfg_path, local_cfg_path])
+                self.assertEqual(cfg4["concurrency"], 8)
+                self.assertEqual(cfg4["models"]["builder"], "gemini-4-argon-high")
+                self.assertEqual(cfg4["models"]["batch_builder"], "gemini-4-argon-high")
+                self.assertEqual(cfg4["models"]["intake"], "gemini-3.6-flash-low")
+                self.assertEqual(load_config(fdir)["concurrency"], 8)
+            finally:
+                if old_env is None:
+                    os.environ.pop("FACTORY_USER_CONFIG", None)
+                else:
+                    os.environ["FACTORY_USER_CONFIG"] = old_env
+
+            init_repo_dir = os.path.join(d, "fresh-repo")
+            os.makedirs(init_repo_dir, exist_ok=True)
+            init_repository(init_repo_dir)
+            with open(os.path.join(init_repo_dir, ".gitignore"), encoding="utf-8") as f:
+                gi_lines = [ln.strip() for ln in f if ln.strip()]
+            self.assertIn("factory/config.local.json", gi_lines)
 
 
 if __name__ == "__main__":
