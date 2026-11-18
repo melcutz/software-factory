@@ -128,6 +128,7 @@ DEFAULT_CONFIG: dict = {
         "ops_base_url": "",
         "forbidden_prod_hosts": [],
         "env_files": [],
+        "test_mode_secret_keys": ["STRIPE_SECRET_KEY"],
     },
 }
 
@@ -538,6 +539,11 @@ def load_config_with_layers(factory_dir: str) -> tuple[dict, list[str]]:
             )
     if not isinstance(sqa.get("env_files"), list) or any(not isinstance(p, str) for p in sqa["env_files"]):
         raise ValueError("staging_qa.env_files must be a list of file paths")
+    test_mode_keys = sqa.get("test_mode_secret_keys")
+    if not isinstance(test_mode_keys, list) or any(
+        not isinstance(k, str) or not k.strip() for k in test_mode_keys
+    ):
+        raise ValueError("staging_qa.test_mode_secret_keys must be a list of non-empty strings")
 
     return cfg, loaded_layers
 

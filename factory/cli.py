@@ -64,7 +64,7 @@ def load_registered_repos(config_path: str | None = None) -> list[str]:
     if not os.path.isfile(path):
         raise SystemExit(
             f"No repos registry found at {path}. Create it as a JSON list of repo paths "
-            f"(e.g. [\"~/work/repo-a\", \"~/work/repo-b\"]) or pass --repo <path>."
+            f"(e.g. [\"~/src/my-app\", \"~/src/my-api\"]) or pass --repo <path>."
         )
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
@@ -359,10 +359,10 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  factory fleet status\n"
-            "  factory fleet pause Base --drain\n"
+            "  factory fleet pause host-a --drain\n"
             "  factory fleet update --restart\n"
             "  factory fleet restart\n"
-            "  factory fleet wake Rocket"
+            "  factory fleet wake myhost"
         ),
     )
     p_fleet.add_argument(

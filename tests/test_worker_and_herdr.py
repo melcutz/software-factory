@@ -167,7 +167,7 @@ def test_fleet_wake_is_idempotent_on_name_taken(tmp_path, monkeypatch):
         f"#!{sys.executable}\n"
         "import json, sys\n"
         "if sys.argv[1:3] == ['machine', 'ls']:\n"
-        "    print(json.dumps({'machines': [{'name': 'base-ubuntu', 'state': 'connected'}]}))\n"
+        "    print(json.dumps({'machines': [{'name': 'host-a', 'state': 'connected'}]}))\n"
         "else:\n"
         "    print(json.dumps({'error': {'kind': 'name_taken', 'message': 'already named'}}))\n"
         "    sys.exit(1)\n",
@@ -179,21 +179,21 @@ def test_fleet_wake_is_idempotent_on_name_taken(tmp_path, monkeypatch):
 
     from factory.lib.fleet import fleet_wake
     res = fleet_wake()
-    assert ("base-ubuntu", 0, "already running") in res
+    assert ("host-a", 0, "already running") in res
 
 
 def test_sanitize_hc_name_and_human_readable_fleet_output():
     from factory.cli import _format_fleet_result
     from factory.lib.herdr_bridge import sanitize_hc_name
 
-    assert sanitize_hc_name("factory-worker-Rocket") == "factory-worker-rocket"
+    assert sanitize_hc_name("factory-worker-MyHost") == "factory-worker-myhost"
     assert sanitize_hc_name("My Repo#42!") == "my-repo-42"
 
     started = _format_fleet_result("lenovo", 0, '{"address":"lenovo/t11","state":"live"}')
     assert started == "lenovo: started (lenovo/t11, live)"
 
-    failed = _format_fleet_result("Rocket", 6, '{"error":{"message":"bad name","hint":"lowercase only"}}')
-    assert failed == "Rocket: FAILED - bad name (lowercase only)"
+    failed = _format_fleet_result("MyHost", 6, '{"error":{"message":"bad name","hint":"lowercase only"}}')
+    assert failed == "MyHost: FAILED - bad name (lowercase only)"
 
 
 def test_fleet_remove_calls_hc_machine_rm(tmp_path, monkeypatch):
@@ -631,7 +631,7 @@ def test_qa_external_blocker_escalates_immediately(tmp_path, monkeypatch):
         "personas_used": ["pro"],
         "failures": [],
         "reproduction_steps": ["click tab"],
-        "external_blocker": "Disable Cloudflare Speed Brain on keepfor.me zone",
+        "external_blocker": "Disable proxy caching on my-app.example zone",
     }
     _handle_qa_failure_for_ticket(
         str(tmp_path), jobs_dir, "main", cfg, gh, {}, tk, 1, 3, qa_dir, "QA failed", qa_out, "def67890", True, "ok"
@@ -640,7 +640,7 @@ def test_qa_external_blocker_escalates_immediately(tmp_path, monkeypatch):
     assert tk.outcome.action == "return"
     assert tk.outcome.job["stage"] == "needs-human"
     gh.comment_issue.assert_called_once()
-    assert "Disable Cloudflare Speed Brain" in gh.comment_issue.call_args[0][1]
+    assert "Disable proxy caching" in gh.comment_issue.call_args[0][1]
 
 
 def test_run_worker_survives_transient_github_error(tmp_path, monkeypatch):
@@ -732,7 +732,7 @@ def test_status_reports_remote_leased_jobs_as_live(tmp_path):
             "stage": "merging",
             "activity": "running:pre-merge-gate:full",
             "pid": 99999999,
-            "lease": {"worker_id": "Base", "hostname": "Base"},
+            "lease": {"worker_id": "host-a", "hostname": "host-a"},
             "_lease_active": True,
         }
     ]

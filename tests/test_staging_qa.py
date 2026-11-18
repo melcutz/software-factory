@@ -94,6 +94,14 @@ def test_config_staging_qa_validation(tmp_path):
     )
     cfg = load_config(str(fdir))
     assert cfg["staging_qa"]["enabled"] is True
+    assert cfg["staging_qa"]["test_mode_secret_keys"] == ["STRIPE_SECRET_KEY"]
+
+    (fdir / "config.json").write_text(
+        json.dumps({"staging_qa": {"test_mode_secret_keys": "STRIPE_SECRET_KEY"}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="staging_qa.test_mode_secret_keys"):
+        load_config(str(fdir))
 
 
 def test_state_staging_qa_transitions_and_resume(tmp_path):
@@ -123,6 +131,13 @@ def test_load_staging_secrets_and_redaction(tmp_path):
     bad_env.write_text("STRIPE_SECRET_KEY=sk_live_1234567890abcdefghij\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Refusing live Stripe key"):
         load_staging_secrets([str(bad_env)])
+
+    custom_bad_env = tmp_path / "custom_bad.env"
+    custom_bad_env.write_text("CUSTOM_PAYMENT_KEY=rk_live_1234567890abcdefghij\n", encoding="utf-8")
+    # Default guarded key list ignores custom key name unless configured.
+    assert load_staging_secrets([str(custom_bad_env)])["CUSTOM_PAYMENT_KEY"].startswith("rk_live_")
+    with pytest.raises(ValueError, match="Refusing live Stripe key in CUSTOM_PAYMENT_KEY"):
+        load_staging_secrets([str(custom_bad_env)], test_mode_secret_keys=["CUSTOM_PAYMENT_KEY"])
 
 
 def test_staging_train_coordinator_coalesces_batch(tmp_path):

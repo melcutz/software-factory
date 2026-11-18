@@ -1297,7 +1297,11 @@ def _execute_staging_train_batch(
         else contextlib.nullcontext()
     )
     with dist_ctx, staging_lock(jobs_dir):
-        secrets = load_staging_secrets(staging_cfg.get("env_files") or [], repo_root=repo_root)
+        secrets = load_staging_secrets(
+            staging_cfg.get("env_files") or [],
+            repo_root=repo_root,
+            test_mode_secret_keys=staging_cfg.get("test_mode_secret_keys"),
+        )
         merged_tickets: list[TrainTicket] = []
         train_base_sha = ""
 
@@ -4237,7 +4241,11 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
     if cfg and (cfg.get("staging_qa") or {}).get("enabled"):
         sqa = cfg["staging_qa"]
         try:
-            secrets = load_staging_secrets(sqa.get("env_files") or [], repo_root=repo_root)
+            secrets = load_staging_secrets(
+                sqa.get("env_files") or [],
+                repo_root=repo_root,
+                test_mode_secret_keys=sqa.get("test_mode_secret_keys"),
+            )
             messages.append(
                 f"OK: staging_qa enabled (base_url={sqa.get('base_url')}, secrets_loaded={len(secrets)})"
             )
