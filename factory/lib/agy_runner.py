@@ -35,10 +35,35 @@ class AgentExecutionError(RuntimeError):
 class QuotaExhaustedError(RuntimeError):
     """Raised immediately when an LLM provider returns HTTP 429 / RESOURCE_EXHAUSTED."""
 
-    def __init__(self, model_spec: str, retry_after_sec: int | None = None, message: str = "") -> None:
+    def __init__(
+        self,
+        model_spec: str,
+        retry_after_sec: int | None = None,
+        message: str = "",
+        bucket: str | None = None,
+    ) -> None:
         self.model_spec = model_spec
         self.retry_after_sec = retry_after_sec
+        self.bucket = bucket
         super().__init__(message or f"LLM quota exhausted for {model_spec}")
+
+
+def classify_model_provider(model_spec: str) -> tuple[str, str]:
+    """Return ``(provider, tier)`` for a model spec.
+
+    provider: "agy" | "opencode" | "opencode-go" | "openrouter" | "gpu"
+    tier: "subscription" | "free" | "paid" | "local"
+    """
+    spec = (model_spec or "").strip()
+    if spec.startswith("gpu:"):
+        return ("gpu", "local")
+    if spec.startswith("opencode-go/"):
+        return ("opencode-go", "subscription")
+    if spec.startswith("openrouter/"):
+        return ("openrouter", "free" if spec.endswith(":free") else "paid")
+    if spec.startswith("opencode/"):
+        return ("opencode", "free" if (spec.endswith("-free") or spec == "opencode/big-pickle") else "paid")
+    return ("agy", "paid")
 
 
 _QUOTA_RE = re.compile(r"(?:\b429\b|RESOURCE_EXHAUSTED|rate[ _-]?limit(?:ed| exceeded)|quota[ _-]?exceeded)", re.IGNORECASE)
@@ -302,8 +327,11 @@ def _invoke_agy_process(
     hard_timeout_sec: float,
     idle_bg_grace_sec: float,
     abort_check: Callable[[], BaseException | None] | None = None,
+    *,
+    label: str = "agy",
+    idle_output_timeout_sec: float | None = None,
 ) -> tuple[int, str, str, str | None]:
-    """Spawn agy in its own process group and enforce hard + idle-background-task timeouts."""
+    """Spawn a subprocess in its own process group and enforce hard + idle timeouts."""
     if subprocess.run is not _ORIG_SUBPROCESS_RUN:
         if abort_check is not None:
             abort_exc = abort_check()
@@ -314,6 +342,7 @@ def _invoke_agy_process(
                 cmd,
                 cwd=cwd,
                 env=env,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 timeout=hard_timeout_sec,
@@ -325,13 +354,14 @@ def _invoke_agy_process(
                 -9,
                 (exc.stdout or "") if isinstance(exc.stdout, str) else "",
                 (exc.stderr or "") if isinstance(exc.stderr, str) else "",
-                f"agy timed out after {hard_timeout_sec:.1f}s",
+                f"{label} timed out after {hard_timeout_sec:.1f}s",
             )
 
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
         env=env,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -343,21 +373,25 @@ def _invoke_agy_process(
     idle_since: float | None = None
     idle_children: set[int] | None = None
     active_children: set[int] = set()
+    last_output_at = time.monotonic()
 
     def _read_stdout() -> None:
-        nonlocal idle_since, idle_children
+        nonlocal idle_since, idle_children, last_output_at
         assert proc.stdout is not None
         for line in proc.stdout:
             stdout_chunks.append(line)
             with state_lock:
+                last_output_at = time.monotonic()
                 idle_since = None
                 idle_children = None
 
     def _read_stderr() -> None:
-        nonlocal idle_since, idle_children, active_children
+        nonlocal idle_since, idle_children, active_children, last_output_at
         assert proc.stderr is not None
         for line in proc.stderr:
             stderr_chunks.append(line)
+            with state_lock:
+                last_output_at = time.monotonic()
             stripped = line.strip()
             if not stripped:
                 continue
@@ -404,7 +438,7 @@ def _invoke_agy_process(
             if now >= hard_deadline:
                 with state_lock:
                     extra = set(active_children)
-                killed_reason = f"agy timed out after {hard_timeout_sec:.1f}s"
+                killed_reason = f"{label} timed out after {hard_timeout_sec:.1f}s"
                 _terminate_process_group(proc, extra)
                 break
             live = _live_child_pids(proc.pid)
@@ -413,6 +447,7 @@ def _invoke_agy_process(
                     active_children = set(live)
                 cur_idle = idle_since
                 tracked = idle_children
+                cur_last_output = last_output_at
                 if cur_idle is not None and live is not None:
                     if not live or (tracked and not (live & tracked)):
                         idle_since = None
@@ -421,8 +456,12 @@ def _invoke_agy_process(
                 extra = set(active_children)
             if cur_idle is not None and (now - cur_idle) >= grace:
                 killed_reason = (
-                    f"agy hung waiting on background task(s) for {grace:.1f}s after root agent went idle"
+                    f"{label} hung waiting on background task(s) for {grace:.1f}s after root agent went idle"
                 )
+                _terminate_process_group(proc, extra)
+                break
+            if idle_output_timeout_sec is not None and (now - cur_last_output) >= idle_output_timeout_sec:
+                killed_reason = f"{label} produced no output for {idle_output_timeout_sec:.1f}s"
                 _terminate_process_group(proc, extra)
                 break
             time.sleep(0.05)
@@ -461,6 +500,142 @@ def _resolve_idle_bg_grace_sec(factory_dir: str, explicit: float | None) -> floa
     return _DEFAULT_IDLE_BG_GRACE_SEC
 
 
+def _build_subprocess_env(extra_env: dict[str, str] | None) -> dict[str, str] | None:
+    """Build subprocess environment, ensuring ~/.opencode/bin and ~/.local/bin are on PATH when present."""
+    user_bins = [
+        os.path.expanduser("~/.opencode/bin"),
+        os.path.expanduser("~/.local/bin"),
+    ]
+    existing_bins = [b for b in user_bins if os.path.isdir(b)]
+    if extra_env is None and not existing_bins:
+        return None
+    env = {**os.environ, **(extra_env or {})}
+    if existing_bins:
+        path_parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+        for b in existing_bins:
+            if b not in path_parts:
+                path_parts.append(b)
+        env["PATH"] = os.pathsep.join(path_parts)
+    return env
+
+
+def _load_gpu_settings(factory_dir: str) -> tuple[str, float]:
+    """Read gpu.mcp_url (env > config > default) and gpu.min_confidence (default 0.90)."""
+    from factory.lib.gpu_runner import resolve_gpu_mcp_url
+
+    cfg_path = os.path.join(factory_dir, "config.json")
+    cfg: dict | None = None
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                cfg = raw
+        except (OSError, ValueError):
+            pass
+    mcp_url = resolve_gpu_mcp_url(factory_dir=factory_dir, config=cfg)
+    min_conf = 0.90
+    if cfg and isinstance(cfg.get("gpu"), dict):
+        mc = cfg["gpu"].get("min_confidence")
+        if isinstance(mc, (int, float)) and not isinstance(mc, bool) and 0.0 < float(mc) <= 1.0:
+            min_conf = float(mc)
+    return mcp_url, min_conf
+
+
+def _run_agy_provider(
+    *,
+    worktree: str,
+    stage: str,
+    agent_name: str,
+    model: str,
+    full_prompt: str,
+    schema: dict,
+    timeout_sec: int,
+    sandbox: bool,
+    proc_env: dict[str, str] | None,
+    effective_idle_grace: float,
+    abort_check: Callable[[], BaseException | None] | None,
+    logs_dir: str,
+    effective_log: str,
+    attempt: int,
+) -> dict:
+    """Invoke `agy -p` once, write attempt log, and return provider envelope."""
+    schema_str = json.dumps(schema, separators=(",", ":"))
+    cmd = [
+        resolve_agy_bin(),
+        "-p",
+        full_prompt,
+        "--model",
+        model,
+        "--output-format",
+        "json",
+        "--json-schema",
+        schema_str,
+        "--print-timeout",
+        f"{int(timeout_sec)}s",
+        "--dangerously-skip-permissions",
+    ]
+    if sandbox:
+        cmd.append("--sandbox")
+
+    t0 = time.monotonic()
+    returncode, stdout_text, stderr_text, killed_reason = _invoke_agy_process(
+        cmd,
+        cwd=worktree,
+        env=proc_env,
+        hard_timeout_sec=float(timeout_sec + _SUBPROCESS_TIMEOUT_GRACE_SEC),
+        idle_bg_grace_sec=effective_idle_grace,
+        abort_check=abort_check,
+        label="agy",
+    )
+    elapsed = round(time.monotonic() - t0, 3)
+
+    log_record = {
+        "attempt": attempt,
+        "agent": agent_name,
+        "stage": stage,
+        "model": model,
+        "sandbox": sandbox,
+        "returncode": returncode,
+        "killed_reason": killed_reason,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+    }
+    log_file = os.path.join(
+        logs_dir,
+        f"{effective_log}.json" if attempt == 1 else f"{effective_log}-retry.json",
+    )
+    with open(log_file, "w", encoding="utf-8") as f:
+        json.dump(log_record, f, indent=2)
+
+    if killed_reason:
+        raise AgentExecutionError(f"{killed_reason}: {(stderr_text or stdout_text)[:400]}")
+    if returncode != 0:
+        quota_err = _detect_quota_error(model, stdout_text, stderr_text)
+        if quota_err is not None:
+            raise quota_err
+        raise AgentExecutionError(
+            f"agy exited with code {returncode}: {(stderr_text or stdout_text)[:400]}"
+        )
+
+    envelope = _extract_json_envelope(stdout_text)
+    if envelope.get("status") != "SUCCESS":
+        raise AgentExecutionError(f"agy returned non-SUCCESS status: {envelope.get('status')!r}")
+
+    raw_structured = envelope.get("structured_output")
+    if not isinstance(raw_structured, dict):
+        raise AgentExecutionError("agy envelope missing dict structured_output")
+
+    usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else {}
+    duration = float(envelope.get("duration_seconds") or elapsed)
+    return {
+        "status": "SUCCESS",
+        "structured_output": raw_structured,
+        "usage": usage,
+        "duration_seconds": duration,
+    }
+
+
 def run_agent(
     factory_dir: str,
     job_dir: str,
@@ -479,35 +654,21 @@ def run_agent(
     idle_bg_grace_sec: float | None = None,
     abort_check: Callable[[], BaseException | None] | None = None,
 ) -> tuple[dict, dict, float]:
-    """Run one headless `agy -p` turn with JSON Schema validation and 1 retry."""
+    """Run one headless agent turn across agy/opencode/gpu with schema validation and guards."""
     effective_idle_grace = _resolve_idle_bg_grace_sec(factory_dir, idle_bg_grace_sec)
-    full_prompt = build_agent_prompt(factory_dir, stage, agent_name, task_prompt)
-    schema_str = json.dumps(schema, separators=(",", ":"))
+    provider, tier = classify_model_provider(model)
+    is_opencode = provider in {"opencode", "opencode-go", "openrouter"}
+    is_gpu = provider == "gpu"
+
+    full_prompt = "" if is_gpu else build_agent_prompt(factory_dir, stage, agent_name, task_prompt)
 
     logs_dir = os.path.join(job_dir, "logs")
     os.makedirs(logs_dir, exist_ok=True)
     effective_log = log_name or f"{stage}-{agent_name}"
 
-    cmd = [
-        resolve_agy_bin(),
-        "-p",
-        full_prompt,
-        "--model",
-        model,
-        "--output-format",
-        "json",
-        "--json-schema",
-        schema_str,
-        "--print-timeout",
-        f"{int(timeout_sec)}s",
-        "--dangerously-skip-permissions",
-    ]
-    if sandbox:
-        cmd.append("--sandbox")
-
     guard_head = sandbox or protect_head
     initial_sha = head_sha(worktree) if guard_head else ""
-    proc_env = {**os.environ, **extra_env} if extra_env is not None else None
+    proc_env = _build_subprocess_env(extra_env)
     last_err: Exception | None = None
     aborted_exc: BaseException | None = None
 
@@ -524,18 +685,54 @@ def run_agent(
             aborted_exc = exc
         return exc
 
-    for attempt in (1, 2):
-        t0 = time.monotonic()
+    attempts = (1,) if (is_opencode or is_gpu) else (1, 2)
+
+    for attempt in attempts:
         try:
             try:
-                returncode, stdout_text, stderr_text, killed_reason = _invoke_agy_process(
-                    cmd,
-                    cwd=worktree,
-                    env=proc_env,
-                    hard_timeout_sec=float(timeout_sec + _SUBPROCESS_TIMEOUT_GRACE_SEC),
-                    idle_bg_grace_sec=effective_idle_grace,
-                    abort_check=_wrapped_abort_check if abort_check is not None else None,
-                )
+                if is_opencode:
+                    from factory.lib.opencode_runner import run_opencode_turn
+
+                    envelope = run_opencode_turn(
+                        worktree=worktree,
+                        stage=stage,
+                        model=model,
+                        full_prompt=full_prompt,
+                        schema=schema,
+                        timeout_sec=timeout_sec,
+                        extra_env=proc_env,
+                        idle_grace_sec=effective_idle_grace,
+                        abort_check=_wrapped_abort_check if abort_check is not None else None,
+                    )
+                elif is_gpu:
+                    from factory.lib.gpu_runner import run_gpu_stage
+
+                    mcp_url, min_conf = _load_gpu_settings(factory_dir)
+                    envelope = run_gpu_stage(
+                        stage=stage,
+                        model=model,
+                        task_prompt=task_prompt,
+                        mcp_url=mcp_url,
+                        min_confidence=min_conf,
+                        timeout_sec=float(timeout_sec),
+                    )
+                else:
+                    envelope = _run_agy_provider(
+                        worktree=worktree,
+                        stage=stage,
+                        agent_name=agent_name,
+                        model=model,
+                        full_prompt=full_prompt,
+                        schema=schema,
+                        timeout_sec=timeout_sec,
+                        sandbox=sandbox,
+                        proc_env=proc_env,
+                        effective_idle_grace=effective_idle_grace,
+                        abort_check=_wrapped_abort_check if abort_check is not None else None,
+                        logs_dir=logs_dir,
+                        effective_log=effective_log,
+                        attempt=attempt,
+                    )
             finally:
                 if guard_head:
                     after_sha = head_sha(worktree)
@@ -553,61 +750,37 @@ def run_agent(
                     if clean_worktree and not is_worktree_clean(worktree):
                         reset_worktree_clean(worktree)
 
-            elapsed = round(time.monotonic() - t0, 3)
-
-            log_record = {
-                "attempt": attempt,
-                "agent": agent_name,
-                "stage": stage,
-                "model": model,
-                "sandbox": sandbox,
-                "returncode": returncode,
-                "killed_reason": killed_reason,
-                "stdout": stdout_text,
-                "stderr": stderr_text,
-            }
-            log_file = os.path.join(
-                logs_dir,
-                f"{effective_log}.json" if attempt == 1 else f"{effective_log}-retry.json",
-            )
-            with open(log_file, "w", encoding="utf-8") as f:
-                json.dump(log_record, f, indent=2)
-
-            if killed_reason:
-                raise AgentExecutionError(f"{killed_reason}: {(stderr_text or stdout_text)[:400]}")
-            if returncode != 0:
-                quota_err = _detect_quota_error(model, stdout_text, stderr_text)
-                if quota_err is not None:
-                    raise quota_err
-                raise AgentExecutionError(
-                    f"agy exited with code {returncode}: {(stderr_text or stdout_text)[:400]}"
-                )
-
-            envelope = _extract_json_envelope(stdout_text)
             if envelope.get("status") != "SUCCESS":
-                raise AgentExecutionError(f"agy returned non-SUCCESS status: {envelope.get('status')!r}")
+                raise AgentExecutionError(
+                    f"{provider} returned non-SUCCESS status: {envelope.get('status')!r}"
+                )
 
             raw_structured = envelope.get("structured_output")
             if not isinstance(raw_structured, dict):
-                raise AgentExecutionError("agy envelope missing dict structured_output")
+                raise AgentExecutionError(f"{provider} envelope missing dict structured_output")
 
             with open(os.path.join(logs_dir, f"{effective_log}.json"), "w", encoding="utf-8") as f:
                 json.dump(envelope, f, indent=2)
 
             validated = validate_stage_output(stage, raw_structured)
-            usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else {}
-            duration = float(envelope.get("duration_seconds") or elapsed)
+            usage = dict(envelope.get("usage")) if isinstance(envelope.get("usage"), dict) else {}
+            usage["provider"] = provider
+            usage["tier"] = tier
+            usage["model"] = model
+            duration = float(envelope.get("duration_seconds") or 0.0)
             return validated, usage, duration
 
         except Exception as exc:
             last_err = exc
             if aborted_exc is not None and exc is aborted_exc:
                 raise
-            if type(exc).__name__ in {"JobHaltedError", "LeaseLostError"}:
+            if type(exc).__name__ in {"JobHaltedError", "LeaseLostError", "GpuAbstain"}:
                 raise
             if isinstance(exc, QuotaExhaustedError):
                 raise
             if isinstance(exc, AgentExecutionError) and "illegally moved HEAD" in str(exc):
+                raise
+            if is_opencode or is_gpu:
                 raise
             if attempt == 2:
                 break
