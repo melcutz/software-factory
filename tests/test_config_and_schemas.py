@@ -604,6 +604,45 @@ class ConfigAndSchemaTests(unittest.TestCase):
             with open(os.path.join(init_repo_dir, ".gitignore"), encoding="utf-8") as f:
                 gi_lines = [ln.strip() for ln in f if ln.strip()]
             self.assertIn("factory/config.local.json", gi_lines)
+            with open(os.path.join(init_repo_dir, "factory", "config.json"), encoding="utf-8") as f:
+                init_cfg = json.load(f)
+            for host_key in ("gpu", "provider_timeouts", "path_prepend", "providers", "model_pricing", "quota"):
+                self.assertNotIn(host_key, init_cfg)
+
+    def test_user_config_applies_through_committed_repo_config_and_explicit_null_wins(self):
+        with tempfile.TemporaryDirectory() as d:
+            user_cfg_path = os.path.join(d, "user-config.json")
+            with open(user_cfg_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "gpu": {"mcp_url": "http://localhost:65530/mcp"},
+                        "quota": {"default_cooldown_sec": 1234},
+                    },
+                    f,
+                )
+
+            old_env = os.environ.get("FACTORY_USER_CONFIG")
+            try:
+                os.environ["FACTORY_USER_CONFIG"] = user_cfg_path
+
+                # (a) Host-level settings from FACTORY_USER_CONFIG apply through THIS repo's committed factory/config.json
+                repo_cfg = load_config(os.path.abspath("factory"))
+                self.assertEqual(repo_cfg["gpu"]["mcp_url"], "http://localhost:65530/mcp")
+                self.assertEqual(repo_cfg["quota"]["default_cooldown_sec"], 1234)
+
+                # (b) A repo config.json that explicitly sets gpu.mcp_url to null still wins (explicit disable)
+                fdir = os.path.join(d, "disabled-repo", "factory")
+                os.makedirs(fdir, exist_ok=True)
+                with open(os.path.join(fdir, "config.json"), "w", encoding="utf-8") as f:
+                    json.dump({"gpu": {"mcp_url": None}}, f)
+                disabled_cfg = load_config(fdir)
+                self.assertIsNone(disabled_cfg["gpu"]["mcp_url"])
+                self.assertEqual(disabled_cfg["quota"]["default_cooldown_sec"], 1234)
+            finally:
+                if old_env is None:
+                    os.environ.pop("FACTORY_USER_CONFIG", None)
+                else:
+                    os.environ["FACTORY_USER_CONFIG"] = old_env
 
 
 if __name__ == "__main__":

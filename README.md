@@ -176,7 +176,7 @@ See [INSTALL.md](INSTALL.md) for the full step-by-step setup walkthrough.
 3. **Repository config**: `<repo>/factory/config.json` (committed in the target repo)
 4. **Repository local override**: `<repo>/factory/config.local.json` (gitignored, machine-specific overrides for that repo)
 
-Dictionary sections (`models`, `labels`, `provider_timeouts`, `gpu`, `quota`, `model_pricing`, `providers`, `batch`, `staging_qa`) **deep-merge per key**; scalars and lists **replace** lower layers. Keys starting with `_` (such as `"_comment"`) are ignored at load time.
+Dictionary sections (`models`, `labels`, `provider_timeouts`, `gpu`, `quota`, `model_pricing`, `providers`, `batch`, `staging_qa`) **deep-merge per key**; scalars and lists **replace** lower layers. Keys starting with `_` (such as `"_comment"`) are ignored at load time. Leave host-level keys (`gpu`, `provider_timeouts`, `path_prepend`, `providers`, `model_pricing`, `quota`) out of the committed repo config so machine-level settings apply; explicitly setting a key like `gpu.mcp_url` to `null` in repo `config.json` still wins to disable it for that repo.
 
 See [factory/config.example.json](factory/config.example.json) for a complete, annotated example of every option.
 

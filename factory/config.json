@@ -33,17 +33,6 @@
     "ux": "gemini-3.8-flash-medium",
     "ui": "gemini-3.6-flash-low"
   },
-  "provider_timeouts": {
-    "agy": null,
-    "opencode": 1800,
-    "opencode-go": 1800,
-    "openrouter": 1200,
-    "gpu": 60
-  },
-  "gpu": {
-    "mcp_url": null,
-    "min_confidence": 0.9
-  },
   "batch": {
     "enabled": true,
     "max_batch_issues": 5,
