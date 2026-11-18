@@ -139,9 +139,26 @@ def fleet_status() -> list[dict]:
     return machines
 
 
-def _factory_shell_cmd(*args: str) -> list[str]:
+def _factory_shell_cmd(*args: str, config: dict | None = None) -> list[str]:
+    from factory.lib.config import _user_config_path, expand_path_prepend
+
     quoted = " ".join(args)
-    return ["sh", "-lc", f'export PATH="$HOME/.local/bin:$PATH"; exec factory {quoted}']
+    cfg = config
+    if cfg is None:
+        user_cfg_path = _user_config_path()
+        if os.path.isfile(user_cfg_path):
+            try:
+                with open(user_cfg_path, encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    cfg = loaded
+            except (OSError, ValueError):
+                pass
+    prepend = expand_path_prepend(cfg)
+    if prepend:
+        joined = ":".join(prepend)
+        return ["sh", "-lc", f'export PATH="{joined}:$PATH"; exec factory {quoted}']
+    return ["sh", "-lc", f"exec factory {quoted}"]
 
 
 def fleet_wake(machine: str | None = None) -> list[tuple[str, int, str]]:

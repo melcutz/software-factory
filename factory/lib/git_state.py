@@ -723,7 +723,9 @@ class GitStateStore:
         retry_after_sec: int | None = None,
         *,
         now_ts: float | None = None,
+        config: dict | None = None,
     ) -> dict:
+        bucket = _governor.quota_bucket_for_model(base_model, config=config) or base_model
         ts = time.time() if now_ts is None else now_ts
         ref = "refs/factory/quota"
         for _ in range(3):
@@ -736,22 +738,23 @@ class GitStateStore:
                     state = self._read_json_from_commit(old_sha, "quota.json") or {"models": {}}
                     if not isinstance(state.get("models"), dict):
                         state["models"] = {}
-            prev = state["models"].get(base_model) or {}
+            prev = state["models"].get(bucket) or {}
             consecutive = int(prev.get("consecutive_429s") or 0) + 1
             idx = min(consecutive - 1, len(QUOTA_BACKOFF_SCHEDULE) - 1)
             wait_sec = max(QUOTA_BACKOFF_SCHEDULE[idx], int(retry_after_sec or 0))
-            state["models"][base_model] = {
+            state["models"][bucket] = {
                 "consecutive_429s": consecutive,
                 "cooldown_until": _iso(ts + wait_sec),
                 "cooldown_until_ts": ts + wait_sec,
                 "reported_by": self.machine_id,
                 "reason": reason[:200],
             }
-            if self._push_json_ref(ref, "quota.json", state, f"quota cooldown {base_model}", old_sha):
+            if self._push_json_ref(ref, "quota.json", state, f"quota cooldown {bucket}", old_sha):
                 return state
         raise RuntimeError("Failed to CAS-update refs/factory/quota after 3 attempts")
 
-    def clear_quota_cooldown(self, base_model: str) -> None:
+    def clear_quota_cooldown(self, base_model: str, *, config: dict | None = None) -> None:
+        bucket = _governor.quota_bucket_for_model(base_model, config=config) or base_model
         ref = "refs/factory/quota"
         for _ in range(3):
             old_sha = self._ls_remote_one(ref)
@@ -763,10 +766,11 @@ class GitStateStore:
             old_sha = fetched
             state = self._read_json_from_commit(old_sha, "quota.json") or {"models": {}}
             models = state.get("models")
-            if not isinstance(models, dict) or base_model not in models:
+            if not isinstance(models, dict) or (bucket not in models and base_model not in models):
                 return
+            models.pop(bucket, None)
             models.pop(base_model, None)
-            if self._push_json_ref(ref, "quota.json", state, f"clear quota {base_model}", old_sha):
+            if self._push_json_ref(ref, "quota.json", state, f"clear quota {bucket}", old_sha):
                 return
 
     # ------------------------------------------------------------------
@@ -797,7 +801,7 @@ class GitStateStore:
 
     def prune_stale_refs(self, *, max_age_days: int = 30, now_ts: float | None = None) -> int:
         ts = time.time() if now_ts is None else now_ts
-        cutoff = ts - (max_age_days * 86400)
+        cutoff = ts - (max_age_days * 24 * 3600)
         deleted = 0
         job_refs = self._ls_remote("refs/factory/jobs/*")
         for ref in sorted(job_refs):

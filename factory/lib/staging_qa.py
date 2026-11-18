@@ -80,12 +80,18 @@ def load_staging_secrets(
     *,
     allowed_keys: frozenset[str] | None = None,
     repo_root: str | None = None,
+    test_mode_secret_keys: Sequence[str] | None = None,
 ) -> dict[str, str]:
     """Parse staging credentials from env files without a shell."""
     hooks = _load_repo_hooks(repo_root)
     if hooks is not None and hasattr(hooks, "load_staging_secrets"):
         return hooks.load_staging_secrets(env_files)
 
+    guarded_keys = (
+        {str(k).strip() for k in test_mode_secret_keys if str(k).strip()}
+        if test_mode_secret_keys is not None
+        else {"STRIPE_SECRET_KEY"}
+    )
     secrets: dict[str, str] = {}
     for path in env_files or ():
         expanded = os.path.expanduser(path)
@@ -105,7 +111,7 @@ def load_staging_secrets(
                 if allowed_keys is not None and key not in allowed_keys:
                     continue
                 val = _parse_env_value(raw_val)
-                if key in {"STRIPE_SECRET_KEY", "KEEPFOR_STRIPE_TEST_KEY"} and (
+                if key in guarded_keys and (
                     val.startswith("sk_live_") or val.startswith("rk_live_")
                 ):
                     raise ValueError(f"Refusing live Stripe key in {key}")

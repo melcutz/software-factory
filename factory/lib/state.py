@@ -368,11 +368,59 @@ def record_usage(
                 "cost_usd": 0.0,
             },
         )
+        u = usage if isinstance(usage, dict) else {}
+        in_tok = int(u.get("input_tokens", 0) or 0)
+        out_tok = int(u.get("output_tokens", 0) or 0)
+        tot_tok = int(u.get("total_tokens", 0) or 0)
+        dur = float(duration_seconds or 0.0)
+        add_cost = float(cost_usd) if cost_usd is not None else 0.0
+
         for key in ("input_tokens", "cache_read_tokens", "output_tokens", "thinking_tokens", "total_tokens"):
-            cur[key] = int(cur.get(key, 0)) + int((usage or {}).get(key, 0) or 0)
-        cur["duration_seconds"] = round(float(cur.get("duration_seconds", 0.0)) + float(duration_seconds or 0.0), 3)
+            cur[key] = int(cur.get(key, 0)) + int(u.get(key, 0) or 0)
+        cur["duration_seconds"] = round(float(cur.get("duration_seconds", 0.0)) + dur, 3)
         if cost_usd is not None:
-            cur["cost_usd"] = round(float(cur.get("cost_usd", 0.0) or 0.0) + float(cost_usd), 6)
+            cur["cost_usd"] = round(float(cur.get("cost_usd", 0.0) or 0.0) + add_cost, 6)
+
+        provider = str(u.get("provider") or "").strip()
+        tier = str(u.get("tier") or "").strip()
+        model_spec = str(u.get("model") or "").strip()
+        if (not provider or not tier) and model_spec:
+            from factory.lib.agy_runner import classify_model_provider
+
+            inf_prov, inf_tier = classify_model_provider(model_spec)
+            provider = provider or inf_prov
+            tier = tier or inf_tier
+
+        def _accum_bucket(container: dict, key: str) -> None:
+            entry = container.setdefault(
+                key,
+                {
+                    "calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "duration_seconds": 0.0,
+                    "cost_usd": 0.0,
+                },
+            )
+            entry["calls"] = int(entry.get("calls", 0)) + 1
+            entry["input_tokens"] = int(entry.get("input_tokens", 0)) + in_tok
+            entry["output_tokens"] = int(entry.get("output_tokens", 0)) + out_tok
+            entry["total_tokens"] = int(entry.get("total_tokens", 0)) + tot_tok
+            entry["duration_seconds"] = round(float(entry.get("duration_seconds", 0.0)) + dur, 3)
+            entry["cost_usd"] = round(float(entry.get("cost_usd", 0.0)) + add_cost, 6)
+
+        if tier:
+            by_tier = cur.setdefault("by_tier", {})
+            if isinstance(by_tier, dict):
+                _accum_bucket(by_tier, tier)
+        if provider:
+            by_provider = cur.setdefault("by_provider", {})
+            if isinstance(by_provider, dict):
+                _accum_bucket(by_provider, provider)
+        if model_spec:
+            cur["last_model"] = model_spec
+
         job["updated"] = _now_iso()
         return _atomic_write_job(jobs_dir, job_id, job)
 

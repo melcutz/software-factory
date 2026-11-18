@@ -167,7 +167,7 @@ def test_fleet_wake_is_idempotent_on_name_taken(tmp_path, monkeypatch):
         f"#!{sys.executable}\n"
         "import json, sys\n"
         "if sys.argv[1:3] == ['machine', 'ls']:\n"
-        "    print(json.dumps({'machines': [{'name': 'base-ubuntu', 'state': 'connected'}]}))\n"
+        "    print(json.dumps({'machines': [{'name': 'host-a', 'state': 'connected'}]}))\n"
         "else:\n"
         "    print(json.dumps({'error': {'kind': 'name_taken', 'message': 'already named'}}))\n"
         "    sys.exit(1)\n",
@@ -179,21 +179,21 @@ def test_fleet_wake_is_idempotent_on_name_taken(tmp_path, monkeypatch):
 
     from factory.lib.fleet import fleet_wake
     res = fleet_wake()
-    assert ("base-ubuntu", 0, "already running") in res
+    assert ("host-a", 0, "already running") in res
 
 
 def test_sanitize_hc_name_and_human_readable_fleet_output():
     from factory.cli import _format_fleet_result
     from factory.lib.herdr_bridge import sanitize_hc_name
 
-    assert sanitize_hc_name("factory-worker-Rocket") == "factory-worker-rocket"
+    assert sanitize_hc_name("factory-worker-MyHost") == "factory-worker-myhost"
     assert sanitize_hc_name("My Repo#42!") == "my-repo-42"
 
     started = _format_fleet_result("lenovo", 0, '{"address":"lenovo/t11","state":"live"}')
     assert started == "lenovo: started (lenovo/t11, live)"
 
-    failed = _format_fleet_result("Rocket", 6, '{"error":{"message":"bad name","hint":"lowercase only"}}')
-    assert failed == "Rocket: FAILED - bad name (lowercase only)"
+    failed = _format_fleet_result("MyHost", 6, '{"error":{"message":"bad name","hint":"lowercase only"}}')
+    assert failed == "MyHost: FAILED - bad name (lowercase only)"
 
 
 def test_fleet_remove_calls_hc_machine_rm(tmp_path, monkeypatch):
@@ -631,7 +631,7 @@ def test_qa_external_blocker_escalates_immediately(tmp_path, monkeypatch):
         "personas_used": ["pro"],
         "failures": [],
         "reproduction_steps": ["click tab"],
-        "external_blocker": "Disable Cloudflare Speed Brain on keepfor.me zone",
+        "external_blocker": "Disable proxy caching on my-app.example zone",
     }
     _handle_qa_failure_for_ticket(
         str(tmp_path), jobs_dir, "main", cfg, gh, {}, tk, 1, 3, qa_dir, "QA failed", qa_out, "def67890", True, "ok"
@@ -640,7 +640,7 @@ def test_qa_external_blocker_escalates_immediately(tmp_path, monkeypatch):
     assert tk.outcome.action == "return"
     assert tk.outcome.job["stage"] == "needs-human"
     gh.comment_issue.assert_called_once()
-    assert "Disable Cloudflare Speed Brain" in gh.comment_issue.call_args[0][1]
+    assert "Disable proxy caching" in gh.comment_issue.call_args[0][1]
 
 
 def test_run_worker_survives_transient_github_error(tmp_path, monkeypatch):
@@ -732,7 +732,7 @@ def test_status_reports_remote_leased_jobs_as_live(tmp_path):
             "stage": "merging",
             "activity": "running:pre-merge-gate:full",
             "pid": 99999999,
-            "lease": {"worker_id": "Base", "hostname": "Base"},
+            "lease": {"worker_id": "host-a", "hostname": "host-a"},
             "_lease_active": True,
         }
     ]
@@ -804,6 +804,53 @@ def test_run_worker_uses_ramp_up_delay_after_claim(tmp_path, monkeypatch):
 
     assert run_worker([str(repo)], once=False) == 0
     assert waited == [7.5]
+
+
+def test_exec_job_command_prepends_opencode_and_local_bin_to_path(tmp_path, monkeypatch):
+    import json
+    import os
+
+    fake_home = tmp_path / "home"
+    oc_bin = fake_home / ".opencode" / "bin"
+    local_bin = fake_home / ".local" / "bin"
+    oc_bin.mkdir(parents=True)
+    local_bin.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    repo = tmp_path / "repo"
+    (repo / "factory").mkdir(parents=True)
+    monkeypatch.setattr(
+        "factory.lib.worker.process_job",
+        lambda *a, **kw: {"id": "job-99", "stage": "done"},
+    )
+    from factory.lib.worker import exec_job_command
+
+    # Without path_prepend configured, PATH is untouched
+    rc = exec_job_command(str(repo), 99)
+    assert rc == 0
+    assert os.environ["PATH"] == "/usr/bin:/bin"
+
+    # With path_prepend configured, entries are expanded and prepended
+    (repo / "factory" / "config.json").write_text(
+        json.dumps({"path_prepend": ["~/.opencode/bin", "~/.local/bin"]}),
+        encoding="utf-8",
+    )
+    rc2 = exec_job_command(str(repo), 99)
+    assert rc2 == 0
+    parts = os.environ["PATH"].split(os.pathsep)
+    assert parts[0] == str(oc_bin)
+    assert parts[1] == str(local_bin)
+
+
+def test_fleet_shell_cmd_includes_opencode_bin():
+    from factory.lib.fleet import _factory_shell_cmd
+
+    cmd = _factory_shell_cmd("worker", "--all")
+    assert cmd == ["sh", "-lc", "exec factory worker --all"]
+    assert ".opencode/bin" not in cmd[2]
+    assert ".local/bin" not in cmd[2]
+
 
 
 

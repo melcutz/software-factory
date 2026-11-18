@@ -414,7 +414,8 @@ class PipelineE2ETests(unittest.TestCase):
         self.bin_dir = os.path.join(self.tmp, "bin")
         os.makedirs(self.bin_dir)
 
-        for name, body in [("gh", FAKE_GH_SCRIPT), ("agy", FAKE_AGY_SCRIPT)]:
+        fake_oc_script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'opencode 0.0.0-fake'; exit 0; fi\necho 'fake opencode in e2e' >&2\nexit 127\n"
+        for name, body in [("gh", FAKE_GH_SCRIPT), ("agy", FAKE_AGY_SCRIPT), ("opencode", fake_oc_script)]:
             p = os.path.join(self.bin_dir, name)
             with open(p, "w", encoding="utf-8") as f:
                 f.write(body)
@@ -456,6 +457,7 @@ class PipelineE2ETests(unittest.TestCase):
 
         self._old_env = os.environ.copy()
         os.environ["PATH"] = f"{self.bin_dir}:{self._old_env.get('PATH', '')}"
+        os.environ["FACTORY_OPENCODE_BIN"] = os.path.join(self.bin_dir, "opencode")
         os.environ["FAKE_GH_STATE"] = self.gh_state_path
         os.environ["FAKE_AGY_STATE"] = self.agy_state_path
         os.environ["MAIN_CLONE_DIR"] = self.repo
@@ -708,9 +710,16 @@ class PipelineE2ETests(unittest.TestCase):
         subprocess.run(["git", "-C", self.repo, "push", "origin", "main"], check=True, capture_output=True)
 
         self._seed_issue(30, "Two-part feature")
+        cfg_priced = {
+            **load_config(os.path.join(self.repo, "factory")),
+            "model_pricing": {
+                "gemini-3.8-flash": dict(input_per_m=1.0, cached_per_m=0.25, output_per_m=4.0),
+                "gemini-3.6-flash": dict(input_per_m=0.5, cached_per_m=0.1, output_per_m=2.0),
+            },
+        }
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            merged = process_job(self.repo, 30)
+            merged = process_job(self.repo, 30, config=cfg_priced)
 
         self.assertEqual(merged["stage"], "merged")
         with open(scopes_file, encoding="utf-8") as f:
