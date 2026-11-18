@@ -141,7 +141,7 @@ def fleet_status() -> list[dict]:
 
 def _factory_shell_cmd(*args: str) -> list[str]:
     quoted = " ".join(args)
-    return ["sh", "-lc", f'export PATH="$HOME/.local/bin:$PATH"; exec factory {quoted}']
+    return ["sh", "-lc", f'export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"; exec factory {quoted}']
 
 
 def fleet_wake(machine: str | None = None) -> list[tuple[str, int, str]]:

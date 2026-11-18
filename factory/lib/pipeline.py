@@ -4084,12 +4084,61 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
     else:
         messages.append(f"OK: git user.email -> {user_email}")
 
+    cfg: dict | None = None
     try:
         cfg = load_config(factory_dir)
         messages.append(f"OK: factory/config.json valid (auto_merge={cfg['auto_merge']}, concurrency={cfg['concurrency']})")
     except Exception as exc:
         ok = False
         messages.append(f"FAIL: factory/config.json invalid: {exc}")
+
+    if cfg and isinstance(cfg.get("models"), dict):
+        all_models: list[str] = []
+        for role in cfg["models"]:
+            all_models.extend(model_chain(cfg, role))
+
+        if any(m.startswith(("opencode/", "opencode-go/", "openrouter/")) for m in all_models):
+            from factory.lib.opencode_runner import resolve_opencode_bin
+
+            oc_bin = resolve_opencode_bin()
+            oc_resolved = shutil.which(oc_bin) or (
+                oc_bin if os.path.isfile(oc_bin) and os.access(oc_bin, os.X_OK) else None
+            )
+            if not oc_resolved:
+                ok = False
+                messages.append("FAIL: `opencode` not found on PATH or ~/.opencode/bin")
+            else:
+                try:
+                    res_oc = subprocess.run(
+                        [oc_resolved, "--version"],
+                        cwd=repo_root,
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                    )
+                    if res_oc.returncode != 0:
+                        ok = False
+                        messages.append(f"FAIL: `{oc_resolved} --version` exited {res_oc.returncode}")
+                    else:
+                        ver_text = (res_oc.stdout or res_oc.stderr or "").strip()
+                        first_line = ver_text.splitlines()[0] if ver_text else ""
+                        detail = f" ({first_line})" if first_line else ""
+                        messages.append(f"OK: `opencode --version`{detail}")
+                except Exception as exc:
+                    ok = False
+                    messages.append(f"FAIL: `{oc_resolved} --version` failed: {exc}")
+
+        if any(m.startswith("gpu:") for m in all_models):
+            from factory.lib.gpu_runner import gpu_available, resolve_gpu_mcp_url
+
+            mcp_url = resolve_gpu_mcp_url(factory_dir=factory_dir, config=cfg)
+            if gpu_available(mcp_url, force=True):
+                messages.append(f"OK: GPU MCP reachable with minicpm5 ({mcp_url})")
+            else:
+                messages.append(
+                    f"WARN: GPU MCP unreachable or minicpm5 not installed ({mcp_url}); gpu: tier will abstain"
+                )
 
     checks_sh = os.path.join(factory_dir, "checks.sh")
     if not (os.path.isfile(checks_sh) and os.access(checks_sh, os.X_OK)):

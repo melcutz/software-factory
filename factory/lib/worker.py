@@ -224,10 +224,14 @@ def select_next_candidate(
 
 def exec_job_command(repo_root: str, issue_number: int) -> int:
     """Execute one factory job inside an hc child terminal or local worker thread."""
-    local_bin = os.path.expanduser("~/.local/bin")
-    path_parts = os.environ.get("PATH", "").split(os.pathsep)
-    if os.path.isdir(local_bin) and local_bin not in path_parts:
-        os.environ["PATH"] = os.pathsep.join([local_bin, *(p for p in path_parts if p)])
+    path_parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    prepend = [
+        b
+        for b in (os.path.expanduser("~/.opencode/bin"), os.path.expanduser("~/.local/bin"))
+        if os.path.isdir(b) and b not in path_parts
+    ]
+    if prepend:
+        os.environ["PATH"] = os.pathsep.join([*prepend, *path_parts])
     repo_root = os.path.abspath(repo_root)
     host_cfg = load_host_config()
     bridge = HerdrBridge.from_env()
