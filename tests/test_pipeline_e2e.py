@@ -414,7 +414,8 @@ class PipelineE2ETests(unittest.TestCase):
         self.bin_dir = os.path.join(self.tmp, "bin")
         os.makedirs(self.bin_dir)
 
-        for name, body in [("gh", FAKE_GH_SCRIPT), ("agy", FAKE_AGY_SCRIPT)]:
+        fake_oc_script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'opencode 0.0.0-fake'; exit 0; fi\necho 'fake opencode in e2e' >&2\nexit 127\n"
+        for name, body in [("gh", FAKE_GH_SCRIPT), ("agy", FAKE_AGY_SCRIPT), ("opencode", fake_oc_script)]:
             p = os.path.join(self.bin_dir, name)
             with open(p, "w", encoding="utf-8") as f:
                 f.write(body)
@@ -456,6 +457,7 @@ class PipelineE2ETests(unittest.TestCase):
 
         self._old_env = os.environ.copy()
         os.environ["PATH"] = f"{self.bin_dir}:{self._old_env.get('PATH', '')}"
+        os.environ["FACTORY_OPENCODE_BIN"] = os.path.join(self.bin_dir, "opencode")
         os.environ["FAKE_GH_STATE"] = self.gh_state_path
         os.environ["FAKE_AGY_STATE"] = self.agy_state_path
         os.environ["MAIN_CLONE_DIR"] = self.repo
@@ -720,7 +722,7 @@ class PipelineE2ETests(unittest.TestCase):
 
         out = buf.getvalue()
         self.assertRegex(out, r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[job-30\]")
-        self.assertIn("model=gemini-3.8-flash effort=medium", out)
+        self.assertIn("model=gemini-4-hydrogen effort=medium", out)
         self.assertIn("cache=200,000", out)
         self.assertIn("cost=$", out)
         self.assertIn("scope=slice", out)

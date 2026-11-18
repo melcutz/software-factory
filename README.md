@@ -272,6 +272,22 @@ Controls concurrency, retry budgets, merge behavior (`"auto_merge": "low" | "all
 }
 ```
 
+### Coder Tiers
+
+Each `models.<role>` entry accepts either a single model string or a list-valued fallback chain tried in order:
+
+- **Model-id prefixes:**
+  - `gemini-*` (no prefix) → `agy` provider (`paid` tier)
+  - `opencode/*` → OpenCode CLI (`free` tier for `*-free` / `opencode/big-pickle`, else `paid`)
+  - `opencode-go/*` → OpenCode Go subscription (`subscription` tier, $0 marginal cost, tokens tracked)
+  - `openrouter/*` → OpenRouter via OpenCode (`free` tier for `*:free`, else `paid`)
+  - `gpu:*` (e.g. `gpu:jev`) → local GPU MCP server (`local` tier, $0)
+- **Fallthrough rules:** Chains advance to the next model on `GpuAbstain`, `QuotaExhaustedError` (after recording the cooldown), active cooldowns in `refs/factory/quota`, `AgentExecutionError`, or timeouts. Chains **abort immediately** (never fall through) on `JobHaltedError`, `LeaseLostError`, `abort_check`, or `"illegally moved HEAD"`.
+- **GPU abstain-only rules:** `gpu:` is only allowed in `intake`, `approver`, and `planner` (`config.json` validation rejects it elsewhere). It never escalates or rejects — it only fast-paths high-confidence `ACCEPT` (`intake`), clean low-risk round-1 `APPROVE` (`approver`), or `<= 1` issue (`planner`), and abstains otherwise.
+- **Cooldown buckets:** `opencode/*-free` & `opencode/big-pickle` share `opencode-free` (3h); `openrouter/*:free` shares `openrouter-free` (3h); `opencode-go/*` shares `opencode-go` (24h); `gpu:*` uses `gpu`; Gemini models normalize to base model (e.g. `gemini-4-argon`).
+- **Provider timeouts & pricing:** Configured via `provider_timeouts` (`agy: null`, `opencode: 1800`, `opencode-go: 1800`, `openrouter: 1200`, `gpu: 60`) and `model_pricing` (Gemini 4 Hydrogen `1.50/7.50`, Argon & Carbon `2.00/10.00` per M tokens; free/local/subscription `$0` marginal cost). `factory stats` breaks down calls, tokens, and cost by tier and provider.
+- **OpenCode binary & `factory doctor`:** Workers prepend `~/.opencode/bin` and `~/.local/bin` to `PATH`. `factory doctor` verifies `opencode --version` when any chain uses `opencode`/`openrouter`/`opencode-go` (fails if missing), and checks `gpu.mcp_url` `local_gpu_status` (`WARN` only if unreachable or `minicpm5` is not installed).
+
 ### Machine Config (`~/.config/factory/host.json`)
 
 Controls per-machine concurrency and resource-governor thresholds (restart the worker after editing):

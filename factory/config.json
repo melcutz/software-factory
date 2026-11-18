@@ -20,16 +20,29 @@
     ".github/"
   ],
   "models": {
-    "planner": "gemini-3.8-flash-low",
-    "intake": "gemini-3.8-flash-low",
-    "spec_writer": "gemini-3.8-flash-medium",
-    "builder": "gemini-3.8-flash-medium",
-    "approver": "gemini-3.8-flash-medium",
-    "code_low": "gemini-3.6-flash-low",
-    "code_medium": "gemini-3.8-flash-low",
-    "code_high": "gemini-3.8-flash-low",
-    "security": "gemini-3.8-flash-medium",
-    "ux": "gemini-3.8-flash-medium",
-    "ui": "gemini-3.6-flash-low"
+    "planner": ["gemini-4-hydrogen-low", "gemini-3.8-flash-medium"],
+    "intake": ["gpu:jev", "gemini-4-hydrogen-low", "gemini-3.8-flash-medium"],
+    "spec_writer": ["gemini-4-hydrogen-medium", "gemini-4-argon-medium", "gemini-3.8-flash-high"],
+    "builder": ["gemini-4-hydrogen-medium", "gemini-4-argon-medium", "gemini-3.8-flash-high"],
+    "builder_low": ["opencode/deepseek-v4.1-flash-free", "gemini-4-hydrogen-medium"],
+    "approver": ["gpu:jev", "gemini-4-argon-medium", "gemini-4-argon-high"],
+    "qa": ["gemini-4-hydrogen-medium", "gemini-4-argon-medium"],
+    "code_low": ["opencode/deepseek-v4.1-flash-free", "gemini-4-hydrogen-low"],
+    "code_medium": ["gemini-4-hydrogen-low", "gemini-3.8-flash-medium"],
+    "code_high": ["gemini-4-hydrogen-medium", "gemini-4-argon-medium"],
+    "security": ["gemini-4-argon-high", "gemini-4-carbon-medium"],
+    "ux": ["gemini-4-hydrogen-medium", "gemini-3.8-flash-medium"],
+    "ui": ["gemini-4-hydrogen-low", "gemini-3.6-flash-low"]
+  },
+  "provider_timeouts": {
+    "agy": null,
+    "opencode": 1800,
+    "opencode-go": 1800,
+    "openrouter": 1200,
+    "gpu": 60
+  },
+  "gpu": {
+    "mcp_url": "http://rocket-ubuntu:8000/mcp",
+    "min_confidence": 0.9
   }
 }

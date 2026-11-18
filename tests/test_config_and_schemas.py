@@ -33,10 +33,10 @@ class ConfigAndSchemaTests(unittest.TestCase):
         self.assertEqual(cfg["auto_merge"], "all")
         rev = resolve_reviewers(cfg, "high", ["ui", "security"])
         self.assertEqual(set(rev.keys()), {"code", "security", "ux", "ui"})
-        self.assertEqual(rev["code"], "gemini-3.8-flash-low")
-        self.assertEqual(rev["security"], "gemini-3.8-flash-medium")
+        self.assertEqual(rev["code"], ["gemini-4-hydrogen-medium", "gemini-4-argon-medium"])
+        self.assertEqual(rev["security"], ["gemini-4-argon-high", "gemini-4-carbon-medium"])
         rev_low = resolve_reviewers(cfg, "low", [])
-        self.assertEqual(rev_low, {"code": "gemini-3.6-flash-low"})
+        self.assertEqual(rev_low, {"code": ["opencode/deepseek-v4.1-flash-free", "gemini-4-hydrogen-low"]})
 
     def test_nit_only_review_normalizes_to_pass(self):
         raw = {
