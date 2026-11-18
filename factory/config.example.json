@@ -1,0 +1,195 @@
+{
+  "_comment": "Complete example configuration for the autonomous software factory. Copy desired overrides into ~/.config/factory/config.json (user-level), factory/config.json (repo-committed), or factory/config.local.json (repo-local, gitignored). Keys starting with '_' are ignored at load time.",
+  "base_branch": "main",
+  "concurrency": 4,
+  "max_rounds": 3,
+  "max_slice_retries": 2,
+  "agent_timeout_sec": 900,
+  "gate_timeout_sec": 600,
+  "idle_bg_grace_sec": 600,
+  "auto_polish": true,
+  "auto_approve_clean": true,
+  "allow_self_host": false,
+  "merge_method": "merge",
+  "auto_merge": "low",
+  "max_job_cost_usd": 0.0,
+  "labels": {
+    "_comment": "GitHub issue labels used for queueing and human handoff.",
+    "queue": "factory",
+    "needs_info": "factory:needs-info",
+    "needs_human": "factory:needs-human",
+    "ship": "factory:ship"
+  },
+  "protected_paths": [
+    "factory/",
+    ".agents/",
+    ".github/"
+  ],
+  "models": {
+    "_comment": "Each role accepts a single model string or an ordered fallback chain. 'gpu:*' is allowed for intake, approver, and planner when gpu.mcp_url is configured.",
+    "planner": [
+      "gpu:decision-model",
+      "opencode/minimax-m2.5-free",
+      "gemini-3.8-flash-low"
+    ],
+    "intake": [
+      "gpu:decision-model",
+      "opencode/minimax-m2.5-free",
+      "gemini-3.8-flash-low"
+    ],
+    "spec_writer": [
+      "opencode/minimax-m2.5-free",
+      "gemini-3.8-flash-medium"
+    ],
+    "builder": [
+      "opencode/minimax-m2.5-free",
+      "openrouter/qwen/qwen3-coder:free",
+      "gemini-3.8-flash-medium"
+    ],
+    "batch_builder": [
+      "opencode/minimax-m2.5-free",
+      "gemini-3.8-flash-medium"
+    ],
+    "builder_low": [
+      "opencode/minimax-m2.5-free",
+      "gemini-3.6-flash-low"
+    ],
+    "approver": [
+      "gpu:decision-model",
+      "gemini-3.8-flash-medium"
+    ],
+    "qa": [
+      "opencode/minimax-m2.5-free",
+      "gemini-3.8-flash-medium"
+    ],
+    "code_low": [
+      "opencode/minimax-m2.5-free",
+      "gemini-3.6-flash-low"
+    ],
+    "code_medium": [
+      "opencode/minimax-m2.5-free",
+      "gemini-3.8-flash-low"
+    ],
+    "code_high": [
+      "gemini-3.8-flash-low"
+    ],
+    "security": [
+      "gemini-3.8-flash-medium"
+    ],
+    "ux": [
+      "gemini-3.8-flash-medium"
+    ],
+    "ui": [
+      "gemini-3.6-flash-low"
+    ]
+  },
+  "provider_timeouts": {
+    "_comment": "Optional per-provider turn timeout overrides in seconds (null uses agent_timeout_sec).",
+    "agy": null,
+    "opencode": 1800,
+    "opencode-go": 1800,
+    "openrouter": 1200,
+    "gpu": 60
+  },
+  "gpu": {
+    "_comment": "Optional local-LLM decision MCP server. Set mcp_url to null to disable; gpu:* chain entries will abstain immediately.",
+    "mcp_url": "http://localhost:PORT/mcp",
+    "min_confidence": 0.9,
+    "tools": {
+      "decide": "decide",
+      "classify": "classify",
+      "status": null
+    }
+  },
+  "quota": {
+    "_comment": "Cooldown buckets when a provider reports rate-limit or quota exhaustion. cooldown_sec=null uses provider retry-after if present, else default_cooldown_sec.",
+    "default_cooldown_sec": 3600,
+    "buckets": [
+      {
+        "match": "gpu:*",
+        "bucket": "gpu",
+        "cooldown_sec": 60
+      },
+      {
+        "match": "opencode-go/*",
+        "bucket": "opencode-go",
+        "cooldown_sec": 1800
+      },
+      {
+        "match": "openrouter/*:free",
+        "bucket": "openrouter-free",
+        "cooldown_sec": 1200
+      },
+      {
+        "match": "opencode/*-free",
+        "bucket": "opencode-free",
+        "cooldown_sec": 600
+      },
+      {
+        "match": "opencode/big-pickle",
+        "bucket": "opencode-free",
+        "cooldown_sec": null
+      }
+    ]
+  },
+  "model_pricing": {
+    "_comment": "Replace 0.0 placeholders with your provider's published USD per-1M token prices. Unpriced models default to $0 and are marked priced=false in usage logs.",
+    "gemini-3.8-flash-medium": {
+      "input_per_m": 0.0,
+      "cached_per_m": 0.0,
+      "output_per_m": 0.0,
+      "tier": "standard"
+    },
+    "opencode/minimax-m2.5-free": {
+      "input_per_m": 0.0,
+      "cached_per_m": 0.0,
+      "output_per_m": 0.0,
+      "tier": "free"
+    },
+    "gpu:decision-model": {
+      "input_per_m": 0.0,
+      "cached_per_m": 0.0,
+      "output_per_m": 0.0,
+      "tier": "local"
+    }
+  },
+  "path_prepend": [
+    "~/.opencode/bin"
+  ],
+  "providers": {
+    "_comment": "Optional explicit binary paths; null searches PATH (including path_prepend).",
+    "agy": {
+      "bin": null
+    },
+    "opencode": {
+      "bin": null
+    }
+  },
+  "batch": {
+    "enabled": true,
+    "max_batch_issues": 5,
+    "max_batch_weight": 6,
+    "max_parallel_batches": 2,
+    "refresh_repo_map": true
+  },
+  "staging_qa": {
+    "_comment": "Optional post-merge staging deploy + Playwright QA train.",
+    "enabled": false,
+    "max_batch_size": 4,
+    "coalesce_window_sec": 15,
+    "max_qa_rounds": 3,
+    "deploy_timeout_sec": 900,
+    "qa_timeout_sec": 1200,
+    "base_url": "https://staging.example.com",
+    "ops_base_url": "",
+    "forbidden_prod_hosts": [
+      "app.example.com"
+    ],
+    "env_files": [
+      ".env.local"
+    ],
+    "test_mode_secret_keys": [
+      "STRIPE_SECRET_KEY"
+    ]
+  }
+}

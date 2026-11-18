@@ -230,6 +230,27 @@ class ConfigAndSchemaTests(unittest.TestCase):
             self.assertIs(priced_usage["priced"], True)
             self.assertEqual(priced_usage["tier"], "custom-tier")
 
+    def test_config_example_loads_and_validates(self):
+        example_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "factory",
+            "config.example.json",
+        )
+        with open(example_path, encoding="utf-8") as fh:
+            raw_text = fh.read()
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+                f.write(raw_text)
+            cfg = load_config(d)
+        self.assertNotIn("_comment", cfg)
+        self.assertNotIn("_comment", cfg["model_pricing"])
+        self.assertEqual(cfg["gpu"]["mcp_url"], "http://localhost:PORT/mcp")
+        self.assertIn("gpu:decision-model", cfg["models"]["intake"])
+        self.assertIn("gpu:decision-model", cfg["models"]["approver"])
+        self.assertEqual(cfg["path_prepend"], ["~/.opencode/bin"])
+        self.assertIn("agy", cfg["providers"])
+        self.assertIn("opencode", cfg["providers"])
+
     def test_batch_config_defaults_and_validation(self):
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
