@@ -179,7 +179,14 @@ def gpu_available(mcp_url: str, *, cache_ttl_sec: float = 60.0, force: bool = Fa
             "local_gpu_status", {}
         )
         if isinstance(status, dict) and not status.get("error"):
-            available = "minicpm5" in json.dumps(status).lower()
+            catalog = status.get("model_catalog")
+            if isinstance(catalog, dict):
+                available = any(
+                    str(k).lower().startswith("minicpm5")
+                    and isinstance(v, dict)
+                    and v.get("installed") is True
+                    for k, v in catalog.items()
+                )
     except Exception:
         available = False
 
@@ -211,65 +218,55 @@ def classify(
 
 
 def _extract_decision_map(resp: dict) -> dict[str, dict]:
-    """Normalize decision payload from `local_system1_jev_decide` into {name: entry}."""
-    raw = resp.get("decisions") if isinstance(resp.get("decisions"), dict) else resp
-    if isinstance(resp.get("results"), list):
-        out: dict[str, dict] = {}
-        for item in resp["results"]:
-            if isinstance(item, dict) and isinstance(item.get("name"), str):
-                out[item["name"]] = item
-        return out
-    out = {}
-    if isinstance(raw, dict):
-        for k, v in raw.items():
-            if isinstance(v, dict):
-                out[k] = v
-            elif isinstance(v, (int, float)) and not isinstance(v, bool):
-                out[k] = {"p": float(v)}
-    return out
+    """Normalize decision payload from `local_system1_jev_decide` into {id: entry}."""
+    if not isinstance(resp, dict) or resp.get("error"):
+        err = resp.get("error") if isinstance(resp, dict) else resp
+        raise GpuAbstain(f"GPU decide returned error: {err}")
+    raw = resp.get("decisions")
+    if not isinstance(raw, dict):
+        raise GpuAbstain("GPU decide response missing 'decisions' dict")
+    return {k: v for k, v in raw.items() if isinstance(v, dict)}
 
 
-def _get_bool_prob(decisions_map: dict[str, dict], name: str, default: float = 0.0) -> float:
-    entry = decisions_map.get(name)
+def _get_bool_prob(decisions_map: dict[str, dict], decision_id: str, default: float = 0.0) -> float:
+    entry = decisions_map.get(decision_id)
     if not isinstance(entry, dict):
         return default
-    for key in ("p", "prob", "probability", "p_true", "score"):
-        val = entry.get(key)
-        if isinstance(val, (int, float)) and not isinstance(val, bool):
-            return float(val)
-    probs = entry.get("probs")
-    if isinstance(probs, dict):
-        for tkey in ("true", "True", "yes", "1"):
-            val = probs.get(tkey)
-            if isinstance(val, (int, float)) and not isinstance(val, bool):
-                return float(val)
+    val = entry.get("true_probability")
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return float(val)
+    dist = entry.get("distribution")
+    if isinstance(dist, dict):
+        for tkey in ("True", "true"):
+            dval = dist.get(tkey)
+            if isinstance(dval, (int, float)) and not isinstance(dval, bool):
+                return float(dval)
     return default
 
 
 def _get_choice_argmax(
     decisions_map: dict[str, dict],
-    name: str,
-    choices: tuple[str, ...] = ("low", "medium", "high"),
+    decision_id: str,
+    options: tuple[str, ...] = ("low", "medium", "high"),
 ) -> str:
-    entry = decisions_map.get(name)
+    entry = decisions_map.get(decision_id)
     if not isinstance(entry, dict):
         return "medium"
-    probs = entry.get("probs")
-    if isinstance(probs, dict):
-        best_choice = None
+    dist = entry.get("distribution")
+    if isinstance(dist, dict):
+        best_opt = None
         best_val = -1.0
-        for ch in choices:
-            val = probs.get(ch)
+        for opt in options:
+            val = dist.get(opt)
             if isinstance(val, (int, float)) and not isinstance(val, bool):
                 if float(val) > best_val:
                     best_val = float(val)
-                    best_choice = ch
-        if best_choice is not None:
-            return best_choice
-    for key in ("choice", "value", "label"):
-        val = entry.get(key)
-        if isinstance(val, str) and val.lower() in choices:
-            return val.lower()
+                    best_opt = opt
+        if best_opt is not None:
+            return best_opt
+    val = entry.get("decision")
+    if isinstance(val, str) and val.lower() in options:
+        return val.lower()
     return "medium"
 
 
@@ -285,10 +282,10 @@ def _run_intake_gpu(
             mcp_url,
             task_prompt,
             decisions=[
-                {"name": "accept", "type": "bool", "question": "Is this issue clear, actionable, and in-scope to ACCEPT?"},
-                {"name": "risk", "type": "choice", "choices": ["low", "medium", "high"], "question": "What is the implementation risk?"},
-                {"name": "touches_ui", "type": "bool", "question": "Does this issue touch UI/frontend?"},
-                {"name": "touches_security", "type": "bool", "question": "Does this issue touch auth, security, or secrets?"},
+                {"id": "accept", "type": "bool", "question": "Is this issue clear, actionable, and in-scope to ACCEPT?"},
+                {"id": "risk", "type": "choice", "options": ["low", "medium", "high"], "question": "What is the implementation risk?"},
+                {"id": "touches_ui", "type": "bool", "question": "Does this issue touch UI/frontend?"},
+                {"id": "touches_security", "type": "bool", "question": "Does this issue touch auth, security, or secrets?"},
             ],
             timeout_sec=timeout_sec,
         )
@@ -351,8 +348,8 @@ def _run_approve_gpu(
             mcp_url,
             task_prompt,
             decisions=[
-                {"name": "safe_to_merge", "type": "bool", "question": "Is this PR safe to merge?"},
-                {"name": "merge_danger", "type": "bool", "question": "Is there any merge danger or unresolved risk?"},
+                {"id": "safe_to_merge", "type": "bool", "question": "Is this PR safe to merge?"},
+                {"id": "merge_danger", "type": "bool", "question": "Is there any merge danger or unresolved risk?"},
             ],
             timeout_sec=timeout_sec,
         )

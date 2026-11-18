@@ -25,11 +25,28 @@ class _FakeMcpState:
     def __init__(self, *, sse_mode: bool = False) -> None:
         self.sse_mode = sse_mode
         self.session_id = "mcp-test-session-42"
-        self.status_payload: dict = {"status": "ok", "models": ["minicpm5"]}
+        self.status_payload: dict = {
+            "ollama_host": "http://127.0.0.1:11434",
+            "currently_warm_in_vram": ["minicpm5-128k:latest"],
+            "multimodal_sidecars": {},
+            "model_catalog": {
+                "minicpm5-128k:latest": {"installed": True, "tier": 1},
+                "bge-m3:latest": {"installed": False, "tier": 2},
+            },
+        }
         self.decide_payload: dict = {}
-        self.classify_payload: dict = {"kept": [], "dropped": []}
+        self.classify_payload: dict = {
+            "model_used": "minicpm5-128k:latest",
+            "wall_s": 0.45,
+            "new_high_volume_items": {},
+            "classifications": {},
+            "added_by_category": {},
+            "excluded_already_in_filters": [],
+            "excluded_below_min_count": [],
+        }
         self.seen_methods: list[str] = []
         self.seen_session_headers: list[str | None] = []
+        self.seen_tool_calls: list[tuple[str, dict]] = []
 
 
 def _start_fake_mcp_server(state: _FakeMcpState):
@@ -64,6 +81,8 @@ def _start_fake_mcp_server(state: _FakeMcpState):
             elif method == "tools/call":
                 params = req.get("params") or {}
                 tool_name = params.get("name")
+                tool_args = params.get("arguments") or {}
+                state.seen_tool_calls.append((str(tool_name), tool_args))
                 if tool_name == "local_gpu_status":
                     payload = state.status_payload
                 elif tool_name == "local_system1_jev_decide":
@@ -71,7 +90,7 @@ def _start_fake_mcp_server(state: _FakeMcpState):
                 elif tool_name == "local_batch_classify_and_filter":
                     payload = state.classify_payload
                 else:
-                    payload = {"error": f"unknown tool {tool_name}"}
+                    payload = {"error": f"unknown tool {tool_name}", "tool": str(tool_name)}
                 rpc_resp = {
                     "jsonrpc": "2.0",
                     "id": req.get("id"),
@@ -148,17 +167,33 @@ def test_gpu_available_false_when_unreachable_or_missing_minicpm5():
 
     # Missing minicpm5 -> False
     state = _FakeMcpState(sse_mode=False)
-    state.status_payload = {"status": "ok", "models": ["qwen-0.5b"]}
+    state.status_payload = {
+        "ollama_host": "http://127.0.0.1:11434",
+        "model_catalog": {"qwen-0.5b:latest": {"installed": True}},
+    }
     server, url = _start_fake_mcp_server(state)
     try:
         assert gpu_available(url, force=True) is False
 
-        # Present minicpm5 -> True
-        state.status_payload = {"status": "ok", "models": ["minicpm5:latest"]}
+        # Catalog lists minicpm5 with installed=false -> False (regression: no substring search)
+        state.status_payload = {
+            "ollama_host": "http://127.0.0.1:11434",
+            "model_catalog": {"minicpm5-128k:latest": {"installed": False, "tier": 1}},
+        }
+        assert gpu_available(url, force=True) is False
+
+        # Present minicpm5 with installed=true -> True
+        state.status_payload = {
+            "ollama_host": "http://127.0.0.1:11434",
+            "model_catalog": {
+                "minicpm5-128k:latest": {"installed": True, "tier": 1},
+                "bge-m3:latest": {"installed": False},
+            },
+        }
         assert gpu_available(url, force=True) is True
 
         # Cached True even if status changes until force=True
-        state.status_payload = {"status": "ok", "models": []}
+        state.status_payload = {"model_catalog": {}}
         assert gpu_available(url, cache_ttl_sec=60.0, force=False) is True
         assert gpu_available(url, force=True) is False
     finally:
@@ -188,14 +223,39 @@ def test_gpu_intake_accept_and_abstain_thresholds(tmp_path: Path, monkeypatch):
     server, url = _start_fake_mcp_server(state)
     monkeypatch.setenv("FACTORY_GPU_MCP_URL", url)
     try:
-        # High confidence ACCEPT via run_agent
+        # High confidence ACCEPT via run_agent (real contract shape)
         state.decide_payload = {
+            "model_used": "minicpm5-128k:latest",
+            "decisions_count": 4,
             "decisions": {
-                "accept": {"p": 0.94},
-                "risk": {"probs": {"low": 0.75, "medium": 0.20, "high": 0.05}},
-                "touches_ui": {"p": 0.80},
-                "touches_security": {"p": 0.10},
-            }
+                "accept": {
+                    "type": "bool",
+                    "decision": True,
+                    "confidence": 0.94,
+                    "distribution": {"True": 0.94, "False": 0.06},
+                    "true_probability": 0.94,
+                },
+                "risk": {
+                    "type": "choice",
+                    "decision": "low",
+                    "confidence": 0.75,
+                    "distribution": {"low": 0.75, "medium": 0.20, "high": 0.05},
+                },
+                "touches_ui": {
+                    "type": "bool",
+                    "decision": True,
+                    "confidence": 0.80,
+                    "distribution": {"True": 0.80, "False": 0.20},
+                    "true_probability": 0.80,
+                },
+                "touches_security": {
+                    "type": "bool",
+                    "decision": False,
+                    "confidence": 0.90,
+                    "distribution": {"True": 0.10, "False": 0.90},
+                    "true_probability": 0.10,
+                },
+            },
         }
         out, usage, _ = run_agent(
             os.path.abspath("factory"),
@@ -219,13 +279,39 @@ def test_gpu_intake_accept_and_abstain_thresholds(tmp_path: Path, monkeypatch):
         assert usage["model"] == "gpu:jev"
         assert usage["cost_usd"] == 0.0
 
+        # Verify request sent "id" and "options" (not "name" / "choices")
+        decide_calls = [args for name, args in state.seen_tool_calls if name == "local_system1_jev_decide"]
+        assert len(decide_calls) == 1
+        sent_decisions = decide_calls[0]["decisions"]
+        assert all("id" in d and "name" not in d for d in sent_decisions)
+        risk_dec = next(d for d in sent_decisions if d["id"] == "risk")
+        assert risk_dec["options"] == ["low", "medium", "high"]
+        assert "choices" not in risk_dec
+
+        # Fallback to distribution["True"] when true_probability omitted
+        state.decide_payload = {
+            "decisions": {
+                "accept": {"type": "bool", "distribution": {"True": 0.92, "False": 0.08}},
+                "risk": {"type": "choice", "distribution": {"low": 0.8, "medium": 0.15, "high": 0.05}},
+                "touches_ui": {"type": "bool", "distribution": {"True": 0.1, "False": 0.9}},
+                "touches_security": {"type": "bool", "distribution": {"True": 0.1, "False": 0.9}},
+            }
+        }
+        env = run_gpu_stage("intake", "gpu:jev", "Clear issue", mcp_url=url, min_confidence=0.90)
+        assert env["structured_output"]["decision"] == "ACCEPT"
+
+        # Error payload -> GpuAbstain
+        state.decide_payload = {"error": "model timeout", "tool": "local_system1_jev_decide"}
+        with pytest.raises(GpuAbstain):
+            run_gpu_stage("intake", "gpu:jev", "Clear issue", mcp_url=url, min_confidence=0.90)
+
         # Below threshold -> GpuAbstain
         state.decide_payload = {
             "decisions": {
-                "accept": {"p": 0.89},
-                "risk": {"probs": {"low": 0.9, "medium": 0.1, "high": 0.0}},
-                "touches_ui": {"p": 0.0},
-                "touches_security": {"p": 0.0},
+                "accept": {"type": "bool", "true_probability": 0.89, "distribution": {"True": 0.89, "False": 0.11}},
+                "risk": {"type": "choice", "distribution": {"low": 0.9, "medium": 0.1, "high": 0.0}},
+                "touches_ui": {"type": "bool", "true_probability": 0.0},
+                "touches_security": {"type": "bool", "true_probability": 0.0},
             }
         }
         with pytest.raises(GpuAbstain):
@@ -238,10 +324,11 @@ def test_gpu_intake_accept_and_abstain_thresholds(tmp_path: Path, monkeypatch):
 def test_gpu_approve_only_low_risk_clean_reviews_high_confidence():
     state = _FakeMcpState(sse_mode=False)
     state.decide_payload = {
+        "model_used": "minicpm5-128k:latest",
         "decisions": {
-            "safe_to_merge": {"p": 0.95},
-            "merge_danger": {"p": 0.02},
-        }
+            "safe_to_merge": {"type": "bool", "true_probability": 0.95, "distribution": {"True": 0.95, "False": 0.05}},
+            "merge_danger": {"type": "bool", "true_probability": 0.02, "distribution": {"True": 0.02, "False": 0.98}},
+        },
     }
     server, url = _start_fake_mcp_server(state)
     clean_prompt = (
@@ -262,8 +349,8 @@ def test_gpu_approve_abstains_on_high_risk_danger_or_low_confidence():
     state = _FakeMcpState(sse_mode=False)
     state.decide_payload = {
         "decisions": {
-            "safe_to_merge": {"p": 0.95},
-            "merge_danger": {"p": 0.02},
+            "safe_to_merge": {"type": "bool", "true_probability": 0.95},
+            "merge_danger": {"type": "bool", "true_probability": 0.02},
         }
     }
     server, url = _start_fake_mcp_server(state)
@@ -286,12 +373,27 @@ def test_gpu_approve_abstains_on_high_risk_danger_or_low_confidence():
             )
         # High merge_danger -> abstain
         clean_prompt = "RISK: low\n## Gate Status\nVERDICT: PASS\n## Reviews\nVERDICT: PASS\n"
-        state.decide_payload = {"decisions": {"safe_to_merge": {"p": 0.95}, "merge_danger": {"p": 0.15}}}
+        state.decide_payload = {
+            "decisions": {
+                "safe_to_merge": {"type": "bool", "true_probability": 0.95},
+                "merge_danger": {"type": "bool", "true_probability": 0.15},
+            }
+        }
         with pytest.raises(GpuAbstain):
             run_gpu_stage("approve", "gpu:jev", clean_prompt, mcp_url=url)
 
         # Low safe_to_merge -> abstain
-        state.decide_payload = {"decisions": {"safe_to_merge": {"p": 0.85}, "merge_danger": {"p": 0.01}}}
+        state.decide_payload = {
+            "decisions": {
+                "safe_to_merge": {"type": "bool", "true_probability": 0.85},
+                "merge_danger": {"type": "bool", "true_probability": 0.01},
+            }
+        }
+        with pytest.raises(GpuAbstain):
+            run_gpu_stage("approve", "gpu:jev", clean_prompt, mcp_url=url)
+
+        # Error payload -> abstain
+        state.decide_payload = {"error": "gpu oom", "tool": "local_system1_jev_decide"}
         with pytest.raises(GpuAbstain):
             run_gpu_stage("approve", "gpu:jev", clean_prompt, mcp_url=url)
     finally:
