@@ -77,7 +77,10 @@ _FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
 def resolve_opencode_bin() -> str:
-    """Return `opencode` on PATH, else ~/.opencode/bin/opencode or ~/.local/bin/opencode."""
+    """Return FACTORY_OPENCODE_BIN if set, else `opencode` on PATH, ~/.opencode/bin/opencode, or ~/.local/bin/opencode."""
+    env_bin = (os.environ.get("FACTORY_OPENCODE_BIN") or "").strip()
+    if env_bin:
+        return env_bin
     found = shutil.which("opencode")
     if found:
         return found

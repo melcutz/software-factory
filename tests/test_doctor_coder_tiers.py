@@ -87,6 +87,7 @@ def _start_fake_gpu_server(catalog: dict):
 
 def test_doctor_checks_opencode_binary_when_configured(tmp_path: Path, monkeypatch):
     clear_gpu_availability_cache()
+    monkeypatch.delenv("FACTORY_OPENCODE_BIN", raising=False)
     git_dir = Path(subprocess.check_output(["which", "git"], text=True).strip()).parent
     fake_home = tmp_path / "home"
     fake_home.mkdir()

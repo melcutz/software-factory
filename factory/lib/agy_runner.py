@@ -79,9 +79,9 @@ def _detect_quota_error(model_spec: str, stdout_text: str, stderr_text: str) -> 
     return QuotaExhaustedError(model_spec, retry_after_sec=retry_after, message=combined.strip()[:400])
 
 
-def resolve_agy_bin() -> str:
+def resolve_agy_bin(path: str | None = None) -> str:
     """Return `agy` when on PATH, else check common user-local bin dirs for non-login shells."""
-    if shutil.which("agy"):
+    if shutil.which("agy", path=path):
         return "agy"
     for candidate in (
         os.path.expanduser("~/.local/bin/agy"),
@@ -562,7 +562,7 @@ def _run_agy_provider(
     """Invoke `agy -p` once, write attempt log, and return provider envelope."""
     schema_str = json.dumps(schema, separators=(",", ":"))
     cmd = [
-        resolve_agy_bin(),
+        resolve_agy_bin(proc_env.get("PATH")),
         "-p",
         full_prompt,
         "--model",

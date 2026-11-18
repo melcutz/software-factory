@@ -79,6 +79,7 @@ print(json.dumps({{"status": "SUCCESS", "duration_seconds": 1.2, "usage": {{"inp
 """,
     )
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("FACTORY_OPENCODE_BIN", str(bin_dir / "opencode"))
 
     cases = [
         ("opencode/deepseek-v4.1-flash-free", "opencode", "free"),
@@ -112,6 +113,7 @@ print(json.dumps({{"status": "SUCCESS", "duration_seconds": 1.2, "usage": {{"inp
 
 
 def test_resolve_opencode_bin_path_and_home_fallbacks(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("FACTORY_OPENCODE_BIN", raising=False)
     fake_home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.setenv("PATH", str(tmp_path / "empty_bin"))
@@ -232,6 +234,7 @@ print(json.dumps({{"type": "step_finish", "sessionID": "ses_reask_1", "part": {{
 """,
     )
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("FACTORY_OPENCODE_BIN", str(bin_dir / "opencode"))
 
     out, usage, _ = run_agent(
         os.path.abspath("factory"),
@@ -271,6 +274,7 @@ print(json.dumps({{"type": "step_finish", "sessionID": "ses_bad", "part": {{"typ
 """,
     )
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("FACTORY_OPENCODE_BIN", str(bin_dir / "opencode"))
 
     with pytest.raises(AgentExecutionError):
         run_agent(
@@ -328,3 +332,58 @@ def test_route_free_models_all_task_kinds():
         assert models[0].startswith("openrouter/") and models[0].endswith(":free")
         assert any(m.startswith("opencode/") for m in models)
         assert all(m.endswith(":free") or m.endswith("-free") or m == "opencode/big-pickle" for m in models)
+
+
+def test_pipeline_default_config_chains_never_executes_real_opencode(tmp_path: Path, monkeypatch):
+    from factory.lib.config import load_config
+    from factory.lib.pipeline import _call_run_agent
+
+    cfg = load_config(os.path.abspath("factory"))
+    builder_low = cfg["models"]["builder_low"]
+    assert isinstance(builder_low, list)
+    assert builder_low[0].startswith("opencode/")
+
+    # conftest.py must have overridden FACTORY_OPENCODE_BIN to a hermetic fake under tmp
+    oc_bin = resolve_opencode_bin()
+    assert oc_bin != os.path.expanduser("~/.opencode/bin/opencode")
+    assert "_hermetic_bins" in oc_bin
+
+    wt = _init_git_wt(tmp_path)
+    bin_dir = tmp_path / "bin"
+    _write_exe(
+        bin_dir / "agy",
+        """#!/usr/bin/env python3
+import json
+print(json.dumps({
+    "status": "SUCCESS",
+    "duration_seconds": 0.5,
+    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    "structured_output": {
+        "verdict": "DONE",
+        "summary": ["ok"],
+        "changes": [],
+        "tests_added": [],
+        "blocked_reason": "",
+        "notes": ""
+    }
+}))
+""",
+    )
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+
+    out, usage, _ = _call_run_agent(
+        os.path.abspath("factory"),
+        str(tmp_path / "job-hermetic"),
+        str(wt),
+        "build",
+        "builder",
+        builder_low,
+        "Implement feature",
+        SCHEMAS["build"],
+        30,
+        config=cfg,
+        sandbox=False,
+    )
+    assert out["verdict"] == "DONE"
+    assert usage["provider"] == "agy"
+    assert usage["model"] == builder_low[1]
