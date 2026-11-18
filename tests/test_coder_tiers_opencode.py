@@ -325,6 +325,83 @@ def test_opencode_broken_model_raises_agent_execution_error():
         assert isinstance(err, AgentExecutionError)
 
 
+def test_detect_opencode_error_ignores_model_text_and_tool_output():
+    noisy = "quota exceeded, usage limit reached, rate limit 429, deprecated, model not found"
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "step_start",
+                    "sessionID": "ses_ok",
+                    "part": {"type": "step-start"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "tool_use",
+                    "sessionID": "ses_ok",
+                    "part": {
+                        "type": "tool",
+                        "tool": "read",
+                        "state": {"status": "completed", "output": noisy},
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "reasoning",
+                    "sessionID": "ses_ok",
+                    "part": {"type": "reasoning", "text": noisy},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "text",
+                    "sessionID": "ses_ok",
+                    "part": {"type": "text", "text": noisy},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "step_finish",
+                    "sessionID": "ses_ok",
+                    "part": {
+                        "type": "step-finish",
+                        "reason": "stop",
+                        "cost": 0,
+                        "tokens": {"input": 100, "output": 20, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+                    },
+                }
+            ),
+        ]
+    )
+    for model_spec in (
+        "opencode-go/minimax-m3",
+        "opencode/x-free",
+        "openrouter/x:free",
+    ):
+        assert detect_opencode_error(model_spec, stdout, "") is None
+
+
+def test_detect_opencode_error_catches_error_json_event_and_stderr():
+    err_stdout = json.dumps(
+        {
+            "type": "error",
+            "sessionID": "ses_err",
+            "error": {"name": "APIError", "data": {"message": "usage limit reached"}},
+        }
+    )
+    err_go = detect_opencode_error("opencode-go/minimax-m3", err_stdout, "")
+    assert isinstance(err_go, QuotaExhaustedError)
+    assert err_go.bucket == "opencode-go"
+    assert err_go.retry_after_sec == 86400
+
+    err_free = detect_opencode_error("opencode/x-free", "", "Free usage limit")
+    assert isinstance(err_free, QuotaExhaustedError)
+    assert err_free.bucket == "opencode-free"
+    assert err_free.retry_after_sec == 10800
+
+
 def test_route_free_models_all_task_kinds():
     for kind in ("lint", "ui", "longctx", "tests", "plan", "default", "unknown-kind"):
         models = route_free_models(kind)

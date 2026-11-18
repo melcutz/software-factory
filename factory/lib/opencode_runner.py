@@ -214,9 +214,63 @@ def extract_json_from_text(text: str) -> dict:
     raise ValueError(f"Could not extract JSON object from opencode text: {raw[:300]!r}")
 
 
+_IGNORED_JSON_EVENT_TYPES = frozenset(
+    {
+        "text",
+        "tool_use",
+        "tool",
+        "tool-use",
+        "step_start",
+        "step-start",
+        "step_finish",
+        "step-finish",
+        "reasoning",
+    }
+)
+
+
+def _extract_error_surfaces(stdout_text: str, stderr_text: str) -> str:
+    """Collect only stderr, non-JSON stdout lines, and provider error JSON events."""
+    surfaces: list[str] = []
+    if stderr_text and stderr_text.strip():
+        surfaces.append(stderr_text.strip())
+
+    for raw_line in (stdout_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            surfaces.append(line)
+            continue
+        if not isinstance(ev, dict):
+            surfaces.append(line)
+            continue
+
+        ev_type = ev.get("type")
+        part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+        part_type = part.get("type")
+
+        if ev_type == "error" or part_type == "error":
+            surfaces.append(line)
+            continue
+        if ev_type in _IGNORED_JSON_EVENT_TYPES or part_type in _IGNORED_JSON_EVENT_TYPES:
+            continue
+
+        state = part.get("state")
+        has_error_state = state == "error" or (
+            isinstance(state, dict) and state.get("status") == "error"
+        )
+        if ev.get("error") or part.get("error") or has_error_state:
+            surfaces.append(line)
+
+    return "\n".join(surfaces).strip()
+
+
 def detect_opencode_error(model_spec: str, stdout_text: str, stderr_text: str) -> Exception | None:
     """Map opencode quota/limit/broken-model output to QuotaExhaustedError or AgentExecutionError."""
-    combined = f"{stderr_text}\n{stdout_text}".strip()
+    combined = _extract_error_surfaces(stdout_text, stderr_text)
     if not combined:
         return None
     snippet = combined[:400]
