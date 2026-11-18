@@ -4,7 +4,7 @@ If you use AI coding agents every day, you eventually hit the same bottleneck: *
 
 We wanted something different: **minimum human effort to reliably ship high-quality code for real, multi-file features.** You file a GitHub issue, slap a `factory` label on it, and walk away. Clean changes should spec, build, test, review, merge, deploy to staging, verify themselves in a real browser, and either stay live or automatically roll back if anything regresses. Ambiguous issues should pause and ask a concrete question instead of guessing.
 
-That goal became [`software-factory-agy`](https://github.com/melcutz/software-factory-agy), an MIT-licensed autonomous software factory powered by Google Antigravity (`agy`), battle-tested on Keepfor (`keepfor.me` open core and `keepfor-cloud`, our multi-tenant Cloudflare Python Workers + D1 SaaS with 3,260+ automated tests).
+That goal became [`software-factory-agy`](https://github.com/melcutz/software-factory-agy), an MIT-licensed autonomous software factory powered by Google Antigravity (`agy`), battle-tested on our product (`example-site` open core and `example-app`, a multi-tenant Cloudflare Python Workers + D1 SaaS with 3,260+ automated tests).
 
 What surprised us most was **where the time and failures actually lived.** We expected to spend most of our effort tuning prompts and waiting on LLMs. Instead:
 
@@ -60,11 +60,11 @@ Under the hood, four design choices hold the system together:
 
 ---
 
-## By the Numbers: 36 Real Jobs on `keepfor-cloud`
+## By the Numbers: 36 Real Jobs on `example-app`
 
-Pointing the factory at `keepfor-cloud` (a multi-tenant FastAPI + Cloudflare Python Workers + D1 + Queues + Stripe + Workers AI codebase with 8 CI invariant gates and 3,264 tests) gave us hard telemetry across **36 queued GitHub issues** spanning two major waves:
+Pointing the factory at `example-app` (a multi-tenant FastAPI + Cloudflare Python Workers + D1 + Queues + Stripe + Workers AI codebase with 8 CI invariant gates and 3,264 tests) gave us hard telemetry across **36 queued GitHub issues** spanning two major waves:
 
-| Metric (`keepfor-cloud` Factory Telemetry) | Value |
+| Metric (`example-app` Factory Telemetry) | Value |
 | :--- | :--- |
 | **Total issues processed** | **36 jobs** (`29` merged to `main`, `1` rejected at intake, `6` in-flight / queued in Wave 2) |
 | **Wave 1 completion rate (`job-516..job-541`)** | **22 / 22 accepted issues merged (`100%`)**, `1` invalid issue rejected at intake in `25.4s` (`$0.00`) |
@@ -78,7 +78,7 @@ Pointing the factory at `keepfor-cloud` (a multi-tenant FastAPI + Cloudflare Pyt
 | **Full 8-step CI gate (`3,264` tests) duration** | **`~6m 30s` -> `1m 12.5s`** (**5.4x faster** via `pytest-xdist` + adaptive worker budget) |
 | **Post-approve (`merging` + `staging_qa`) median wall-clock** | **`24.4 min` -> `3.0 - 4.9 min`** (**5x - 8x faster** via selective flags + coalesced train) |
 
-A snapshot of representative jobs from the `keepfor-cloud` logs tells the story of how the system evolved:
+A snapshot of representative jobs from the `example-app` logs tells the story of how the system evolved:
 
 | Job | Feature / Fix | Slices | Rounds / QA | LLM Time | Wall Time | Cache Tokens | Cost | Outcome & Lesson |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
@@ -118,7 +118,7 @@ Once we saw the data, we stopped tweaking prompts and attacked deterministic inf
 ---
 
 ### 2. Right-Sizing Models + Prompt Caching Cut PR Cost by 35x (`$14.25` -> `$0.27`)
-Our first three `keepfor-cloud` jobs (`job-516..518`) ran a frontier reasoning model (`gemini-4-argon` high effort) across every stage. `job-518` (a 2-slice auth/security ticket) burned `82 minutes` of model time, `33.2M` cached tokens, and **`$14.25` on a single PR**.
+Our first three `example-app` jobs (`job-516..518`) ran a frontier reasoning model (`gemini-4-argon` high effort) across every stage. `job-518` (a 2-slice auth/security ticket) burned `82 minutes` of model time, `33.2M` cached tokens, and **`$14.25` on a single PR**.
 
 Per-step cost telemetry (`[job-N] stage=... dur=... tokens=... (in=... cache=... out=... think=...) cost=$...`) made the fix obvious:
 - **Match model tier to cognitive load:** Keep frontier reasoning where architectural judgment matters (`spec` on complex/high-risk tickets, `security` review, `approver` on `risk == "high"`), and route structured execution (`intake`, vertical-slice `builder`, `code`/`ux`/`ui` review, Playwright `qa`) to fast mid-tier models.
@@ -134,10 +134,10 @@ Across the next **19 consecutive merged PRs (`job-519..537`, 49 vertical slices)
 ### 3. Local Unit Tests Lie About Edge Runtimes -- Live Staging QA + Auto-Rollback Caught Real Outages
 A natural question is: *"If you already have 3,264 unit/integration tests and specialized LLM code reviewers, why bother deploying to live staging and running headless Chromium?"*
 
-Two real `keepfor-cloud` jobs answered that definitively:
+Two real `example-app` jobs answered that definitively:
 
-1. **The `1 MiB` Multipart Parser Trap (`job-525`):** `job-525` enforced a `10 MB` bookmark `.html` upload cap on `POST /import`. All 3,200+ local ASGI `TestClient` tests and code reviews passed on Round 1, and PR `#549` merged and deployed to `staging.keepfor.me`. Then the Playwright `qa` agent uploaded real `2 MB` and `10.5 MB` `.html` files through the live Cloudflare Worker -- and got back `HTTP 400 {"detail": "There was an error parsing the body"}` (Starlette's `MultiPartParser` default `1 MiB` `max_part_size` was rejecting `2 MB` files before the route handler ever ran!). The factory **automatically `git revert`ed the merge commit on `main`, rolled back both Cloudflare Workers via `wrangler versions deploy`, verified `/health`, spun up `factory/job-525-qa2` with the Playwright failure screenshot and HTTP payload, fixed `max_part_size`, and shipped PR `#554` on QA Round 2** -- zero human touches, `$0.51` total cost.
-2. **The Missing Wrangler Bundle Glob (`job-568`):** `job-568` extracted ~900 KB of inline `<script>` tags out of Jinja templates into `/static/base.js`, `/static/library.js`, and `/static/tags.js`. Every local test passed because local Python reads `src/keepfor_cloud/static/*.js` straight from disk. On live Cloudflare Workers staging, Playwright opened `/` in Chromium, saw `GET /static/base.js -> 404` (`MIME type 'application/json'`, `typeof window.showToast === "undefined"`), and diagnosed the exact root cause in `failure.md`: `apps/web/wrangler.staging.jsonc` `rules[].globs` only listed `["**/*.html", "**/*.sql", "**/*.md", "**/*.css"]` and omitted `"**/*.js"`, so Wrangler stripped all JS files when bundling the Python Worker! Automatically, the factory reverted PR `#597`, rolled back staging Workers, patched the Wrangler globs, passed all 3 reviewers, deployed PR `#598`, verified HTTP 200 `application/javascript` + `immutable` cache headers across 4 Playwright personas on `qa-2`, and merged cleanly -- **just `11.5 minutes` from QA failure to self-healed merge** (`$2.38` total).
+1. **The `1 MiB` Multipart Parser Trap (`job-525`):** `job-525` enforced a `10 MB` bookmark `.html` upload cap on `POST /import`. All 3,200+ local ASGI `TestClient` tests and code reviews passed on Round 1, and PR `#549` merged and deployed to `staging.example-app.com`. Then the Playwright `qa` agent uploaded real `2 MB` and `10.5 MB` `.html` files through the live Cloudflare Worker -- and got back `HTTP 400 {"detail": "There was an error parsing the body"}` (Starlette's `MultiPartParser` default `1 MiB` `max_part_size` was rejecting `2 MB` files before the route handler ever ran!). The factory **automatically `git revert`ed the merge commit on `main`, rolled back both Cloudflare Workers via `wrangler versions deploy`, verified `/health`, spun up `factory/job-525-qa2` with the Playwright failure screenshot and HTTP payload, fixed `max_part_size`, and shipped PR `#554` on QA Round 2** -- zero human touches, `$0.51` total cost.
+2. **The Missing Wrangler Bundle Glob (`job-568`):** `job-568` extracted ~900 KB of inline `<script>` tags out of Jinja templates into `/static/base.js`, `/static/library.js`, and `/static/tags.js`. Every local test passed because local Python reads `src/example_app/static/*.js` straight from disk. On live Cloudflare Workers staging, Playwright opened `/` in Chromium, saw `GET /static/base.js -> 404` (`MIME type 'application/json'`, `typeof window.showToast === "undefined"`), and diagnosed the exact root cause in `failure.md`: `apps/web/wrangler.staging.jsonc` `rules[].globs` only listed `["**/*.html", "**/*.sql", "**/*.md", "**/*.css"]` and omitted `"**/*.js"`, so Wrangler stripped all JS files when bundling the Python Worker! Automatically, the factory reverted PR `#597`, rolled back staging Workers, patched the Wrangler globs, passed all 3 reviewers, deployed PR `#598`, verified HTTP 200 `application/javascript` + `immutable` cache headers across 4 Playwright personas on `qa-2`, and merged cleanly -- **just `11.5 minutes` from QA failure to self-healed merge** (`$2.38` total).
 
 **Takeaway:** Local test harnesses don't test build bundlers, CDN/Access headers, Worker packaging globs, or framework parser limits. Closing the loop with live-staging browser QA + automated revert/rollback turns silent production outages into self-healing Round-2 PRs.
 
@@ -146,7 +146,7 @@ Two real `keepfor-cloud` jobs answered that definitively:
 ### 4. Parallel Agents Expose Hidden Repo Coupling (Generated Assets & Order-Dependent Tests)
 Turning concurrency up to `4-5` parallel workers didn't just surface normal `git merge` conflicts -- it exposed hidden coupling inside the repository itself:
 
-- **Guaranteed conflicts on content-hashed assets (`tailwind-<sha256>.css`):** `keepfor-cloud` commits a content-hashed `src/keepfor_cloud/static/tailwind-<sha256>.css` bundle enforced by CI. Whenever two parallel UI jobs edited completely different HTML templates, both regenerated a new CSS hash and deleted the old one -- **guaranteeing a git merge conflict on `main` 100% of the time** and burning a 60-90s Builder LLM round just to run `python3 scripts/build_tailwind.py`. Adding a deterministic asset-conflict resolver (`try_resolve_generated_asset_conflicts`) plus pre-gate `auto_polish_worktree` (`ruff check --fix-only --select=I,W`, `ruff format`, and `build_tailwind.py` *before* `checks.sh` runs) eliminated an entire category of mechanical gate failures and merge conflicts.
+- **Guaranteed conflicts on content-hashed assets (`tailwind-<sha256>.css`):** `example-app` commits a content-hashed `src/example_app/static/tailwind-<sha256>.css` bundle enforced by CI. Whenever two parallel UI jobs edited completely different HTML templates, both regenerated a new CSS hash and deleted the old one -- **guaranteeing a git merge conflict on `main` 100% of the time** and burning a 60-90s Builder LLM round just to run `python3 scripts/build_tailwind.py`. Adding a deterministic asset-conflict resolver (`try_resolve_generated_asset_conflicts`) plus pre-gate `auto_polish_worktree` (`ruff check --fix-only --select=I,W`, `ruff format`, and `build_tailwind.py` *before* `checks.sh` runs) eliminated an entire category of mechanical gate failures and merge conflicts.
 - **Parallelizing `pytest` (`xdist`) exposed latent races in existing tests:** Enabling `pytest -n auto` immediately tripped two pre-existing test bugs that had hidden for months under serial execution: one ops test invoked `deploy_staging.sh --dry-run` against `REPO_ROOT` (running `shutil.rmtree("apps/web/build")` while another xdist worker imported from `apps/web/build`!), and an isolation fixture relied on an earlier test in the same file having initialized global cloud providers. Isolating bundle build paths, wiring explicit fixture setup, and using `--dist loadfile` made 8-way parallel test execution 100% deterministic.
 
 **Takeaway:** High-throughput agent parallelism acts like a fuzz tester for your build and test infrastructure. Eliminate generated-file conflicts deterministically instead of paying LLMs to resolve hashes.
@@ -188,7 +188,7 @@ During early live runs, we noticed two huge sources of wasted work and broken st
 ### 8. Parallel Workers Without a DAG Turn Into `needs-human` Spam
 Running 4-5 issues concurrently off the same `main` commit fails fast unless the scheduler understands dependencies:
 - Issue A and Issue B edit the same subsystem, so whichever finishes second hits avoidable merge conflicts.
-- Issue B logically depends on a schema or API from Issue A (`#573..#576` depending on `#564, #568, #572` in `keepfor-cloud` Wave 2) that hasn't merged yet.
+- Issue B logically depends on a schema or API from Issue A (`#573..#576` depending on `#564, #568, #572` in `example-app` Wave 2) that hasn't merged yet.
 
 ```mermaid
 flowchart LR
@@ -231,12 +231,12 @@ The nastiest bugs in headless agent orchestration are silent subprocess hangs --
 
 In Wave 1 (`job-524`), a QA agent spawned a background helper that kept pipes open after the agent went idle. To prevent zombie hangs, we shipped a process-group watchdog ([`e6463e8`](https://github.com/melcutz/software-factory-agy/commit/e6463e8)) that watched `stderr` for `root agent idle; waiting up to ... for N background task(s)` and killed the session after **`45 seconds`**.
 
-When we launched Wave 2 across `keepfor-cloud` and `keepfor.me`, **9 jobs suddenly escalated to `needs-human`** (`32` watchdog kills in the logs!). Inspecting the `agy` transcripts revealed why:
+When we launched Wave 2 across `example-app` and `example-site`, **9 jobs suddenly escalated to `needs-human`** (`32` watchdog kills in the logs!). Inspecting the `agy` transcripts revealed why:
 - `agy`'s `run_command` tool has a `10s` synchronous cap (`WaitMsBeforeAsync <= 10000ms`). **Any** foreground command taking longer than `10s` (`pytest` under parallel load, first-run `uv sync`, or a `60-110s` multi-persona Playwright `run_qa.py` script against live staging) is **automatically backgrounded by `agy`** while the root agent idles waiting for the completion wakeup!
-- At `55 seconds` (`10s` sync + `45s` grace), our watchdog shot `agy` mid-flight: `job-564`'s Playwright script had literally just passed `pro` regression and all three import-quota assertions when the `45s` timer killed it, and `job-132`'s `pytest` run in `keepfor.me` was at `83%` green dots!
+- At `55 seconds` (`10s` sync + `45s` grace), our watchdog shot `agy` mid-flight: `job-564`'s Playwright script had literally just passed `pro` regression and all three import-quota assertions when the `45s` timer killed it, and `job-132`'s `pytest` run in `example-site` was at `83%` green dots!
 - Worse, because the kill happened inside `staging_qa`, the pipeline treated all 5 killed QA runs (`job-564, 565, 569, 570, 571`) as staging failures -- **executing 15 consecutive PR reverts on `main` and 15 Cloudflare Worker rollbacks** across 3 QA rounds before escalating!
 
-Fixing the watchdog to inspect `/proc` descendants, unlatch cleanly when backgrounded children exit, reap `setsid` grandchildren, and raise the grace window to `600s` ([`8dba8d7`](https://github.com/melcutz/software-factory-agy/commit/8dba8d7), `keepfor-cloud` `4bb5cce`) resolved the false kills immediately -- `job-564`, `job-565`, and `job-571` resumed and merged cleanly (`#594`, `#595`, `#596`). And the incident proved an unexpected silver lining: **even when a buggy watchdog triggered 15 unattended staging rollbacks in a row, `main` and `staging.keepfor.me/health` never once broke**, and every job's built code survived intact on its `factory/job-*-qa3` branch.
+Fixing the watchdog to inspect `/proc` descendants, unlatch cleanly when backgrounded children exit, reap `setsid` grandchildren, and raise the grace window to `600s` ([`8dba8d7`](https://github.com/melcutz/software-factory-agy/commit/8dba8d7), `example-app` `4bb5cce`) resolved the false kills immediately -- `job-564`, `job-565`, and `job-571` resumed and merged cleanly (`#594`, `#595`, `#596`). And the incident proved an unexpected silver lining: **even when a buggy watchdog triggered 15 unattended staging rollbacks in a row, `main` and `staging.example-app.com/health` never once broke**, and every job's built code survived intact on its `factory/job-*-qa3` branch.
 
 **Takeaway:** Understand your agent CLI's async tool-execution model before writing idle watchdogs -- and make your rollback path rock-solid, because sooner or later your own orchestrator will test it in anger.
 
@@ -255,4 +255,4 @@ If you're building an autonomous coding pipeline, here is the checklist we wish 
 7. **Schedule with a dependency DAG** (`planner.py` + `TopologicalSorter`) before turning concurrency above `1`.
 8. **Verify OS-level PID liveness (`os.kill(pid, 0)`)** in `factory status` and supervise `setsid` process groups with child-aware watchdogs and per-step `$`/token telemetry.
 
-You can explore the generic orchestrator, test harness, and commit history in [`melcutz/software-factory-agy`](https://github.com/melcutz/software-factory-agy).
+You can explore the generic orchestrator, test harness, and commit history in [`software-factory-agy`](https://github.com/melcutz/software-factory-agy).
