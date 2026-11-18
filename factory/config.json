@@ -1,38 +1,37 @@
 {
+  "base_branch": "main",
   "concurrency": 10,
   "max_rounds": 3,
   "max_slice_retries": 2,
   "agent_timeout_sec": 900,
   "gate_timeout_sec": 600,
-  "allow_self_host": true,
-  "base_branch": "main",
-  "merge_method": "merge",
   "auto_merge": "all",
+  "auto_approve_clean": true,
+  "auto_polish": true,
+  "allow_self_host": true,
+  "max_job_cost_usd": 0.0,
+  "merge_method": "merge",
   "labels": {
     "queue": "factory",
     "needs_info": "factory:needs-info",
-    "needs_human": "factory:needs-human"
+    "needs_human": "factory:needs-human",
+    "ship": "factory:ship"
   },
-  "protected_paths": [
-    "factory/checks.sh",
-    "factory/config.json",
-    ".agents/",
-    ".github/"
-  ],
   "models": {
-    "planner": ["gemini-4-hydrogen-low", "gemini-3.8-flash-medium"],
-    "intake": ["gpu:jev", "gemini-4-hydrogen-low", "gemini-3.8-flash-medium"],
-    "spec_writer": ["gemini-4-hydrogen-medium", "gemini-4-argon-medium", "gemini-3.8-flash-high"],
-    "builder": ["gemini-4-hydrogen-medium", "gemini-4-argon-medium", "gemini-3.8-flash-high"],
-    "builder_low": ["opencode/deepseek-v4.1-flash-free", "gemini-4-hydrogen-medium"],
-    "approver": ["gpu:jev", "gemini-4-argon-medium", "gemini-4-argon-high"],
-    "qa": ["gemini-4-hydrogen-medium", "gemini-4-argon-medium"],
-    "code_low": ["opencode/deepseek-v4.1-flash-free", "gemini-4-hydrogen-low"],
-    "code_medium": ["gemini-4-hydrogen-low", "gemini-3.8-flash-medium"],
-    "code_high": ["gemini-4-hydrogen-medium", "gemini-4-argon-medium"],
-    "security": ["gemini-4-argon-high", "gemini-4-carbon-medium"],
-    "ux": ["gemini-4-hydrogen-medium", "gemini-3.8-flash-medium"],
-    "ui": ["gemini-4-hydrogen-low", "gemini-3.6-flash-low"]
+    "planner": "gemini-3.8-flash-low",
+    "batch_builder": "gemini-3.8-flash-medium",
+    "intake": "gemini-3.8-flash-low",
+    "spec_writer": "gemini-3.8-flash-medium",
+    "builder": "gemini-3.8-flash-medium",
+    "builder_low": null,
+    "approver": "gemini-3.8-flash-medium",
+    "qa": "gemini-3.8-flash-medium",
+    "code_low": "gemini-3.6-flash-low",
+    "code_medium": "gemini-3.8-flash-low",
+    "code_high": "gemini-3.8-flash-low",
+    "security": "gemini-3.8-flash-medium",
+    "ux": "gemini-3.8-flash-medium",
+    "ui": "gemini-3.6-flash-low"
   },
   "provider_timeouts": {
     "agy": null,
@@ -42,7 +41,35 @@
     "gpu": 60
   },
   "gpu": {
-    "mcp_url": "http://rocket-ubuntu:8000/mcp",
+    "mcp_url": null,
     "min_confidence": 0.9
+  },
+  "batch": {
+    "enabled": true,
+    "max_batch_issues": 5,
+    "max_batch_weight": 6,
+    "refresh_repo_map": true
+  },
+  "protected_paths": [
+    "factory/checks.sh",
+    "factory/config.json",
+    ".agents/",
+    ".github/"
+  ],
+  "staging_qa": {
+    "enabled": false,
+    "base_url": "",
+    "deploy_command": "",
+    "healthcheck_url": "",
+    "max_batch_size": 4,
+    "coalesce_window_sec": 15,
+    "max_qa_rounds": 3,
+    "deploy_timeout_sec": 600,
+    "qa_timeout_sec": 900,
+    "env_files": [
+      ".env.local",
+      ".dev.vars"
+    ],
+    "extra_env": {}
   }
 }

@@ -40,13 +40,15 @@ DEFAULT_PROVIDER_TIMEOUTS: dict[str, int | None] = {
     "gpu": 60,
 }
 
-DEFAULT_MODEL_PRICING: dict[str, dict[str, float]] = {
-    "gemini-3.6-flash": {"input_per_m": 0.15, "cached_per_m": 0.0375, "output_per_m": 0.60},
-    "gemini-3.8-flash": {"input_per_m": 0.30, "cached_per_m": 0.075, "output_per_m": 2.50},
-    "gemini-4-hydrogen": {"input_per_m": 1.50, "cached_per_m": 0.375, "output_per_m": 7.50},
-    "gemini-4-argon": {"input_per_m": 2.00, "cached_per_m": 0.50, "output_per_m": 10.00},
-    "gemini-4-carbon": {"input_per_m": 2.00, "cached_per_m": 0.50, "output_per_m": 10.00},
-}
+DEFAULT_MODEL_PRICING: dict[str, dict[str, float]] = {}
+
+DEFAULT_QUOTA_BUCKETS: list[dict] = [
+    {"match": "gpu:*", "bucket": "gpu", "cooldown_sec": None},
+    {"match": "opencode-go/*", "bucket": "opencode-go", "cooldown_sec": None},
+    {"match": "openrouter/*:free", "bucket": "openrouter-free", "cooldown_sec": None},
+    {"match": "opencode/*-free", "bucket": "opencode-free", "cooldown_sec": None},
+    {"match": "opencode/big-pickle", "bucket": "opencode-free", "cooldown_sec": None},
+]
 
 DEFAULT_CONFIG: dict = {
     "concurrency": 4,
@@ -89,10 +91,24 @@ DEFAULT_CONFIG: dict = {
     },
     "provider_timeouts": copy.deepcopy(DEFAULT_PROVIDER_TIMEOUTS),
     "gpu": {
-        "mcp_url": "http://rocket-ubuntu:8000/mcp",
+        "mcp_url": None,
         "min_confidence": 0.9,
+        "tools": {
+            "decide": "decide",
+            "classify": "classify",
+            "status": None,
+        },
     },
     "model_pricing": copy.deepcopy(DEFAULT_MODEL_PRICING),
+    "quota": {
+        "default_cooldown_sec": 3600,
+        "buckets": copy.deepcopy(DEFAULT_QUOTA_BUCKETS),
+    },
+    "path_prepend": [],
+    "providers": {
+        "agy": {"bin": None},
+        "opencode": {"bin": None},
+    },
     "max_job_cost_usd": 0.0,
     "batch": {
         "enabled": True,
@@ -155,30 +171,84 @@ def split_model_and_effort(model_spec: str) -> tuple[str, str]:
     return spec, "default"
 
 
+def expand_path_prepend(config: dict | None) -> list[str]:
+    """Return expanded directory paths from ``config['path_prepend']``."""
+    raw = (config or {}).get("path_prepend") if isinstance(config, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            exp = os.path.expanduser(item.strip())
+            if exp not in out:
+                out.append(exp)
+    return out
+
+
+def _lookup_pricing_entry(effective_spec: str, pricing_map: dict | None) -> dict | None:
+    if not effective_spec or not isinstance(pricing_map, dict):
+        return None
+    base_model, _ = split_model_and_effort(effective_spec)
+    rates = pricing_map.get(effective_spec) or pricing_map.get(base_model)
+    if isinstance(rates, dict):
+        return rates
+    for prefix_key, entry in pricing_map.items():
+        if (
+            isinstance(prefix_key, str)
+            and prefix_key
+            and (effective_spec.startswith(prefix_key) or base_model.startswith(prefix_key))
+            and isinstance(entry, dict)
+        ):
+            return entry
+    return None
+
+
+def resolve_model_tier(model_spec: str, config: dict | None = None) -> str:
+    """Resolve model tier from ``model_pricing.<model>.tier`` if configured, else generic ('local', 'free', 'standard')."""
+    effective_spec = (model_spec or "").strip()
+    pricing_map = (config or {}).get("model_pricing") if isinstance(config, dict) else None
+    rates = _lookup_pricing_entry(effective_spec, pricing_map)
+    if isinstance(rates, dict):
+        tier_val = rates.get("tier")
+        if isinstance(tier_val, str) and tier_val.strip():
+            return tier_val.strip()
+    _, tier = classify_model_provider(effective_spec)
+    return tier
+
+
 def estimate_usage_cost_usd(
     model_spec: str,
     usage: dict | None,
     config: dict | None = None,
 ) -> float | None:
-    """Return direct or estimated USD cost for a single agent step's token usage, or None if unknown."""
+    """Return direct or estimated USD cost for a single agent step's token usage (0.0 when unpriced)."""
     if not isinstance(usage, dict):
         return None
     for direct_key in ("cost_usd", "cost"):
         val = usage.get(direct_key)
         if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+            usage["priced"] = True
             return round(float(val), 6)
 
     effective_spec = (model_spec or str(usage.get("model") or "")).strip()
+    pricing_map = ((config or {}).get("model_pricing") if isinstance(config, dict) else None) or DEFAULT_MODEL_PRICING
+    rates = _lookup_pricing_entry(effective_spec, pricing_map)
+    if isinstance(rates, dict):
+        tier_val = rates.get("tier")
+        if isinstance(tier_val, str) and tier_val.strip():
+            usage["tier"] = tier_val.strip()
+
     provider, tier = classify_model_provider(effective_spec)
-    if tier in {"free", "local", "subscription"} or provider in {"gpu", "opencode-go"}:
+    if tier in {"free", "local"} or provider == "gpu":
+        usage["priced"] = bool(isinstance(rates, dict))
+        if not isinstance(rates, dict):
+            return 0.0
+
+    if not isinstance(rates, dict):
+        usage["priced"] = False
         return 0.0
 
-    pricing_map = ((config or {}).get("model_pricing") if isinstance(config, dict) else None) or DEFAULT_MODEL_PRICING
-    base_model, _ = split_model_and_effort(effective_spec)
-    rates = pricing_map.get(effective_spec) or pricing_map.get(base_model)
-    if not isinstance(rates, dict):
-        return None
-
+    usage["priced"] = True
     in_tok = int(usage.get("input_tokens", 0) or 0)
     cache_tok = int(usage.get("cache_read_tokens", 0) or 0)
     out_tok = int(usage.get("output_tokens", 0) or 0)
@@ -333,14 +403,77 @@ def load_config_with_layers(factory_dir: str) -> tuple[dict, list[str]]:
     if not isinstance(gpu_cfg, dict):
         raise ValueError("gpu must be a JSON object")
     mcp_url = gpu_cfg.get("mcp_url")
-    if not isinstance(mcp_url, str) or not mcp_url.strip():
-        raise ValueError("gpu.mcp_url must be a non-empty http(s) URL")
-    parsed_mcp = urlparse(mcp_url.strip())
-    if parsed_mcp.scheme not in {"http", "https"} or not parsed_mcp.hostname:
-        raise ValueError(f"gpu.mcp_url must be an http(s) URL, got {mcp_url!r}")
+    if mcp_url is not None:
+        if not isinstance(mcp_url, str) or not mcp_url.strip():
+            raise ValueError("gpu.mcp_url must be null or a non-empty http(s) URL")
+        parsed_mcp = urlparse(mcp_url.strip())
+        if parsed_mcp.scheme not in {"http", "https"} or not parsed_mcp.hostname:
+            raise ValueError(f"gpu.mcp_url must be an http(s) URL, got {mcp_url!r}")
     min_conf = gpu_cfg.get("min_confidence", 0.9)
     if not isinstance(min_conf, (int, float)) or isinstance(min_conf, bool) or not (0.0 < float(min_conf) <= 1.0):
         raise ValueError(f"gpu.min_confidence must be a number in (0.0, 1.0], got {min_conf!r}")
+    tools_cfg = gpu_cfg.get("tools")
+    if tools_cfg is not None:
+        if not isinstance(tools_cfg, dict):
+            raise ValueError("gpu.tools must be a JSON object")
+        for tkey in ("decide", "classify"):
+            tval = tools_cfg.get(tkey)
+            if tval is not None and (not isinstance(tval, str) or not tval.strip()):
+                raise ValueError(f"gpu.tools.{tkey} must be a non-empty string, got {tval!r}")
+        sval = tools_cfg.get("status")
+        if sval is not None and (not isinstance(sval, str) or not sval.strip()):
+            raise ValueError(f"gpu.tools.status must be null or a non-empty string, got {sval!r}")
+
+    quota_cfg = cfg.get("quota")
+    if not isinstance(quota_cfg, dict):
+        raise ValueError("quota must be a JSON object")
+    def_cd = quota_cfg.get("default_cooldown_sec")
+    if not isinstance(def_cd, int) or isinstance(def_cd, bool) or def_cd < 1:
+        raise ValueError(f"quota.default_cooldown_sec must be a positive integer, got {def_cd!r}")
+    buckets_cfg = quota_cfg.get("buckets")
+    if not isinstance(buckets_cfg, list):
+        raise ValueError("quota.buckets must be a list of bucket rules")
+    for idx, rule in enumerate(buckets_cfg):
+        if not isinstance(rule, dict):
+            raise ValueError(f"quota.buckets[{idx}] must be an object")
+        m_pat = rule.get("match")
+        b_name = rule.get("bucket")
+        c_sec = rule.get("cooldown_sec")
+        if not isinstance(m_pat, str) or not m_pat.strip():
+            raise ValueError(f"quota.buckets[{idx}].match must be a non-empty string")
+        if not isinstance(b_name, str) or not b_name.strip():
+            raise ValueError(f"quota.buckets[{idx}].bucket must be a non-empty string")
+        if c_sec is not None and (not isinstance(c_sec, int) or isinstance(c_sec, bool) or c_sec < 1):
+            raise ValueError(f"quota.buckets[{idx}].cooldown_sec must be null or a positive integer, got {c_sec!r}")
+
+    pp_cfg = cfg.get("path_prepend")
+    if not isinstance(pp_cfg, list) or any(not isinstance(p, str) or not p.strip() for p in pp_cfg):
+        raise ValueError("path_prepend must be a list of non-empty directory strings")
+
+    prov_cfg = cfg.get("providers")
+    if not isinstance(prov_cfg, dict):
+        raise ValueError("providers must be a JSON object")
+    for pname, pval in prov_cfg.items():
+        if not isinstance(pval, dict):
+            raise ValueError(f"providers.{pname} must be a JSON object")
+        bval = pval.get("bin")
+        if bval is not None and (not isinstance(bval, str) or not bval.strip()):
+            raise ValueError(f"providers.{pname}.bin must be null or a non-empty string, got {bval!r}")
+
+    mp_cfg = cfg.get("model_pricing")
+    if not isinstance(mp_cfg, dict):
+        raise ValueError("model_pricing must be a JSON object")
+    for mkey, mval in mp_cfg.items():
+        if not isinstance(mval, dict):
+            raise ValueError(f"model_pricing.{mkey} must be a JSON object")
+        for rkey in ("input_per_m", "cached_per_m", "output_per_m"):
+            if rkey in mval:
+                rval = mval[rkey]
+                if not isinstance(rval, (int, float)) or isinstance(rval, bool) or rval < 0:
+                    raise ValueError(f"model_pricing.{mkey}.{rkey} must be a non-negative number, got {rval!r}")
+        if "tier" in mval and mval["tier"] is not None:
+            if not isinstance(mval["tier"], str) or not mval["tier"].strip():
+                raise ValueError(f"model_pricing.{mkey}.tier must be a non-empty string")
 
     for int_key in ("concurrency", "max_rounds", "max_slice_retries", "agent_timeout_sec", "gate_timeout_sec"):
         val = cfg.get(int_key)

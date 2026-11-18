@@ -52,43 +52,85 @@ def classify_model_provider(model_spec: str) -> tuple[str, str]:
     """Return ``(provider, tier)`` for a model spec.
 
     provider: "agy" | "opencode" | "opencode-go" | "openrouter" | "gpu"
-    tier: "subscription" | "free" | "paid" | "local"
+    tier: "local" | "free" | "standard"
     """
     spec = (model_spec or "").strip()
     if spec.startswith("gpu:"):
         return ("gpu", "local")
     if spec.startswith("opencode-go/"):
-        return ("opencode-go", "subscription")
+        return ("opencode-go", "standard")
     if spec.startswith("openrouter/"):
-        return ("openrouter", "free" if spec.endswith(":free") else "paid")
+        return ("openrouter", "free" if spec.endswith(":free") else "standard")
     if spec.startswith("opencode/"):
-        return ("opencode", "free" if (spec.endswith("-free") or spec == "opencode/big-pickle") else "paid")
-    return ("agy", "paid")
+        return ("opencode", "free" if (spec.endswith("-free") or spec == "opencode/big-pickle") else "standard")
+    return ("agy", "standard")
 
 
 _QUOTA_RE = re.compile(r"(?:\b429\b|RESOURCE_EXHAUSTED|rate[ _-]?limit(?:ed| exceeded)|quota[ _-]?exceeded)", re.IGNORECASE)
 _RETRY_AFTER_RE = re.compile(r"retry[- _]?after[:\s]+(\d+)\s*s?", re.IGNORECASE)
 
 
-def _detect_quota_error(model_spec: str, stdout_text: str, stderr_text: str) -> QuotaExhaustedError | None:
+def _detect_quota_error(
+    model_spec: str,
+    stdout_text: str,
+    stderr_text: str,
+    config: dict | None = None,
+) -> QuotaExhaustedError | None:
+    from factory.lib.governor import quota_bucket_for_model, quota_cooldown_for_model
+
     combined = f"{stderr_text}\n{stdout_text}"
     if not _QUOTA_RE.search(combined):
         return None
     m = _RETRY_AFTER_RE.search(combined)
     retry_after = int(m.group(1)) if m else None
-    return QuotaExhaustedError(model_spec, retry_after_sec=retry_after, message=combined.strip()[:400])
+    bucket = quota_bucket_for_model(model_spec, config=config) or None
+    if retry_after is None and isinstance(config, dict) and isinstance(config.get("quota"), dict):
+        buckets = config["quota"].get("buckets")
+        if isinstance(buckets, list):
+            _, cd = quota_cooldown_for_model(model_spec, config=config, retry_after_sec=None)
+            for rule in buckets:
+                if (
+                    isinstance(rule, dict)
+                    and rule.get("bucket") == bucket
+                    and isinstance(rule.get("cooldown_sec"), int)
+                ):
+                    retry_after = cd
+                    break
+    return QuotaExhaustedError(
+        model_spec,
+        retry_after_sec=retry_after,
+        message=combined.strip()[:400],
+        bucket=bucket,
+    )
 
 
-def resolve_agy_bin(path: str | None = None) -> str:
-    """Return `agy` when on PATH, else check common user-local bin dirs for non-login shells."""
-    if shutil.which("agy", path=path):
+def resolve_agy_bin(path: str | None = None, config: dict | None = None) -> str:
+    """Resolve `agy` binary via FACTORY_AGY_BIN, providers.agy.bin, path_prepend + PATH, or 'agy'."""
+    from factory.lib.config import expand_path_prepend
+
+    env_bin = (os.environ.get("FACTORY_AGY_BIN") or "").strip()
+    if env_bin:
+        return env_bin
+    if isinstance(config, dict):
+        providers = config.get("providers")
+        if isinstance(providers, dict) and isinstance(providers.get("agy"), dict):
+            cfg_bin = providers["agy"].get("bin")
+            if isinstance(cfg_bin, str) and cfg_bin.strip():
+                return os.path.expanduser(cfg_bin.strip())
+    try:
+        in_path = shutil.which("agy", path=path)
+    except TypeError:
+        in_path = shutil.which("agy")
+    if in_path:
         return "agy"
-    for candidate in (
-        os.path.expanduser("~/.local/bin/agy"),
-        os.path.expanduser("~/bin/agy"),
-    ):
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
+    prepend = expand_path_prepend(config)
+    if prepend:
+        try:
+            found = shutil.which("agy", path=os.pathsep.join(prepend))
+        except TypeError:
+            found = shutil.which("agy")
+        if found:
+            return found
     return "agy"
 
 
@@ -500,46 +542,63 @@ def _resolve_idle_bg_grace_sec(factory_dir: str, explicit: float | None) -> floa
     return _DEFAULT_IDLE_BG_GRACE_SEC
 
 
-def _build_subprocess_env(extra_env: dict[str, str] | None) -> dict[str, str] | None:
-    """Build subprocess environment, ensuring ~/.opencode/bin and ~/.local/bin are on PATH when present."""
-    user_bins = [
-        os.path.expanduser("~/.opencode/bin"),
-        os.path.expanduser("~/.local/bin"),
-    ]
-    existing_bins = [b for b in user_bins if os.path.isdir(b)]
-    if extra_env is None and not existing_bins:
+def _load_runtime_config(factory_dir: str, config: dict | None = None) -> dict | None:
+    if isinstance(config, dict):
+        return config
+    from factory.lib.config import load_config
+
+    try:
+        return load_config(factory_dir)
+    except Exception:
+        cfg_path = os.path.join(factory_dir, "config.json")
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    return raw
+            except (OSError, ValueError):
+                pass
+    return None
+
+
+def _build_subprocess_env(
+    extra_env: dict[str, str] | None,
+    config: dict | None = None,
+) -> dict[str, str] | None:
+    """Build subprocess environment, prepending configured path_prepend directories when present."""
+    from factory.lib.config import expand_path_prepend
+
+    prepend_bins = [b for b in expand_path_prepend(config) if os.path.isdir(b)]
+    if extra_env is None and not prepend_bins:
         return None
     env = {**os.environ, **(extra_env or {})}
-    if existing_bins:
+    if prepend_bins:
         path_parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
-        for b in existing_bins:
-            if b not in path_parts:
-                path_parts.append(b)
-        env["PATH"] = os.pathsep.join(path_parts)
+        new_parts = list(prepend_bins)
+        for p in path_parts:
+            if p not in new_parts:
+                new_parts.append(p)
+        env["PATH"] = os.pathsep.join(new_parts)
     return env
 
 
-def _load_gpu_settings(factory_dir: str) -> tuple[str, float]:
-    """Read gpu.mcp_url (env > config > default) and gpu.min_confidence (default 0.90)."""
-    from factory.lib.gpu_runner import resolve_gpu_mcp_url
+def _load_gpu_settings(
+    factory_dir: str,
+    config: dict | None = None,
+) -> tuple[str | None, float, dict[str, str | None]]:
+    """Read gpu.mcp_url (env > config > None), gpu.min_confidence (default 0.90), and gpu.tools."""
+    from factory.lib.gpu_runner import resolve_gpu_mcp_url, resolve_gpu_tools
 
-    cfg_path = os.path.join(factory_dir, "config.json")
-    cfg: dict | None = None
-    if os.path.isfile(cfg_path):
-        try:
-            with open(cfg_path, encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, dict):
-                cfg = raw
-        except (OSError, ValueError):
-            pass
+    cfg = _load_runtime_config(factory_dir, config)
     mcp_url = resolve_gpu_mcp_url(factory_dir=factory_dir, config=cfg)
     min_conf = 0.90
     if cfg and isinstance(cfg.get("gpu"), dict):
         mc = cfg["gpu"].get("min_confidence")
         if isinstance(mc, (int, float)) and not isinstance(mc, bool) and 0.0 < float(mc) <= 1.0:
             min_conf = float(mc)
-    return mcp_url, min_conf
+    tools = resolve_gpu_tools(cfg)
+    return mcp_url, min_conf, tools
 
 
 def _run_agy_provider(
@@ -558,11 +617,16 @@ def _run_agy_provider(
     logs_dir: str,
     effective_log: str,
     attempt: int,
+    config: dict | None = None,
 ) -> dict:
     """Invoke `agy -p` once, write attempt log, and return provider envelope."""
     schema_str = json.dumps(schema, separators=(",", ":"))
+    try:
+        agy_bin = resolve_agy_bin((proc_env or {}).get("PATH"), config=config)
+    except TypeError:
+        agy_bin = resolve_agy_bin((proc_env or {}).get("PATH"))
     cmd = [
-        resolve_agy_bin(proc_env.get("PATH")),
+        agy_bin,
         "-p",
         full_prompt,
         "--model",
@@ -611,7 +675,7 @@ def _run_agy_provider(
     if killed_reason:
         raise AgentExecutionError(f"{killed_reason}: {(stderr_text or stdout_text)[:400]}")
     if returncode != 0:
-        quota_err = _detect_quota_error(model, stdout_text, stderr_text)
+        quota_err = _detect_quota_error(model, stdout_text, stderr_text, config=config)
         if quota_err is not None:
             raise quota_err
         raise AgentExecutionError(
@@ -654,10 +718,15 @@ def run_agent(
     idle_bg_grace_sec: float | None = None,
     abort_check: Callable[[], BaseException | None] | None = None,
     gpu_context: dict | None = None,
+    config: dict | None = None,
 ) -> tuple[dict, dict, float]:
     """Run one headless agent turn across agy/opencode/gpu with schema validation and guards."""
+    from factory.lib.config import resolve_model_tier
+
+    runtime_cfg = _load_runtime_config(factory_dir, config)
     effective_idle_grace = _resolve_idle_bg_grace_sec(factory_dir, idle_bg_grace_sec)
-    provider, tier = classify_model_provider(model)
+    provider, _ = classify_model_provider(model)
+    tier = resolve_model_tier(model, runtime_cfg)
     is_opencode = provider in {"opencode", "opencode-go", "openrouter"}
     is_gpu = provider == "gpu"
 
@@ -669,7 +738,7 @@ def run_agent(
 
     guard_head = sandbox or protect_head
     initial_sha = head_sha(worktree) if guard_head else ""
-    proc_env = _build_subprocess_env(extra_env)
+    proc_env = _build_subprocess_env(extra_env, config=runtime_cfg)
     last_err: Exception | None = None
     aborted_exc: BaseException | None = None
 
@@ -704,11 +773,12 @@ def run_agent(
                         extra_env=proc_env,
                         idle_grace_sec=effective_idle_grace,
                         abort_check=_wrapped_abort_check if abort_check is not None else None,
+                        config=runtime_cfg,
                     )
                 elif is_gpu:
                     from factory.lib.gpu_runner import run_gpu_stage
 
-                    mcp_url, min_conf = _load_gpu_settings(factory_dir)
+                    mcp_url, min_conf, gpu_tools = _load_gpu_settings(factory_dir, config=runtime_cfg)
                     envelope = run_gpu_stage(
                         stage=stage,
                         model=model,
@@ -717,6 +787,7 @@ def run_agent(
                         min_confidence=min_conf,
                         timeout_sec=float(timeout_sec),
                         gpu_context=gpu_context,
+                        tools=gpu_tools,
                     )
                 else:
                     envelope = _run_agy_provider(
@@ -734,6 +805,7 @@ def run_agent(
                         logs_dir=logs_dir,
                         effective_log=effective_log,
                         attempt=attempt,
+                        config=runtime_cfg,
                     )
             finally:
                 if guard_head:
@@ -819,7 +891,7 @@ def run_agent_chain(
     Never moves on after:
       - JobHaltedError, LeaseLostError, abort_check exceptions, or "illegally moved HEAD"
     """
-    from factory.lib.config import provider_timeout_sec
+    from factory.lib.config import provider_timeout_sec, resolve_model_tier
     from factory.lib.governor import is_model_in_cooldown, quota_bucket_for_model
 
     if isinstance(models, str):
@@ -831,6 +903,7 @@ def run_agent_chain(
     if not chain:
         raise ValueError(f"Empty model chain for stage {stage!r} ({agent_name!r})")
 
+    runtime_cfg = _load_runtime_config(factory_dir, config)
     runner = runner_fn or run_agent
     quota_state: dict = {"models": {}}
     if state_store is not None and hasattr(state_store, "get_quota_state"):
@@ -847,17 +920,17 @@ def run_agent_chain(
 
     for idx, model_spec in enumerate(chain):
         if len(chain) > 1 and isinstance(quota_state, dict) and quota_state.get("models"):
-            in_cd, rem = is_model_in_cooldown(quota_state, model_spec)
+            in_cd, rem = is_model_in_cooldown(quota_state, model_spec, config=runtime_cfg)
             if in_cd:
                 cooldown_remainings.append(rem)
                 if log_fn is not None:
-                    bucket = quota_bucket_for_model(model_spec)
+                    bucket = quota_bucket_for_model(model_spec, config=runtime_cfg)
                     log_fn(
                         f"chain stage={stage} skipping {model_spec} (bucket={bucket} in cooldown for {int(rem)}s)"
                     )
                 continue
 
-        eff_timeout = provider_timeout_sec(config, model_spec, timeout_sec)
+        eff_timeout = provider_timeout_sec(runtime_cfg, model_spec, timeout_sec)
         attempted += 1
         aborted_exc: BaseException | None = None
 
@@ -877,6 +950,8 @@ def run_agent_chain(
         call_kwargs = dict(run_kwargs)
         if abort_check is not None:
             call_kwargs["abort_check"] = _wrapped_abort
+        if runner is run_agent and runtime_cfg is not None:
+            call_kwargs["config"] = runtime_cfg
 
         try:
             out, usage, dur = runner(
@@ -892,12 +967,13 @@ def run_agent_chain(
                 **call_kwargs,
             )
             usage_dict = dict(usage) if isinstance(usage, dict) else {}
-            prov, tier = classify_model_provider(model_spec)
+            prov, _ = classify_model_provider(model_spec)
+            tier = resolve_model_tier(model_spec, runtime_cfg)
             usage_dict.setdefault("provider", prov)
             usage_dict.setdefault("tier", tier)
             usage_dict["model"] = model_spec
             if state_store is not None and hasattr(state_store, "clear_quota_cooldown"):
-                bucket = quota_bucket_for_model(model_spec)
+                bucket = quota_bucket_for_model(model_spec, config=runtime_cfg)
                 q_models = (quota_state.get("models") or {}) if isinstance(quota_state, dict) else {}
                 if bucket and (bucket in q_models or model_spec in q_models):
                     try:
@@ -923,7 +999,7 @@ def run_agent_chain(
             if isinstance(exc, QuotaExhaustedError):
                 last_err = exc
                 last_quota_err = exc
-                bucket = exc.bucket or quota_bucket_for_model(exc.model_spec or model_spec)
+                bucket = exc.bucket or quota_bucket_for_model(exc.model_spec or model_spec, config=runtime_cfg)
                 if state_store is not None and hasattr(state_store, "record_quota_cooldown") and idx + 1 < len(chain):
                     try:
                         quota_state = state_store.record_quota_cooldown(
@@ -956,7 +1032,7 @@ def run_agent_chain(
 
     if attempted == 0:
         min_rem = int(min(cooldown_remainings)) if cooldown_remainings else None
-        first_bucket = quota_bucket_for_model(chain[0])
+        first_bucket = quota_bucket_for_model(chain[0], config=runtime_cfg)
         raise QuotaExhaustedError(
             chain[0],
             retry_after_sec=min_rem,

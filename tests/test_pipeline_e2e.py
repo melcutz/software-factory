@@ -710,9 +710,16 @@ class PipelineE2ETests(unittest.TestCase):
         subprocess.run(["git", "-C", self.repo, "push", "origin", "main"], check=True, capture_output=True)
 
         self._seed_issue(30, "Two-part feature")
+        cfg_priced = {
+            **load_config(os.path.join(self.repo, "factory")),
+            "model_pricing": {
+                "gemini-3.8-flash": dict(input_per_m=1.0, cached_per_m=0.25, output_per_m=4.0),
+                "gemini-3.6-flash": dict(input_per_m=0.5, cached_per_m=0.1, output_per_m=2.0),
+            },
+        }
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            merged = process_job(self.repo, 30)
+            merged = process_job(self.repo, 30, config=cfg_priced)
 
         self.assertEqual(merged["stage"], "merged")
         with open(scopes_file, encoding="utf-8") as f:
@@ -722,7 +729,7 @@ class PipelineE2ETests(unittest.TestCase):
 
         out = buf.getvalue()
         self.assertRegex(out, r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[job-30\]")
-        self.assertIn("model=gemini-4-hydrogen effort=medium", out)
+        self.assertIn("model=gemini-3.8-flash effort=medium", out)
         self.assertIn("cache=200,000", out)
         self.assertIn("cost=$", out)
         self.assertIn("scope=slice", out)

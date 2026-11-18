@@ -14,6 +14,8 @@ from factory.lib.agy_runner import (
     QuotaExhaustedError,
     _invoke_agy_process,
 )
+from factory.lib.config import expand_path_prepend
+from factory.lib.governor import quota_cooldown_for_model
 from factory.lib.schemas import validate_stage_output
 
 _FREE_ROUTES: dict[str, list[str]] = {
@@ -73,23 +75,32 @@ _BROKEN_MODEL_RE = re.compile(
     r"(?:deprecated|ProviderModelNotFound|model not found|requires Global regions)",
     re.IGNORECASE,
 )
+_RETRY_AFTER_RE = re.compile(r"retry[- _]?after[:\s=]+(\d+)\s*s?", re.IGNORECASE)
 _FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
-def resolve_opencode_bin() -> str:
-    """Return FACTORY_OPENCODE_BIN if set, else `opencode` on PATH, ~/.opencode/bin/opencode, or ~/.local/bin/opencode."""
+def resolve_opencode_bin(config: dict | None = None, path: str | None = None) -> str:
+    """Resolve `opencode` binary via FACTORY_OPENCODE_BIN, providers.opencode.bin, path_prepend + PATH, or 'opencode'."""
     env_bin = (os.environ.get("FACTORY_OPENCODE_BIN") or "").strip()
     if env_bin:
         return env_bin
-    found = shutil.which("opencode")
+    if isinstance(config, dict):
+        providers = config.get("providers")
+        if isinstance(providers, dict) and isinstance(providers.get("opencode"), dict):
+            cfg_bin = providers["opencode"].get("bin")
+            if isinstance(cfg_bin, str) and cfg_bin.strip():
+                return os.path.expanduser(cfg_bin.strip())
+    search_path = path if path is not None else os.environ.get("PATH", "")
+    prepend = expand_path_prepend(config)
+    if prepend:
+        parts = [p for p in search_path.split(os.pathsep) if p]
+        for b in reversed(prepend):
+            if b not in parts:
+                parts.insert(0, b)
+        search_path = os.pathsep.join(parts)
+    found = shutil.which("opencode", path=search_path)
     if found:
         return found
-    for candidate in (
-        os.path.expanduser("~/.opencode/bin/opencode"),
-        os.path.expanduser("~/.local/bin/opencode"),
-    ):
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
     return "opencode"
 
 
@@ -268,44 +279,41 @@ def _extract_error_surfaces(stdout_text: str, stderr_text: str) -> str:
     return "\n".join(surfaces).strip()
 
 
-def detect_opencode_error(model_spec: str, stdout_text: str, stderr_text: str) -> Exception | None:
+def detect_opencode_error(
+    model_spec: str,
+    stdout_text: str,
+    stderr_text: str,
+    config: dict | None = None,
+) -> Exception | None:
     """Map opencode quota/limit/broken-model output to QuotaExhaustedError or AgentExecutionError."""
     combined = _extract_error_surfaces(stdout_text, stderr_text)
     if not combined:
         return None
     snippet = combined[:400]
+    m = _RETRY_AFTER_RE.search(combined)
+    parsed_retry = int(m.group(1)) if m else None
 
-    if model_spec.startswith("openrouter/") and _OPENROUTER_LIMIT_RE.search(combined):
-        return QuotaExhaustedError(
-            model_spec,
-            retry_after_sec=10800,
-            message=snippet,
-            bucket="openrouter-free",
+    is_quota_limit = (
+        (model_spec.startswith("openrouter/") and bool(_OPENROUTER_LIMIT_RE.search(combined)))
+        or bool(_ZEN_FREE_LIMIT_RE.search(combined))
+        or (
+            model_spec.startswith("opencode/")
+            and (model_spec.endswith("-free") or model_spec == "opencode/big-pickle")
+            and bool(_ZEN_RATE_LIMIT_RE.search(combined))
         )
-    if _ZEN_FREE_LIMIT_RE.search(combined):
-        return QuotaExhaustedError(
+        or (model_spec.startswith("opencode-go/") and bool(_GO_LIMIT_RE.search(combined)))
+    )
+    if is_quota_limit:
+        bucket, cooldown_sec = quota_cooldown_for_model(
             model_spec,
-            retry_after_sec=10800,
-            message=snippet,
-            bucket="opencode-free",
+            config=config,
+            retry_after_sec=parsed_retry,
         )
-    if (
-        model_spec.startswith("opencode/")
-        and (model_spec.endswith("-free") or model_spec == "opencode/big-pickle")
-        and _ZEN_RATE_LIMIT_RE.search(combined)
-    ):
         return QuotaExhaustedError(
             model_spec,
-            retry_after_sec=10800,
+            retry_after_sec=cooldown_sec,
             message=snippet,
-            bucket="opencode-free",
-        )
-    if model_spec.startswith("opencode-go/") and _GO_LIMIT_RE.search(combined):
-        return QuotaExhaustedError(
-            model_spec,
-            retry_after_sec=86400,
-            message=snippet,
-            bucket="opencode-go",
+            bucket=bucket,
         )
     if _BROKEN_MODEL_RE.search(combined):
         return AgentExecutionError(f"opencode model unavailable ({model_spec}): {snippet}")
@@ -332,6 +340,7 @@ def _run_opencode_cmd(
     extra_env: dict[str, str] | None,
     idle_grace_sec: float,
     abort_check: Callable[[], BaseException | None] | None,
+    config: dict | None = None,
 ) -> tuple[str, str | None, dict, float]:
     t0 = time.monotonic()
     returncode, stdout_text, stderr_text, killed_reason = _invoke_agy_process(
@@ -349,7 +358,7 @@ def _run_opencode_cmd(
     if killed_reason:
         raise AgentExecutionError(f"{killed_reason}: {(stderr_text or stdout_text)[:400]}")
 
-    mapped_err = detect_opencode_error(model, stdout_text, stderr_text)
+    mapped_err = detect_opencode_error(model, stdout_text, stderr_text, config=config)
     if mapped_err is not None:
         raise mapped_err
 
@@ -373,9 +382,10 @@ def run_opencode_turn(
     extra_env: dict[str, str] | None = None,
     idle_grace_sec: float = 600.0,
     abort_check: Callable[[], BaseException | None] | None = None,
+    config: dict | None = None,
 ) -> dict:
     """Run one opencode turn with JSONL parsing and at most 1 in-session validation re-ask."""
-    oc_bin = resolve_opencode_bin()
+    oc_bin = resolve_opencode_bin(config=config, path=(extra_env or {}).get("PATH"))
     prompt = build_opencode_prompt(full_prompt, schema)
     cmd = [oc_bin, "run", "-m", model, "--format", "json", "--auto", prompt]
 
@@ -387,6 +397,7 @@ def run_opencode_turn(
         extra_env=extra_env,
         idle_grace_sec=idle_grace_sec,
         abort_check=abort_check,
+        config=config,
     )
 
     err_msg = ""
@@ -430,6 +441,7 @@ def run_opencode_turn(
         extra_env=extra_env,
         idle_grace_sec=idle_grace_sec,
         abort_check=abort_check,
+        config=config,
     )
     total_usage = _merge_usage(usage, usage2)
     total_duration = round(duration + duration2, 3)

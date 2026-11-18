@@ -723,8 +723,9 @@ class GitStateStore:
         retry_after_sec: int | None = None,
         *,
         now_ts: float | None = None,
+        config: dict | None = None,
     ) -> dict:
-        bucket = _governor.quota_bucket_for_model(base_model) or base_model
+        bucket = _governor.quota_bucket_for_model(base_model, config=config) or base_model
         ts = time.time() if now_ts is None else now_ts
         ref = "refs/factory/quota"
         for _ in range(3):
@@ -752,8 +753,8 @@ class GitStateStore:
                 return state
         raise RuntimeError("Failed to CAS-update refs/factory/quota after 3 attempts")
 
-    def clear_quota_cooldown(self, base_model: str) -> None:
-        bucket = _governor.quota_bucket_for_model(base_model) or base_model
+    def clear_quota_cooldown(self, base_model: str, *, config: dict | None = None) -> None:
+        bucket = _governor.quota_bucket_for_model(base_model, config=config) or base_model
         ref = "refs/factory/quota"
         for _ in range(3):
             old_sha = self._ls_remote_one(ref)
@@ -800,7 +801,7 @@ class GitStateStore:
 
     def prune_stale_refs(self, *, max_age_days: int = 30, now_ts: float | None = None) -> int:
         ts = time.time() if now_ts is None else now_ts
-        cutoff = ts - (max_age_days * 86400)
+        cutoff = ts - (max_age_days * 24 * 3600)
         deleted = 0
         job_refs = self._ls_remote("refs/factory/jobs/*")
         for ref in sorted(job_refs):

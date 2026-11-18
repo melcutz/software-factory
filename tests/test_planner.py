@@ -297,12 +297,20 @@ class PlannerTests(unittest.TestCase):
             self.assertIn("queued", banner_str)
 
     def test_gemini_4_hydrogen_cost_estimation(self):
-        cost = estimate_usage_cost_usd(
-            "gemini-4-hydrogen-medium",
-            {"input_tokens": 100_000, "cache_read_tokens": 200_000, "output_tokens": 10_000},
-        )
+        unpriced_usage = {"input_tokens": 100_000, "cache_read_tokens": 200_000, "output_tokens": 10_000}
+        self.assertEqual(estimate_usage_cost_usd("gemini-4-hydrogen-medium", unpriced_usage), 0.0)
+        self.assertIs(unpriced_usage.get("priced"), False)
+
+        cfg = {
+            "model_pricing": {
+                "gemini-4-hydrogen": dict(input_per_m=1.5, cached_per_m=0.375, output_per_m=7.5),
+            }
+        }
+        priced_usage = {"input_tokens": 100_000, "cache_read_tokens": 200_000, "output_tokens": 10_000}
+        cost = estimate_usage_cost_usd("gemini-4-hydrogen-medium", priced_usage, cfg)
         self.assertIsNotNone(cost)
         self.assertGreater(cost, 0.0)
+        self.assertIs(priced_usage.get("priced"), True)
 
     def test_resumed_build_slice_cleans_uncommitted_debris_on_first_attempt(self):
         import json

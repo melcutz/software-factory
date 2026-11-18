@@ -288,6 +288,8 @@ def test_pipeline_clears_quota_cooldown_on_successful_agent_call(tmp_path, monke
 
 
 def test_quota_bucket_for_model_normalizes_providers():
+    from factory.lib.governor import quota_cooldown_for_model
+
     assert quota_bucket_for_model("opencode/deepseek-v4.1-flash-free") == "opencode-free"
     assert quota_bucket_for_model("opencode/mimo-v2.6-flash-free") == "opencode-free"
     assert quota_bucket_for_model("opencode/big-pickle") == "opencode-free"
@@ -295,9 +297,26 @@ def test_quota_bucket_for_model_normalizes_providers():
     assert quota_bucket_for_model("openrouter/nvidia/nemotron-3-ultra-550b-a55b:free") == "openrouter-free"
     assert quota_bucket_for_model("opencode-go/glm-5.3") == "opencode-go"
     assert quota_bucket_for_model("opencode-go/kimi-k3") == "opencode-go"
-    assert quota_bucket_for_model("gpu:jev") == "gpu"
+    assert quota_bucket_for_model("gpu:decision-model") == "gpu"
     assert quota_bucket_for_model("gemini-4-argon-high") == "gemini-4-argon"
     assert quota_bucket_for_model("gemini-4-hydrogen:medium") == "gemini-4-hydrogen"
+
+    custom_cfg = {
+        "quota": {
+            "default_cooldown_sec": 900,
+            "buckets": [
+                {"match": "custom-provider/*:free", "bucket": "custom-free", "cooldown_sec": 600},
+                {"match": "openrouter/*:free", "bucket": "openrouter-free", "cooldown_sec": None},
+                {"match": "opencode-go/*", "bucket": "opencode-go", "cooldown_sec": 1200},
+            ],
+        }
+    }
+    assert quota_bucket_for_model("custom-provider/foo:free", custom_cfg) == "custom-free"
+    assert quota_cooldown_for_model("custom-provider/foo:free", custom_cfg) == ("custom-free", 600)
+    assert quota_cooldown_for_model("openrouter/foo:free", custom_cfg, retry_after_sec=45) == ("openrouter-free", 45)
+    assert quota_cooldown_for_model("openrouter/foo:free", custom_cfg) == ("openrouter-free", 900)
+    assert quota_cooldown_for_model("opencode-go/glm-5.3", custom_cfg) == ("opencode-go", 1200)
+    assert quota_cooldown_for_model("unmatched/model-x", custom_cfg) == ("unmatched/model-x", 900)
 
 
 def test_is_model_in_cooldown_and_record_quota_cooldown_use_provider_buckets(tmp_path):
@@ -308,43 +327,43 @@ def test_is_model_in_cooldown_and_record_quota_cooldown_use_provider_buckets(tmp
     )
     store = GitStateStore(str(repo), "m0")
 
-    # Recording a single opencode Zen free model puts ALL opencode free models in cooldown for 3h
+    # Recording a single opencode Zen free model puts ALL opencode free models in cooldown
     store.record_quota_cooldown(
         "opencode/deepseek-v4.1-flash-free",
         "Free usage limit reached",
-        retry_after_sec=10800,
+        retry_after_sec=600,
         now_ts=1000.0,
     )
     q = store.get_quota_state()
     assert "opencode-free" in q["models"]
-    assert q["models"]["opencode-free"]["cooldown_until_ts"] == 1000.0 + 10800
+    assert q["models"]["opencode-free"]["cooldown_until_ts"] == 1000.0 + 600
 
     in_cd, rem = is_model_in_cooldown(q, "opencode/mimo-v2.6-flash-free", now_ts=1100.0)
     assert in_cd is True
-    assert rem == 10700.0
+    assert rem == 500.0
     in_cd_bp, _ = is_model_in_cooldown(q, "opencode/big-pickle", now_ts=1100.0)
     assert in_cd_bp is True
     in_cd_or, _ = is_model_in_cooldown(q, "openrouter/cohere/north-mini-code:free", now_ts=1100.0)
     assert in_cd_or is False
 
-    # OpenRouter free and Go subscription buckets respect retry_after_sec
+    # OpenRouter free and opencode-go buckets respect retry_after_sec
     store.record_quota_cooldown(
         "openrouter/cohere/north-mini-code:free",
         "429 free-models-per-day",
-        retry_after_sec=10800,
+        retry_after_sec=600,
         now_ts=1000.0,
     )
     store.record_quota_cooldown(
         "opencode-go/glm-5.3",
         "weekly limit reached",
-        retry_after_sec=86400,
+        retry_after_sec=1200,
         now_ts=1000.0,
     )
     q2 = store.get_quota_state()
     assert is_model_in_cooldown(q2, "openrouter/google/gemma-4-31b-it:free", now_ts=1500.0)[0] is True
     in_cd_go, rem_go = is_model_in_cooldown(q2, "opencode-go/kimi-k3", now_ts=2000.0)
     assert in_cd_go is True
-    assert rem_go == 85400.0
+    assert rem_go == 200.0
 
     # Clearing via any model in the bucket clears the shared bucket
     store.clear_quota_cooldown("opencode/hy4-flash-free")

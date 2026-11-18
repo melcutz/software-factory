@@ -101,7 +101,7 @@ class FallbackChainsTest(unittest.TestCase):
         self.assertEqual(dur, 1.5)
         self.assertEqual(usage["model"], "gemini-4-hydrogen-low")
         self.assertEqual(usage["provider"], "agy")
-        self.assertEqual(usage["tier"], "paid")
+        self.assertEqual(usage["tier"], "standard")
         # Verify openrouter/qwen/qwen3-coder:free and opencode/mimo-v2.6-flash-free were skipped without calling
         self.assertEqual(
             calls,
@@ -348,7 +348,7 @@ class FallbackChainsTest(unittest.TestCase):
             line = _record_and_format_step(jobs_dir, job_id, chain, usage, dur, cfg)
             self.assertIn("gemini-4-hydrogen", line)
             job = load_job(jobs_dir, job_id)
-            self.assertEqual(job["usage"]["by_tier"]["paid"]["calls"], 1)
+            self.assertEqual(job["usage"]["by_tier"]["standard"]["calls"], 1)
             self.assertEqual(job["usage"]["by_provider"]["agy"]["calls"], 1)
 
     def test_batch_triage_and_review_work_with_model_chains(self) -> None:
@@ -429,7 +429,7 @@ class FallbackChainsTest(unittest.TestCase):
                     "input_tokens": 0,
                     "output_tokens": 0,
                     "total_tokens": 0,
-                    "model": "gpu:jev",
+                    "model": "gpu:decision-model",
                 },
                 0.5,
                 cost_usd=0.0,
@@ -479,10 +479,9 @@ class FallbackChainsTest(unittest.TestCase):
             self.assertEqual(summary["by_tier"]["local"]["calls"], 1)
             self.assertEqual(summary["by_tier"]["free"]["calls"], 1)
             self.assertEqual(summary["by_tier"]["free"]["total_tokens"], 1200)
-            self.assertEqual(summary["by_tier"]["subscription"]["calls"], 1)
-            self.assertEqual(summary["by_tier"]["subscription"]["total_tokens"], 2500)
-            self.assertEqual(summary["by_tier"]["paid"]["calls"], 1)
-            self.assertAlmostEqual(summary["by_tier"]["paid"]["cost_usd"], 0.009)
+            self.assertEqual(summary["by_tier"]["standard"]["calls"], 2)
+            self.assertEqual(summary["by_tier"]["standard"]["total_tokens"], 6100)
+            self.assertAlmostEqual(summary["by_tier"]["standard"]["cost_usd"], 0.009)
             self.assertEqual(summary["by_provider"]["gpu"]["calls"], 1)
             self.assertEqual(summary["by_provider"]["opencode"]["calls"], 1)
             self.assertEqual(summary["by_provider"]["opencode-go"]["calls"], 1)

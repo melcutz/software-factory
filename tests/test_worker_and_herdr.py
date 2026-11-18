@@ -807,7 +807,9 @@ def test_run_worker_uses_ramp_up_delay_after_claim(tmp_path, monkeypatch):
 
 
 def test_exec_job_command_prepends_opencode_and_local_bin_to_path(tmp_path, monkeypatch):
+    import json
     import os
+
     fake_home = tmp_path / "home"
     oc_bin = fake_home / ".opencode" / "bin"
     local_bin = fake_home / ".local" / "bin"
@@ -824,8 +826,18 @@ def test_exec_job_command_prepends_opencode_and_local_bin_to_path(tmp_path, monk
     )
     from factory.lib.worker import exec_job_command
 
+    # Without path_prepend configured, PATH is untouched
     rc = exec_job_command(str(repo), 99)
     assert rc == 0
+    assert os.environ["PATH"] == "/usr/bin:/bin"
+
+    # With path_prepend configured, entries are expanded and prepended
+    (repo / "factory" / "config.json").write_text(
+        json.dumps({"path_prepend": ["~/.opencode/bin", "~/.local/bin"]}),
+        encoding="utf-8",
+    )
+    rc2 = exec_job_command(str(repo), 99)
+    assert rc2 == 0
     parts = os.environ["PATH"].split(os.pathsep)
     assert parts[0] == str(oc_bin)
     assert parts[1] == str(local_bin)
@@ -835,9 +847,9 @@ def test_fleet_shell_cmd_includes_opencode_bin():
     from factory.lib.fleet import _factory_shell_cmd
 
     cmd = _factory_shell_cmd("worker", "--all")
-    assert cmd[:2] == ["sh", "-lc"]
-    assert "$HOME/.opencode/bin" in cmd[2]
-    assert "$HOME/.local/bin" in cmd[2]
+    assert cmd == ["sh", "-lc", "exec factory worker --all"]
+    assert ".opencode/bin" not in cmd[2]
+    assert ".local/bin" not in cmd[2]
 
 
 

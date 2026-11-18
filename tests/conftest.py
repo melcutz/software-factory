@@ -36,20 +36,46 @@ def _hermetic_coder_tiers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setenv("FACTORY_USER_CONFIG", str(tmp_path / "_nonexistent_user_config.json"))
     monkeypatch.setenv("FACTORY_OPENCODE_BIN", str(fake_oc))
-    monkeypatch.setenv("FACTORY_GPU_MCP_URL", "http://127.0.0.1:9/mcp")
+    monkeypatch.delenv("FACTORY_GPU_MCP_URL", raising=False)
 
     import factory.lib.agy_runner as agy_runner
+    from factory.lib.config import expand_path_prepend
+    import factory.lib.gpu_runner as gpu_runner
 
-    def _hermetic_resolve_agy_bin(path: str | None = None) -> str:
+    def _hermetic_resolve_agy_bin(path: str | None = None, config: dict | None = None) -> str:
         env_agy = (os.environ.get("FACTORY_AGY_BIN") or "").strip()
         if env_agy:
             return env_agy
-        which_agy = shutil.which("agy", path=path)
+        if isinstance(config, dict):
+            providers = config.get("providers")
+            if isinstance(providers, dict) and isinstance(providers.get("agy"), dict):
+                cfg_bin = providers["agy"].get("bin")
+                if isinstance(cfg_bin, str) and cfg_bin.strip():
+                    expanded = os.path.expanduser(cfg_bin.strip())
+                    if _is_temp_path(expanded):
+                        return expanded
+        search_path = path if path is not None else os.environ.get("PATH", "")
+        prepend = expand_path_prepend(config)
+        if prepend:
+            search_path = os.pathsep.join([*prepend, search_path]) if search_path else os.pathsep.join(prepend)
+        try:
+            which_agy = shutil.which("agy", path=search_path)
+        except TypeError:
+            which_agy = shutil.which("agy")
         if which_agy and _is_temp_path(which_agy):
             return which_agy
         return str(fake_agy)
 
     monkeypatch.setattr(agy_runner, "resolve_agy_bin", _hermetic_resolve_agy_bin)
+
+    orig_rpc = gpu_runner.McpStreamableClient._rpc
+
+    def _guarded_rpc(self, *args, **kwargs):
+        if not self.url.startswith(("http://127.0.0.1:", "http://localhost:")):
+            raise AssertionError(f"Refusing non-local GPU MCP call in tests: {self.url!r}")
+        return orig_rpc(self, *args, **kwargs)
+
+    monkeypatch.setattr(gpu_runner.McpStreamableClient, "_rpc", _guarded_rpc)
 
     orig_invoke = agy_runner._invoke_agy_process
 

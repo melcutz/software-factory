@@ -9,9 +9,14 @@ import time
 import urllib.error
 import urllib.request
 
-DEFAULT_GPU_MCP_URL = "http://rocket-ubuntu:8000/mcp"
+DEFAULT_GPU_MCP_URL: str | None = None
+DEFAULT_GPU_TOOLS: dict[str, str | None] = {
+    "decide": "decide",
+    "classify": "classify",
+    "status": None,
+}
 _GPU_AVAIL_LOCK = threading.Lock()
-_GPU_AVAIL_CACHE: dict[str, tuple[float, bool]] = {}
+_GPU_AVAIL_CACHE: dict[tuple[str, str | None], tuple[float, bool]] = {}
 
 _RISK_LOW_RE = re.compile(r"\bRISK\s*:\s*low\b", re.IGNORECASE)
 _RISK_HIGH_MED_RE = re.compile(r"\bRISK\s*:\s*(?:medium|high)\b", re.IGNORECASE)
@@ -28,27 +33,48 @@ def clear_gpu_availability_cache() -> None:
         _GPU_AVAIL_CACHE.clear()
 
 
-def resolve_gpu_mcp_url(factory_dir: str | None = None, config: dict | None = None) -> str:
-    """Resolve GPU MCP URL: env FACTORY_GPU_MCP_URL > config['gpu']['mcp_url'] > default."""
+def resolve_gpu_mcp_url(factory_dir: str | None = None, config: dict | None = None) -> str | None:
+    """Resolve GPU MCP URL: env FACTORY_GPU_MCP_URL > config['gpu']['mcp_url'] > None."""
     env_url = (os.environ.get("FACTORY_GPU_MCP_URL") or "").strip()
     if env_url:
         return env_url
     cfg = config
     if cfg is None and factory_dir:
-        cfg_path = os.path.join(factory_dir, "config.json")
-        if os.path.isfile(cfg_path):
-            try:
-                with open(cfg_path, encoding="utf-8") as f:
-                    raw = json.load(f)
-                if isinstance(raw, dict):
-                    cfg = raw
-            except (OSError, ValueError):
-                cfg = None
+        try:
+            from factory.lib.config import load_config
+
+            cfg = load_config(factory_dir)
+        except Exception:
+            cfg_path = os.path.join(factory_dir, "config.json")
+            if os.path.isfile(cfg_path):
+                try:
+                    with open(cfg_path, encoding="utf-8") as f:
+                        raw = json.load(f)
+                    if isinstance(raw, dict):
+                        cfg = raw
+                except (OSError, ValueError):
+                    cfg = None
     if isinstance(cfg, dict) and isinstance(cfg.get("gpu"), dict):
-        cfg_url = str(cfg["gpu"].get("mcp_url") or "").strip()
-        if cfg_url:
-            return cfg_url
+        raw_url = cfg["gpu"].get("mcp_url")
+        if isinstance(raw_url, str) and raw_url.strip():
+            return raw_url.strip()
     return DEFAULT_GPU_MCP_URL
+
+
+def resolve_gpu_tools(config: dict | None = None) -> dict[str, str | None]:
+    """Return resolved MCP tool names (`decide`, `classify`, optional `status`) from config."""
+    out = dict(DEFAULT_GPU_TOOLS)
+    gpu_cfg = (config or {}).get("gpu") if isinstance(config, dict) else None
+    tools_cfg = gpu_cfg.get("tools") if isinstance(gpu_cfg, dict) else None
+    if isinstance(tools_cfg, dict):
+        for key in ("decide", "classify"):
+            val = tools_cfg.get(key)
+            if isinstance(val, str) and val.strip():
+                out[key] = val.strip()
+        if "status" in tools_cfg:
+            sval = tools_cfg.get("status")
+            out["status"] = sval.strip() if isinstance(sval, str) and sval.strip() else None
+    return out
 
 
 class McpStreamableClient:
@@ -117,6 +143,25 @@ class McpStreamableClient:
             raise ValueError(f"Expected JSON-RPC object from MCP server, got {type(parsed).__name__}")
         return parsed
 
+    def ping(self) -> bool:
+        """Verify MCP endpoint reachability via initialize handshake."""
+        resp = self._rpc(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "software-factory", "version": "1.0"},
+            },
+            req_id=1,
+            timeout=self.connect_timeout,
+        )
+        if not isinstance(resp, dict) or resp.get("error") is not None:
+            return False
+        if not isinstance(resp.get("result"), dict):
+            return False
+        self._rpc("notifications/initialized", None, req_id=None, timeout=self.connect_timeout)
+        return True
+
     def call_tool(self, name: str, arguments: dict) -> dict:
         """Initialize MCP session, send notifications/initialized, and call tool."""
         self._rpc(
@@ -164,41 +209,66 @@ class McpStreamableClient:
         return result
 
 
-def gpu_available(mcp_url: str, *, cache_ttl_sec: float = 60.0, force: bool = False) -> bool:
-    """Return True if GPU MCP endpoint is reachable and reports minicpm5 installed."""
+def gpu_available(
+    mcp_url: str | None,
+    *,
+    cache_ttl_sec: float = 60.0,
+    force: bool = False,
+    status_tool: str | None = None,
+) -> bool:
+    """Return True if GPU MCP endpoint is reachable (and optional status_tool reports ready)."""
+    clean_url = (mcp_url or "").strip()
+    if not clean_url:
+        return False
+    cache_key = (clean_url, status_tool)
     now = time.monotonic()
     if not force:
         with _GPU_AVAIL_LOCK:
-            cached = _GPU_AVAIL_CACHE.get(mcp_url)
+            cached = _GPU_AVAIL_CACHE.get(cache_key)
             if cached is not None and (now - cached[0]) < cache_ttl_sec:
                 return cached[1]
 
     available = False
     try:
-        status = McpStreamableClient(mcp_url, connect_timeout=5.0, call_timeout=10.0).call_tool(
-            "local_gpu_status", {}
-        )
-        if isinstance(status, dict) and not status.get("error"):
-            catalog = status.get("model_catalog")
-            if isinstance(catalog, dict):
-                available = any(
-                    str(k).lower().startswith("minicpm5")
-                    and isinstance(v, dict)
-                    and v.get("installed") is True
-                    for k, v in catalog.items()
-                )
+        client = McpStreamableClient(clean_url, connect_timeout=5.0, call_timeout=10.0)
+        if status_tool:
+            status = client.call_tool(status_tool, {})
+            if isinstance(status, dict) and not status.get("error"):
+                if isinstance(status.get("ok"), bool) and not status["ok"]:
+                    available = False
+                elif isinstance(status.get("ready"), bool):
+                    available = status["ready"]
+                elif isinstance(status.get("model_catalog"), dict):
+                    catalog = status["model_catalog"]
+                    available = any(
+                        isinstance(v, dict) and v.get("installed") is True
+                        for v in catalog.values()
+                    )
+                elif isinstance(status.get("ok"), bool):
+                    available = status["ok"]
+                else:
+                    available = True
+        else:
+            available = client.ping()
     except Exception:
         available = False
 
     with _GPU_AVAIL_LOCK:
-        _GPU_AVAIL_CACHE[mcp_url] = (time.monotonic(), available)
+        _GPU_AVAIL_CACHE[cache_key] = (time.monotonic(), available)
     return available
 
 
-def decide(mcp_url: str, state: str, decisions: list[dict], *, timeout_sec: float = 60.0) -> dict:
-    """Call MCP `local_system1_jev_decide`."""
+def decide(
+    mcp_url: str,
+    state: str,
+    decisions: list[dict],
+    *,
+    timeout_sec: float = 60.0,
+    tool_name: str = "decide",
+) -> dict:
+    """Call configured MCP decide tool."""
     return McpStreamableClient(mcp_url, connect_timeout=5.0, call_timeout=timeout_sec).call_tool(
-        "local_system1_jev_decide",
+        tool_name or "decide",
         {"state": state, "decisions": decisions},
     )
 
@@ -209,16 +279,17 @@ def classify(
     allowed_categories: list[str],
     *,
     timeout_sec: float = 60.0,
+    tool_name: str = "classify",
 ) -> dict:
-    """Call MCP `local_batch_classify_and_filter`."""
+    """Call configured MCP classify tool."""
     return McpStreamableClient(mcp_url, connect_timeout=5.0, call_timeout=timeout_sec).call_tool(
-        "local_batch_classify_and_filter",
+        tool_name or "classify",
         {"items": items, "allowed_categories": allowed_categories},
     )
 
 
 def _extract_decision_map(resp: dict) -> dict[str, dict]:
-    """Normalize decision payload from `local_system1_jev_decide` into {id: entry}."""
+    """Normalize decision payload from MCP decide tool into {id: entry}."""
     if not isinstance(resp, dict) or resp.get("error"):
         err = resp.get("error") if isinstance(resp, dict) else resp
         raise GpuAbstain(f"GPU decide returned error: {err}")
@@ -276,6 +347,7 @@ def _run_intake_gpu(
     mcp_url: str,
     min_confidence: float,
     timeout_sec: float,
+    decide_tool: str = "decide",
 ) -> dict:
     try:
         resp = decide(
@@ -288,6 +360,7 @@ def _run_intake_gpu(
                 {"id": "touches_security", "type": "bool", "question": "Does this issue touch auth, security, or secrets?"},
             ],
             timeout_sec=timeout_sec,
+            tool_name=decide_tool,
         )
     except Exception as exc:
         raise GpuAbstain(f"GPU intake call failed: {exc}") from exc
@@ -339,6 +412,7 @@ def _run_approve_gpu(
     min_confidence: float,
     timeout_sec: float,
     gpu_context: dict | None = None,
+    decide_tool: str = "decide",
 ) -> dict:
     _check_approve_context(gpu_context)
     try:
@@ -350,6 +424,7 @@ def _run_approve_gpu(
                 {"id": "merge_danger", "type": "bool", "question": "Is there any merge danger or unresolved risk?"},
             ],
             timeout_sec=timeout_sec,
+            tool_name=decide_tool,
         )
     except Exception as exc:
         raise GpuAbstain(f"GPU approve call failed: {exc}") from exc
@@ -387,34 +462,44 @@ def run_gpu_stage(
     model: str,
     task_prompt: str,
     *,
-    mcp_url: str,
+    mcp_url: str | None = None,
     min_confidence: float = 0.90,
     timeout_sec: float = 60.0,
     gpu_context: dict | None = None,
+    tools: dict[str, str | None] | None = None,
 ) -> dict:
     """Execute a supported stage on the local GPU MCP tier, or raise GpuAbstain."""
     del model  # currently all gpu:* specs route to the configured MCP server
+    clean_url = (mcp_url or "").strip()
+    if not clean_url:
+        raise GpuAbstain("GPU decision MCP disabled (gpu.mcp_url not set)")
     if stage not in {"intake", "approve", "plan"}:
         raise GpuAbstain(f"GPU tier unsupported for stage {stage!r}")
 
+    resolved_tools = resolve_gpu_tools({"gpu": {"tools": tools}} if isinstance(tools, dict) else None)
+    decide_tool = str(resolved_tools.get("decide") or "decide")
+    status_tool = resolved_tools.get("status")
+
     t0 = time.monotonic()
-    if not gpu_available(mcp_url):
-        raise GpuAbstain("GPU MCP unavailable or minicpm5 not installed")
+    if not gpu_available(clean_url, status_tool=status_tool):
+        raise GpuAbstain("GPU decision MCP unavailable")
 
     if stage == "intake":
         structured = _run_intake_gpu(
             task_prompt,
-            mcp_url=mcp_url,
+            mcp_url=clean_url,
             min_confidence=min_confidence,
             timeout_sec=timeout_sec,
+            decide_tool=decide_tool,
         )
     elif stage == "approve":
         structured = _run_approve_gpu(
             task_prompt,
-            mcp_url=mcp_url,
+            mcp_url=clean_url,
             min_confidence=min_confidence,
             timeout_sec=timeout_sec,
             gpu_context=gpu_context,
+            decide_tool=decide_tool,
         )
     else:
         structured = _run_plan_gpu(task_prompt)

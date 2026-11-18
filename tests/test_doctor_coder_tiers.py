@@ -62,6 +62,12 @@ def _start_fake_gpu_server(catalog: dict):
                     "id": req.get("id"),
                     "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}},
                 }
+            elif method == "tools/list":
+                rpc_resp = {
+                    "jsonrpc": "2.0",
+                    "id": req.get("id"),
+                    "result": {"tools": [{"name": "decide"}, {"name": "classify"}]},
+                }
             else:
                 rpc_resp = {
                     "jsonrpc": "2.0",
@@ -102,10 +108,10 @@ def test_doctor_checks_opencode_binary_when_configured(tmp_path: Path, monkeypat
         models={"builder_low": ["opencode/deepseek-v4.1-flash-free", "gemini-4-hydrogen-medium"]},
     )
 
-    # Missing opencode -> fail
+    # Missing opencode -> fail with neutral guidance
     ok, msgs = run_doctor(str(repo))
     assert ok is False
-    assert any("opencode" in m and "FAIL:" in m for m in msgs)
+    assert any("FAIL: opencode not found; set providers.opencode.bin or path_prepend" in m for m in msgs)
 
     # Failing opencode --version -> fail
     _install_fake_cli_bins(bin_dir, opencode_rc=2)
@@ -132,23 +138,37 @@ def test_doctor_warns_on_unreachable_or_missing_gpu_without_failing(tmp_path: Pa
     monkeypatch.setenv("PATH", f"{bin_dir}:{git_dir}")
     monkeypatch.delenv("FACTORY_GPU_MCP_URL", raising=False)
 
-    # Unreachable GPU -> WARN, ok stays True
+    # Disabled GPU (mcp_url=None) -> OK disabled message
     repo = _init_doctor_repo(
         tmp_path,
-        models={"intake": ["gpu:jev", "gemini-4-hydrogen-low"]},
-        gpu_url="http://127.0.0.1:1/mcp",
+        models={"intake": ["gpu:decision-model", "gemini-4-hydrogen-low"]},
+        gpu_url=None,
+    )
+    ok, msgs = run_doctor(str(repo))
+    assert ok is True
+    assert any("OK: gpu decision MCP: disabled (gpu.mcp_url not set)" in m for m in msgs)
+
+    # Unreachable GPU -> WARN, ok stays True
+    (repo / "factory" / "config.json").write_text(
+        json.dumps(
+            {
+                "models": {"intake": ["gpu:decision-model", "gemini-4-hydrogen-low"]},
+                "gpu": {"mcp_url": "http://127.0.0.1:1/mcp", "min_confidence": 0.9},
+            }
+        ),
+        encoding="utf-8",
     )
     ok, msgs = run_doctor(str(repo))
     assert ok is True
     assert any(m.startswith("WARN: GPU MCP unreachable") for m in msgs)
 
-    # Reachable GPU with minicpm5 installed -> OK
-    server, url = _start_fake_gpu_server({"minicpm5-128k:latest": {"installed": True}})
+    # Reachable GPU -> OK
+    server, url = _start_fake_gpu_server({"decision-model:latest": {"installed": True}})
     try:
         (repo / "factory" / "config.json").write_text(
             json.dumps(
                 {
-                    "models": {"intake": ["gpu:jev", "gemini-4-hydrogen-low"]},
+                    "models": {"intake": ["gpu:decision-model", "gemini-4-hydrogen-low"]},
                     "gpu": {"mcp_url": url, "min_confidence": 0.9},
                 }
             ),
@@ -156,7 +176,7 @@ def test_doctor_warns_on_unreachable_or_missing_gpu_without_failing(tmp_path: Pa
         )
         ok, msgs = run_doctor(str(repo))
         assert ok is True
-        assert any(m.startswith("OK: GPU MCP reachable with minicpm5") for m in msgs)
+        assert any(m.startswith("OK: GPU MCP reachable") for m in msgs)
     finally:
         server.shutdown()
         server.server_close()

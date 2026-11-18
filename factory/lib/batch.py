@@ -10,7 +10,7 @@ import re
 import threading
 
 from factory.lib.agy_runner import QuotaExhaustedError, classify_model_provider, run_agent, run_agent_chain
-from factory.lib.config import estimate_usage_cost_usd, model_chain, resolve_reviewers
+from factory.lib.config import estimate_usage_cost_usd, model_chain, resolve_model_tier, resolve_reviewers
 from factory.lib.gate_runner import find_protected_violations, run_gate
 from factory.lib.git_ops import (
     GitHubClient,
@@ -442,7 +442,8 @@ def triage_and_plan_queue(
                     str(model[0]).strip() if isinstance(model, list) and model else str(model or "").strip()
                 )
                 used_model = str(usage.get("model") or fallback_model).strip()
-                prov, tier = classify_model_provider(used_model)
+                prov, _ = classify_model_provider(used_model)
+                tier = resolve_model_tier(used_model, config)
                 scaled = {
                     k: int(v // n_items) if isinstance(v, int) else v
                     for k, v in usage.items()
@@ -516,7 +517,8 @@ def _record_batch_usage(
     else:
         fallback_spec = str(model_spec or "").strip()
     effective_spec = str(usage.get("model") or fallback_spec).strip()
-    prov, tier = classify_model_provider(effective_spec)
+    prov, _ = classify_model_provider(effective_spec)
+    tier = resolve_model_tier(effective_spec, config)
     total_w = sum(max(1, it.complexity_weight) for it in issues)
     for it in issues:
         ratio = max(1, it.complexity_weight) / total_w

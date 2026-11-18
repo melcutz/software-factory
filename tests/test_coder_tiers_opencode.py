@@ -42,14 +42,14 @@ def _write_exe(path: Path, body: str) -> Path:
 
 
 def test_classify_model_provider():
-    assert classify_model_provider("gemini-4-hydrogen-medium") == ("agy", "paid")
+    assert classify_model_provider("gemini-4-hydrogen-medium") == ("agy", "standard")
     assert classify_model_provider("opencode/deepseek-v4.1-flash-free") == ("opencode", "free")
     assert classify_model_provider("opencode/big-pickle") == ("opencode", "free")
-    assert classify_model_provider("opencode/custom-paid") == ("opencode", "paid")
-    assert classify_model_provider("opencode-go/glm-5.3") == ("opencode-go", "subscription")
+    assert classify_model_provider("opencode/custom-model") == ("opencode", "standard")
+    assert classify_model_provider("opencode-go/glm-5.3") == ("opencode-go", "standard")
     assert classify_model_provider("openrouter/cohere/north-mini-code:free") == ("openrouter", "free")
-    assert classify_model_provider("openrouter/anthropic/claude") == ("openrouter", "paid")
-    assert classify_model_provider("gpu:jev") == ("gpu", "local")
+    assert classify_model_provider("openrouter/anthropic/claude") == ("openrouter", "standard")
+    assert classify_model_provider("gpu:decision-model") == ("gpu", "local")
 
 
 def test_dispatcher_routes_prefixes_and_tags_usage(tmp_path: Path, monkeypatch):
@@ -83,9 +83,9 @@ print(json.dumps({{"status": "SUCCESS", "duration_seconds": 1.2, "usage": {{"inp
 
     cases = [
         ("opencode/deepseek-v4.1-flash-free", "opencode", "free"),
-        ("opencode-go/glm-5.3", "opencode-go", "subscription"),
+        ("opencode-go/glm-5.3", "opencode-go", "standard"),
         ("openrouter/cohere/north-mini-code:free", "openrouter", "free"),
-        ("gemini-4-hydrogen-medium", "agy", "paid"),
+        ("gemini-4-hydrogen-medium", "agy", "standard"),
     ]
     for idx, (model, exp_provider, exp_tier) in enumerate(cases):
         out, usage, dur = run_agent(
@@ -121,19 +121,32 @@ def test_resolve_opencode_bin_path_and_home_fallbacks(tmp_path: Path, monkeypatc
     # Fallback when nothing exists
     assert resolve_opencode_bin() == "opencode"
 
-    # ~/.local/bin/opencode
-    local_oc = _write_exe(fake_home / ".local" / "bin" / "opencode", "#!/bin/sh\nexit 0\n")
-    assert resolve_opencode_bin() == str(local_oc)
-
-    # ~/.opencode/bin/opencode takes precedence over ~/.local/bin/opencode
+    # Unconfigured ~/.opencode/bin/opencode is NOT implicitly searched
     oc_home = _write_exe(fake_home / ".opencode" / "bin" / "opencode", "#!/bin/sh\nexit 0\n")
-    assert resolve_opencode_bin() == str(oc_home)
+    assert resolve_opencode_bin() == "opencode"
 
-    # PATH takes precedence over home fallbacks
+    # path_prepend enables finding ~/.opencode/bin/opencode
+    cfg_prepend = {"path_prepend": [str(fake_home / ".opencode" / "bin")]}
+    assert resolve_opencode_bin(config=cfg_prepend) == str(oc_home)
+
+    # PATH finds opencode without config
     path_dir = tmp_path / "path_bin"
     path_oc = _write_exe(path_dir / "opencode", "#!/bin/sh\nexit 0\n")
     monkeypatch.setenv("PATH", str(path_dir))
     assert resolve_opencode_bin() == str(path_oc)
+
+    # providers.opencode.bin overrides PATH and path_prepend
+    explicit_oc = _write_exe(tmp_path / "custom" / "opencode", "#!/bin/sh\nexit 0\n")
+    cfg_bin = {
+        "path_prepend": [str(fake_home / ".opencode" / "bin")],
+        "providers": {"opencode": {"bin": str(explicit_oc)}},
+    }
+    assert resolve_opencode_bin(config=cfg_bin) == str(explicit_oc)
+
+    # FACTORY_OPENCODE_BIN overrides everything
+    env_oc = _write_exe(tmp_path / "env_bin" / "opencode", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setenv("FACTORY_OPENCODE_BIN", str(env_oc))
+    assert resolve_opencode_bin(config=cfg_bin) == str(env_oc)
 
 
 def test_opencode_jsonl_parsing_and_usage_summing():
@@ -293,26 +306,45 @@ print(json.dumps({{"type": "step_finish", "sessionID": "ses_bad", "part": {{"typ
 
 
 def test_opencode_quota_mapping_free_openrouter_go_and_retry_after():
+    # Default cooldown is 3600 when unconfigured and no retry-after header is present
     err_zen = detect_opencode_error(
         "opencode/deepseek-v4.1-flash-free", "", "Error: Free usage limit reached for today"
     )
     assert isinstance(err_zen, QuotaExhaustedError)
     assert err_zen.bucket == "opencode-free"
-    assert err_zen.retry_after_sec == 10800
+    assert err_zen.retry_after_sec == 3600
 
+    # Explicit retry-after in provider output takes precedence
+    err_retry = detect_opencode_error(
+        "openrouter/cohere/north-mini-code:free", "", "429 free-models-per-day exceeded; Retry after 120s"
+    )
+    assert isinstance(err_retry, QuotaExhaustedError)
+    assert err_retry.bucket == "openrouter-free"
+    assert err_retry.retry_after_sec == 120
+
+    # Configured bucket cooldowns override default when provider omits retry-after
+    custom_cfg = {
+        "quota": {
+            "default_cooldown_sec": 900,
+            "buckets": [
+                {"match": "openrouter/*:free", "bucket": "openrouter-free", "cooldown_sec": 600},
+                {"match": "opencode-go/*", "bucket": "opencode-go", "cooldown_sec": 1200},
+            ],
+        }
+    }
     err_or = detect_opencode_error(
-        "openrouter/cohere/north-mini-code:free", "", "429 free-models-per-day exceeded"
+        "openrouter/cohere/north-mini-code:free", "", "429 free-models-per-day exceeded", config=custom_cfg
     )
     assert isinstance(err_or, QuotaExhaustedError)
     assert err_or.bucket == "openrouter-free"
-    assert err_or.retry_after_sec == 10800
+    assert err_or.retry_after_sec == 600
 
     err_go = detect_opencode_error(
-        "opencode-go/glm-5.3", "", "Weekly limit reached for Go subscription"
+        "opencode-go/glm-5.3", "", "Weekly limit reached for plan", config=custom_cfg
     )
     assert isinstance(err_go, QuotaExhaustedError)
     assert err_go.bucket == "opencode-go"
-    assert err_go.retry_after_sec == 86400
+    assert err_go.retry_after_sec == 1200
 
 
 def test_opencode_broken_model_raises_agent_execution_error():
@@ -394,12 +426,12 @@ def test_detect_opencode_error_catches_error_json_event_and_stderr():
     err_go = detect_opencode_error("opencode-go/minimax-m3", err_stdout, "")
     assert isinstance(err_go, QuotaExhaustedError)
     assert err_go.bucket == "opencode-go"
-    assert err_go.retry_after_sec == 86400
+    assert err_go.retry_after_sec == 3600
 
     err_free = detect_opencode_error("opencode/x-free", "", "Free usage limit")
     assert isinstance(err_free, QuotaExhaustedError)
     assert err_free.bucket == "opencode-free"
-    assert err_free.retry_after_sec == 10800
+    assert err_free.retry_after_sec == 3600
 
 
 def test_route_free_models_all_task_kinds():
@@ -416,9 +448,7 @@ def test_pipeline_default_config_chains_never_executes_real_opencode(tmp_path: P
     from factory.lib.pipeline import _call_run_agent
 
     cfg = load_config(os.path.abspath("factory"))
-    builder_low = cfg["models"]["builder_low"]
-    assert isinstance(builder_low, list)
-    assert builder_low[0].startswith("opencode/")
+    builder_low = ["opencode/deepseek-v4.1-flash-free", "gemini-3.8-flash-medium"]
 
     # conftest.py must have overridden FACTORY_OPENCODE_BIN to a hermetic fake under tmp
     oc_bin = resolve_opencode_bin()

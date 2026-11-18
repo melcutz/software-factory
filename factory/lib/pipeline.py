@@ -22,6 +22,7 @@ from factory.lib.agy_runner import (
     QuotaExhaustedError,
     classify_model_provider,
     resolve_agent_path,
+    resolve_agy_bin,
     run_agent,
     run_agent_chain,
 )
@@ -30,9 +31,11 @@ from factory.lib.batch import run_batch_factory
 _ORIG_RUN_AGENT = run_agent
 from factory.lib.config import (
     estimate_usage_cost_usd,
+    expand_path_prepend,
     load_config,
     load_config_with_layers,
     model_chain,
+    resolve_model_tier,
     resolve_reviewers,
     split_model_and_effort,
 )
@@ -184,6 +187,7 @@ def _fmt_model_tag(model_spec: str | list[str]) -> str:
 def _clear_quota_cooldown_if_needed(
     state_store: GitStateStore | None,
     model_spec: str | list[str],
+    config: dict | None = None,
 ) -> None:
     if state_store is None:
         return
@@ -193,12 +197,12 @@ def _clear_quota_cooldown_if_needed(
         raw_spec = (model_spec or "").strip()
     if not raw_spec:
         return
-    bucket = _governor.quota_bucket_for_model(raw_spec)
+    bucket = _governor.quota_bucket_for_model(raw_spec, config=config)
     if not bucket:
         return
     models = state_store.get_quota_state().get("models")
     if isinstance(models, dict) and (bucket in models or raw_spec in models):
-        state_store.clear_quota_cooldown(bucket)
+        state_store.clear_quota_cooldown(bucket, config=config)
 
 
 def _record_and_format_step(
@@ -216,7 +220,8 @@ def _record_and_format_step(
         default_spec = (model_spec or "").strip()
     effective_spec = str(u.get("model") or default_spec).strip()
     if effective_spec:
-        prov, tier = classify_model_provider(effective_spec)
+        prov, _ = classify_model_provider(effective_spec)
+        tier = resolve_model_tier(effective_spec, config)
         u.setdefault("provider", prov)
         u.setdefault("tier", tier)
         u.setdefault("model", effective_spec)
@@ -3469,8 +3474,13 @@ def process_job(
             reset_worktree_clean(worktree)
         _set_activity(jobs_dir, job_id, "cooldown: quota")
         if state_store is not None:
-            bucket = exc.bucket or _governor.quota_bucket_for_model(exc.model_spec)
-            state_store.record_quota_cooldown(bucket or exc.model_spec, str(exc), exc.retry_after_sec)
+            bucket = exc.bucket or _governor.quota_bucket_for_model(exc.model_spec, config=cfg)
+            state_store.record_quota_cooldown(
+                bucket or exc.model_spec,
+                str(exc),
+                exc.retry_after_sec,
+                config=cfg,
+            )
             _checkpoint_if_store(state_store, job_id, jdir, jobs_dir, release_lease=True)
         return load_job(jobs_dir, job_id)
     except LeaseLostError:
@@ -4040,12 +4050,42 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
     else:
         messages.append(f"OK: Python {sys.version.split()[0]}")
 
+    cfg: dict | None = None
+    cfg_layers: list[str] = []
+    cfg_err: Exception | None = None
+    try:
+        cfg, cfg_layers = load_config_with_layers(factory_dir)
+    except Exception as exc:
+        cfg_err = exc
+
+    search_path = os.environ.get("PATH", "")
+    prepend_dirs = expand_path_prepend(cfg)
+    if prepend_dirs:
+        search_path = os.pathsep.join([*prepend_dirs, search_path])
+
+    def _which_cmd(cmd_str: str) -> str | None:
+        if prepend_dirs:
+            try:
+                return shutil.which(cmd_str, path=search_path)
+            except TypeError:
+                return shutil.which(cmd_str)
+        return shutil.which(cmd_str)
+
     for binary, args in (("git", ["--version"]), ("gh", ["auth", "status"]), ("agy", ["--version"])):
-        if not shutil.which(binary):
+        bin_target = binary
+        if binary == "agy":
+            try:
+                bin_target = resolve_agy_bin(search_path, config=cfg)
+            except TypeError:
+                bin_target = resolve_agy_bin(search_path)
+        resolved = _which_cmd(bin_target) or (
+            bin_target if os.path.isfile(bin_target) and os.access(bin_target, os.X_OK) else None
+        )
+        if not resolved:
             ok = False
             messages.append(f"FAIL: `{binary}` not found on PATH")
             continue
-        res = subprocess.run([binary, *args], cwd=repo_root, capture_output=True, text=True, check=False)
+        res = subprocess.run([resolved, *args], cwd=repo_root, capture_output=True, text=True, check=False)
         if res.returncode != 0:
             ok = False
             messages.append(f"FAIL: `{binary} {' '.join(args)}` exited {res.returncode}")
@@ -4085,14 +4125,12 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
     else:
         messages.append(f"OK: git user.email -> {user_email}")
 
-    cfg: dict | None = None
-    try:
-        cfg, loaded_layers = load_config_with_layers(factory_dir)
-        layers_str = ", ".join(loaded_layers) if loaded_layers else "defaults only"
+    if cfg_err is None:
+        layers_str = ", ".join(cfg_layers) if cfg_layers else "defaults only"
         messages.append(f"OK: factory/config.json valid (layers: {layers_str})")
-    except Exception as exc:
+    else:
         ok = False
-        messages.append(f"FAIL: factory/config.json invalid: {exc}")
+        messages.append(f"FAIL: factory/config.json invalid: {cfg_err}")
 
     if cfg and isinstance(cfg.get("models"), dict):
         all_models: list[str] = []
@@ -4102,13 +4140,13 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
         if any(m.startswith(("opencode/", "opencode-go/", "openrouter/")) for m in all_models):
             from factory.lib.opencode_runner import resolve_opencode_bin
 
-            oc_bin = resolve_opencode_bin()
-            oc_resolved = shutil.which(oc_bin) or (
+            oc_bin = resolve_opencode_bin(config=cfg, path=search_path)
+            oc_resolved = _which_cmd(oc_bin) or (
                 oc_bin if os.path.isfile(oc_bin) and os.access(oc_bin, os.X_OK) else None
             )
             if not oc_resolved:
                 ok = False
-                messages.append("FAIL: `opencode` not found on PATH or ~/.opencode/bin")
+                messages.append("FAIL: opencode not found; set providers.opencode.bin or path_prepend")
             else:
                 try:
                     res_oc = subprocess.run(
@@ -4132,14 +4170,17 @@ def run_doctor(repo_root: str) -> tuple[bool, list[str]]:
                     messages.append(f"FAIL: `{oc_resolved} --version` failed: {exc}")
 
         if any(m.startswith("gpu:") for m in all_models):
-            from factory.lib.gpu_runner import gpu_available, resolve_gpu_mcp_url
+            from factory.lib.gpu_runner import gpu_available, resolve_gpu_mcp_url, resolve_gpu_tools
 
             mcp_url = resolve_gpu_mcp_url(factory_dir=factory_dir, config=cfg)
-            if gpu_available(mcp_url, force=True):
-                messages.append(f"OK: GPU MCP reachable with minicpm5 ({mcp_url})")
+            gpu_tools = resolve_gpu_tools(cfg)
+            if not mcp_url:
+                messages.append("OK: gpu decision MCP: disabled (gpu.mcp_url not set)")
+            elif gpu_available(mcp_url, force=True, status_tool=gpu_tools.get("status")):
+                messages.append(f"OK: GPU MCP reachable ({mcp_url})")
             else:
                 messages.append(
-                    f"WARN: GPU MCP unreachable or minicpm5 not installed ({mcp_url}); gpu: tier will abstain"
+                    f"WARN: GPU MCP unreachable ({mcp_url}); gpu: tier will abstain"
                 )
 
     checks_sh = os.path.join(factory_dir, "checks.sh")
