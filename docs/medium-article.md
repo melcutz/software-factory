@@ -4,7 +4,7 @@
 
 Most conversations about AI coding agents obsess over prompts, context windows, and which frontier model writes slightly cleaner Python.
 
-When we built an autonomous software factory ([`software-factory-agy`](https://github.com/melcutz/software-factory-agy)) and pointed it at a real production SaaS codebase (`example-app` -- a multi-tenant FastAPI + Cloudflare Python Workers + D1 + Queues + Stripe + Workers AI app with 3,264 tests and 8 CI invariant gates), **the bottlenecks that actually mattered had almost nothing to do with prompt engineering.**
+When we built an autonomous software factory ([`software-factory-agy`](https://github.com/melcutz/software-factory)) and pointed it at a real production SaaS codebase (`example-app` -- a multi-tenant FastAPI + Cloudflare Python Workers + D1 + Queues + Stripe + Workers AI app with 3,264 tests and 8 CI invariant gates), **the bottlenecks that actually mattered had almost nothing to do with prompt engineering.**
 
 Across **36 queued GitHub issues**, the factory shipped **29 merged multi-file PRs (70 vertical slices)**, rejected 1 out-of-scope issue cleanly in 25 seconds for `$0.00`, and processed **217.2M tokens** across **10.45 hours** of cumulative model time.
 

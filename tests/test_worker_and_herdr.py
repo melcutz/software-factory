@@ -161,6 +161,103 @@ def test_fleet_update_runs_git_pull_on_all_machines(tmp_path, monkeypatch):
     assert any("run --on lenovo -- sh -lc" in ln and "pull --ff-only origin" in ln for ln in lines)
 
 
+def test_fleet_update_falls_back_to_factory_home(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    from factory.lib.fleet import _fleet_update_script, fleet_update
+
+    # 1. Verify fleet_update()'s local (no-machines) path invokes sh -lc with the
+    #    update script without depending on the ambient environment.
+    captured_cmds: list[list[str]] = []
+    with monkeypatch.context() as m:
+        m.setattr("factory.lib.fleet.discover_machines", lambda: [])
+
+        def fake_run(cmd, **_kwargs):
+            captured_cmds.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="Already up to date.\n", stderr="")
+
+        m.setattr("factory.lib.fleet.subprocess.run", fake_run)
+        res = fleet_update()
+
+    assert res == [("local", 0, "Already up to date.")]
+    assert captured_cmds == [["sh", "-lc", _fleet_update_script()]]
+
+    # 2. Execute the generated script in a hermetic sh -c environment:
+    #    - PATH contains only a stub python3 (exits 1) and a symlink to git
+    #    - HOME and cwd point to tmp dirs outside the repo
+    #    - PYTHONPATH is unset
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_py = fake_bin / "python3"
+    fake_py.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake_py.chmod(0o755)
+    sh_bin = shutil.which("sh") or "/bin/sh"
+    git_bin = shutil.which("git")
+    assert git_bin is not None
+    (fake_bin / "git").symlink_to(git_bin)
+
+    outside_cwd = tmp_path / "outside"
+    outside_cwd.mkdir()
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    base_env = {"PATH": str(fake_bin), "HOME": str(empty_home)}
+    script = _fleet_update_script()
+
+    # Neither `import factory` nor FACTORY_HOME yields a directory -> clear error + non-zero.
+    res_unset = subprocess.run(
+        [sh_bin, "-c", script],
+        env=base_env,
+        cwd=str(outside_cwd),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_unset.returncode != 0
+    assert "cannot locate factory checkout; set FACTORY_HOME" in res_unset.stderr
+
+    res_missing = subprocess.run(
+        [sh_bin, "-c", script],
+        env={**base_env, "FACTORY_HOME": str(tmp_path / "missing-checkout")},
+        cwd=str(outside_cwd),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_missing.returncode != 0
+    assert "cannot locate factory checkout; set FACTORY_HOME" in res_missing.stderr
+
+    # Valid FACTORY_HOME git checkout pulls from origin when `import factory` fails.
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", str(origin), str(seed)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.email", "test@example.com"], check=True)
+    (seed / "README.md").write_text("v1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-m", "v1"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(seed), "push", "origin", "HEAD"], check=True, capture_output=True)
+
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "clone", str(origin), str(checkout)], check=True, capture_output=True)
+
+    (seed / "README.md").write_text("v2\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-m", "v2"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(seed), "push", "origin", "HEAD"], check=True, capture_output=True)
+
+    res_ok = subprocess.run(
+        [sh_bin, "-c", script],
+        env={**base_env, "FACTORY_HOME": str(checkout)},
+        cwd=str(outside_cwd),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_ok.returncode == 0
+    assert (checkout / "README.md").read_text(encoding="utf-8") == "v2\n"
+
+
 def test_fleet_wake_is_idempotent_on_name_taken(tmp_path, monkeypatch):
     fake_hc = tmp_path / "hc"
     fake_hc.write_text(

@@ -1,6 +1,6 @@
-# Setup & Installation Guide (`software-factory-agy` v0.3.0)
+# Setup & Installation Guide (`software-factory` v0.3.0)
 
-This guide walks you through installing `software-factory-agy`, configuring a target repository, verifying prerequisites, and running your first issue—on one machine or across a multi-machine fleet.
+This guide walks you through installing `software-factory`, configuring a target repository, verifying prerequisites, and running your first issue—on one machine or across a multi-machine fleet.
 
 For all configuration keys and layer precedence rules, see the [Configuration Reference](README.md#5-configuration-reference).
 
@@ -24,8 +24,8 @@ For all configuration keys and layer precedence rules, see the [Configuration Re
 Clone this repository and install it in editable mode on each machine that will run factory jobs:
 
 ```bash
-git clone https://github.com/melcutz/software-factory-agy.git
-cd software-factory-agy
+git clone https://github.com/melcutz/software-factory.git
+cd software-factory
 pip install -e .
 # On Ubuntu 24.04+ / externally managed Python environments:
 # python3 -m pip install --user --break-system-packages --no-deps -e .

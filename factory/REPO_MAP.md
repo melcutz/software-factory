@@ -1,4 +1,4 @@
-# Repository Architecture Map (`software-factory-agy`)
+# Repository Architecture Map (`software-factory`)
 
 Zero-dependency Python 3.10+ autonomous issue-to-PR software factory built on Google Antigravity (`agy`), Git refs (`refs/factory/*`), and `herdr-core` (`hc`).
 

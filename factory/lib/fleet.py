@@ -205,13 +205,19 @@ def fleet_unpause(machine: str | None = None) -> list[tuple[str, int, str]]:
     return results
 
 
-def fleet_update(machine: str | None = None) -> list[tuple[str, int, str]]:
-    """Pull latest software-factory-agy on all (or one) fleet machine(s)."""
-    update_script = (
-        'DIR=$(python3 -c "import os,factory; print(os.path.dirname(list(factory.__path__)[0]))" 2>/dev/null || echo "$HOME/work/software-factory-agy"); '
+def _fleet_update_script() -> str:
+    return (
+        'DIR=$(python3 -c "import os,factory; print(os.path.dirname(list(factory.__path__)[0]))" 2>/dev/null); '
+        '[ -n "$DIR" ] && [ -d "$DIR" ] || DIR="${FACTORY_HOME:-}"; '
+        'if [ -z "$DIR" ] || [ ! -d "$DIR" ]; then echo "cannot locate factory checkout; set FACTORY_HOME" >&2; exit 1; fi; '
         'BRANCH=$(git -C "$DIR" symbolic-ref --short HEAD 2>/dev/null || echo main); '
         'git -C "$DIR" pull --ff-only origin "$BRANCH"'
     )
+
+
+def fleet_update(machine: str | None = None) -> list[tuple[str, int, str]]:
+    """Pull latest software-factory on all (or one) fleet machine(s)."""
+    update_script = _fleet_update_script()
     machines = discover_machines()
     if machine:
         machines = [m for m in machines if m["name"] == machine]
