@@ -161,6 +161,62 @@ def test_fleet_update_runs_git_pull_on_all_machines(tmp_path, monkeypatch):
     assert any("run --on lenovo -- sh -lc" in ln and "pull --ff-only origin" in ln for ln in lines)
 
 
+def test_fleet_update_falls_back_to_factory_home(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    from factory.lib.fleet import fleet_update
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_py = fake_bin / "python3"
+    fake_py.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake_py.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("HC_BIN_PATH", str(tmp_path / "no-hc"))
+    monkeypatch.setenv("FACTORY_HOST_DIR", str(tmp_path))
+    monkeypatch.setattr("factory.lib.fleet.discover_machines", lambda: [])
+
+    # Neither `import factory` nor FACTORY_HOME yields a directory -> clear error + non-zero.
+    monkeypatch.delenv("FACTORY_HOME", raising=False)
+    res_unset = fleet_update()
+    assert len(res_unset) == 1
+    assert res_unset[0][0] == "local"
+    assert res_unset[0][1] != 0
+    assert "cannot locate factory checkout; set FACTORY_HOME" in res_unset[0][2]
+
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "missing-checkout"))
+    res_missing = fleet_update()
+    assert res_missing[0][1] != 0
+    assert "cannot locate factory checkout; set FACTORY_HOME" in res_missing[0][2]
+
+    # Valid FACTORY_HOME git checkout pulls from origin when `import factory` fails.
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", str(origin), str(seed)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.email", "test@example.com"], check=True)
+    (seed / "README.md").write_text("v1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-m", "v1"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(seed), "push", "origin", "HEAD"], check=True, capture_output=True)
+
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "clone", str(origin), str(checkout)], check=True, capture_output=True)
+
+    (seed / "README.md").write_text("v2\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-m", "v2"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(seed), "push", "origin", "HEAD"], check=True, capture_output=True)
+
+    monkeypatch.setenv("FACTORY_HOME", str(checkout))
+    res_ok = fleet_update()
+    assert res_ok[0][0] == "local"
+    assert res_ok[0][1] == 0
+    assert (checkout / "README.md").read_text(encoding="utf-8") == "v2\n"
+
+
 def test_fleet_wake_is_idempotent_on_name_taken(tmp_path, monkeypatch):
     fake_hc = tmp_path / "hc"
     fake_hc.write_text(

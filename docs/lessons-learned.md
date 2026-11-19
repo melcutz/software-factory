@@ -4,7 +4,7 @@ If you use AI coding agents every day, you eventually hit the same bottleneck: *
 
 We wanted something different: **minimum human effort to reliably ship high-quality code for real, multi-file features.** You file a GitHub issue, slap a `factory` label on it, and walk away. Clean changes should spec, build, test, review, merge, deploy to staging, verify themselves in a real browser, and either stay live or automatically roll back if anything regresses. Ambiguous issues should pause and ask a concrete question instead of guessing.
 
-That goal became [`software-factory-agy`](https://github.com/melcutz/software-factory-agy), an MIT-licensed autonomous software factory powered by Google Antigravity (`agy`), battle-tested on our product (`example-site` open core and `example-app`, a multi-tenant Cloudflare Python Workers + D1 SaaS with 3,260+ automated tests).
+That goal became [`software-factory-agy`](https://github.com/melcutz/software-factory), an MIT-licensed autonomous software factory powered by Google Antigravity (`agy`), battle-tested on our product (`example-site` open core and `example-app`, a multi-tenant Cloudflare Python Workers + D1 SaaS with 3,260+ automated tests).
 
 What surprised us most was **where the time and failures actually lived.** We expected to spend most of our effort tuning prompts and waiting on LLMs. Instead:
 
@@ -53,10 +53,10 @@ flowchart TD
 
 Under the hood, four design choices hold the system together:
 
-- **Headless JSON RPCs ([`f7e1a28`](https://github.com/melcutz/software-factory-agy/commit/f7e1a28), [`b797862`](https://github.com/melcutz/software-factory-agy/commit/b797862)):** Every agent is invoked via `agy` in headless JSON mode and validated against `SCHEMAS` in `factory/lib/schemas.py`. The orchestrator renders the human-readable `*.md` artifacts from that JSON, so a chatty model can never corrupt downstream parsing.
-- **Atomic state machine ([`ef000ff`](https://github.com/melcutz/software-factory-agy/commit/ef000ff)):** Each job's `job.json` is updated under a file lock via `tempfile.mkstemp` + `os.replace`, with an explicit `TRANSITIONS` graph and `escalated_from` tracking.
-- **Worktrees + protected-path enforcement ([`db75973`](https://github.com/melcutz/software-factory-agy/commit/db75973)):** Every job builds in `.worktrees/job-<N>` on branch `factory/job-<N>`. Before any test suite runs, a deterministic gate checks `git diff` against `protected_paths` (`factory/`, `.agents/`, `.github/`, `vendor/`) so an agent can never weaken its own checks.
-- **End-to-end test harness ([`5dc762b`](https://github.com/melcutz/software-factory-agy/commit/5dc762b)):** The entire pipeline -- including multi-PR staging trains, git revert conflicts, and Worker rollbacks -- is tested end-to-end with real `git` bare remotes and worktrees paired with fake `gh` and `agy` shims.
+- **Headless JSON RPCs ([`f7e1a28`](https://github.com/melcutz/software-factory/commit/f7e1a28), [`b797862`](https://github.com/melcutz/software-factory/commit/b797862)):** Every agent is invoked via `agy` in headless JSON mode and validated against `SCHEMAS` in `factory/lib/schemas.py`. The orchestrator renders the human-readable `*.md` artifacts from that JSON, so a chatty model can never corrupt downstream parsing.
+- **Atomic state machine ([`ef000ff`](https://github.com/melcutz/software-factory/commit/ef000ff)):** Each job's `job.json` is updated under a file lock via `tempfile.mkstemp` + `os.replace`, with an explicit `TRANSITIONS` graph and `escalated_from` tracking.
+- **Worktrees + protected-path enforcement ([`db75973`](https://github.com/melcutz/software-factory/commit/db75973)):** Every job builds in `.worktrees/job-<N>` on branch `factory/job-<N>`. Before any test suite runs, a deterministic gate checks `git diff` against `protected_paths` (`factory/`, `.agents/`, `.github/`, `vendor/`) so an agent can never weaken its own checks.
+- **End-to-end test harness ([`5dc762b`](https://github.com/melcutz/software-factory/commit/5dc762b)):** The entire pipeline -- including multi-PR staging trains, git revert conflicts, and Worker rollbacks -- is tested end-to-end with real `git` bare remotes and worktrees paired with fake `gh` and `agy` shims.
 
 ---
 
@@ -154,7 +154,7 @@ Turning concurrency up to `4-5` parallel workers didn't just surface normal `git
 ---
 
 ### 5. Your Prototype's Shell Scripts Will Betray You First
-We started with a 19-file bash-and-markdown prototype ([`02ad3f8`](https://github.com/melcutz/software-factory-agy/commit/02ad3f8)). It worked for a single happy-path run, and fell apart the moment anything unexpected happened: partial outputs, concurrent writes to `job.json`, or resuming after a crash.
+We started with a 19-file bash-and-markdown prototype ([`02ad3f8`](https://github.com/melcutz/software-factory/commit/02ad3f8)). It worked for a single happy-path run, and fell apart the moment anything unexpected happened: partial outputs, concurrent writes to `job.json`, or resuming after a crash.
 
 Rewriting the orchestrator in Python with strict schemas, file locks, and unit/e2e tests wasn't "over-engineering" -- it was the minimum bar for debugging why a run failed at 2 a.m.
 
@@ -165,9 +165,9 @@ Rewriting the orchestrator in Python with strict schemas, file locks, and unit/e
 ### 6. `gh` CLI and `git worktree` Have Sharp Edges
 The moment we pointed the factory at live GitHub repositories, three CLI/git behaviors broke runs in ways we never saw in synthetic tests:
 
-- **`gh pr merge --delete-branch` deletes your active worktree.** In newer `gh` releases, `--delete-branch` tries to switch branches locally and clean up -- which **deletes `.worktrees/job-<N>` out from under the running Python process**. The very next `git fetch` in `merging` crashed with `No such file or directory`. We dropped `--delete-branch` and delete remote branches explicitly from `repo_root` ([`6b168f9`](https://github.com/melcutz/software-factory-agy/commit/6b168f9)).
-- **`gh issue view --comments --json ...` fails on newer `gh`.** Newer `gh` versions reject `--comments` when `--json` is present because `comments` is already a JSON field ([`cc0053f`](https://github.com/melcutz/software-factory-agy/commit/cc0053f)).
-- **`git diff --name-only` C-quotes filenames.** Without `-z` (NUL-delimited output), non-ASCII or unusual paths get escaped, silently breaking `protected_paths` checks ([`b352832`](https://github.com/melcutz/software-factory-agy/commit/b352832)).
+- **`gh pr merge --delete-branch` deletes your active worktree.** In newer `gh` releases, `--delete-branch` tries to switch branches locally and clean up -- which **deletes `.worktrees/job-<N>` out from under the running Python process**. The very next `git fetch` in `merging` crashed with `No such file or directory`. We dropped `--delete-branch` and delete remote branches explicitly from `repo_root` ([`6b168f9`](https://github.com/melcutz/software-factory/commit/6b168f9)).
+- **`gh issue view --comments --json ...` fails on newer `gh`.** Newer `gh` versions reject `--comments` when `--json` is present because `comments` is already a JSON field ([`cc0053f`](https://github.com/melcutz/software-factory/commit/cc0053f)).
+- **`git diff --name-only` C-quotes filenames.** Without `-z` (NUL-delimited output), non-ASCII or unusual paths get escaped, silently breaking `protected_paths` checks ([`b352832`](https://github.com/melcutz/software-factory/commit/b352832)).
 - **Post-revert fast-forward trap:** When restoring a reverted PR onto a fresh retry branch (`factory/job-N-qa2`), you cannot `git checkout <pre_merge_head> && git merge origin/main` -- because `<pre_merge_head>` was already merged into `origin/main` before being reverted, `git merge` fast-forwards to `origin/main` and **silently wipes out all of the PR's commits!** Instead, branch off `origin/main` and `git revert --no-edit <revert_sha>` ("revert the revert"), aborting cleanly if sibling hunks conflict.
 
 **Takeaway:** Never let external CLIs mutate your worktree directory layout behind your back, always parse git paths with `-z`, and test revert/reapply git ancestry against real bare remotes.
@@ -177,9 +177,9 @@ The moment we pointed the factory at live GitHub repositories, three CLI/git beh
 ### 7. Naive Retries Re-Build Merged PRs and Run Your Test Suite 5x
 During early live runs, we noticed two huge sources of wasted work and broken state:
 
-1. **Non-idempotent `merging` and `staging_qa` resumes:** If a job crashed *after* `gh pr merge` succeeded on GitHub (or mid-`staging_qa` deploy) before `job.json` reached `merged`, naive resume logic sent it back to `build` or tried to re-merge an already-merged PR! Checking `gh_client.get_pr_merge_commit(pr_num)` and recording `pre_merge_main_sha` + `merged_commit_sha` on `job.json` made both `merging` and `staging_qa` cleanly resumable ([`6b168f9`](https://github.com/melcutz/software-factory-agy/commit/6b168f9)).
+1. **Non-idempotent `merging` and `staging_qa` resumes:** If a job crashed *after* `gh pr merge` succeeded on GitHub (or mid-`staging_qa` deploy) before `job.json` reached `merged`, naive resume logic sent it back to `build` or tried to re-merge an already-merged PR! Checking `gh_client.get_pr_merge_commit(pr_num)` and recording `pre_merge_main_sha` + `merged_commit_sha` on `job.json` made both `merging` and `staging_qa` cleanly resumable ([`6b168f9`](https://github.com/melcutz/software-factory/commit/6b168f9)).
 2. **The 5x test-suite tax:** Our builder was running the full test suite inside each slice turn, then the orchestrator ran it again in the slice gate, again in `stage=gate` on the exact same commit SHA, and again in `pre-merge`.
-   - Scoping intermediate slices (`1..N-1`) to `FACTORY_GATE_SCOPE=slice` while reserving `full` for the final slice, plus caching `verified_gate_sha` on `job.json` so `stage=gate` skips duplicate runs on an unchanged `HEAD` ([`6c465ab`](https://github.com/melcutz/software-factory-agy/commit/6c465ab), [`7c295fb`](https://github.com/melcutz/software-factory-agy/commit/7c295fb)), eliminated redundant full-suite runs immediately.
+   - Scoping intermediate slices (`1..N-1`) to `FACTORY_GATE_SCOPE=slice` while reserving `full` for the final slice, plus caching `verified_gate_sha` on `job.json` so `stage=gate` skips duplicate runs on an unchanged `HEAD` ([`6c465ab`](https://github.com/melcutz/software-factory/commit/6c465ab), [`7c295fb`](https://github.com/melcutz/software-factory/commit/7c295fb)), eliminated redundant full-suite runs immediately.
 
 **Takeaway:** Every stage in an autonomous pipeline must be idempotent, and you should never run the full test suite twice on the exact same git SHA.
 
@@ -198,8 +198,8 @@ flowchart LR
     CR -->|"pre-merge gate PASS"| MG["Push & Enter Staging Train"]
 ```
 
-- **Queue Dependency DAG & Dynamic Poll Loop ([`9ac4740`](https://github.com/melcutz/software-factory-agy/commit/9ac4740), [`1f2fecb`](https://github.com/melcutz/software-factory-agy/commit/1f2fecb)):** `factory/lib/planner.py` combines explicit issue references (`Depends on #X`, `Blocked by #X`, `After #X`) with LLM-predicted file-surface collisions into an acyclic `graphlib.TopologicalSorter` DAG, pre-registering waiting tickets in `factory status` as `queued (after #564,#568)` and dynamically ingesting newly labeled GitHub issues mid-run without restarting the daemon.
-- **Agent-Assisted Code Conflict Resolution ([`0daed5a`](https://github.com/melcutz/software-factory-agy/commit/0daed5a)):** When `sync_with_base` hits a real code conflict in `merging`, we keep `MERGE_HEAD` intact, invoke `builder` to resolve markers and commit, verify a clean worktree with an advanced `HEAD`, and force a `full` `pre-merge` gate before pushing.
+- **Queue Dependency DAG & Dynamic Poll Loop ([`9ac4740`](https://github.com/melcutz/software-factory/commit/9ac4740), [`1f2fecb`](https://github.com/melcutz/software-factory/commit/1f2fecb)):** `factory/lib/planner.py` combines explicit issue references (`Depends on #X`, `Blocked by #X`, `After #X`) with LLM-predicted file-surface collisions into an acyclic `graphlib.TopologicalSorter` DAG, pre-registering waiting tickets in `factory status` as `queued (after #564,#568)` and dynamically ingesting newly labeled GitHub issues mid-run without restarting the daemon.
+- **Agent-Assisted Code Conflict Resolution ([`0daed5a`](https://github.com/melcutz/software-factory/commit/0daed5a)):** When `sync_with_base` hits a real code conflict in `merging`, we keep `MERGE_HEAD` intact, invoke `builder` to resolve markers and commit, verify a clean worktree with an advanced `HEAD`, and force a `full` `pre-merge` gate before pushing.
 
 **Takeaway:** Concurrency without dependency scheduling and automated conflict resolution just multiplies your human escalation queue.
 
@@ -217,7 +217,7 @@ Code-only review (`reviewer-code`) catches logic bugs and SQL scoping issues, bu
 ### 10. Showing `stage=build` After a Crash Is Misinformation
 When you kick off a batch and come back 30 minutes later, you run `factory status`. Early on, our status table only read `stage` from `job.json`. If the runner had been stopped or crashed an hour earlier, `factory status` still claimed `stage=merging` -- leading you to wait on a dead process.
 
-Making OS-level liveness a first-class signal fixed this ([`e5006d4`](https://github.com/melcutz/software-factory-agy/commit/e5006d4), [`3bee80a`](https://github.com/melcutz/software-factory-agy/commit/e5006d4)):
+Making OS-level liveness a first-class signal fixed this ([`e5006d4`](https://github.com/melcutz/software-factory/commit/e5006d4), [`3bee80a`](https://github.com/melcutz/software-factory/commit/e5006d4)):
 - Workers write `activity` (`waiting:repo_lock`, `running:slice-2/2`, `running:pre-merge-gate:slice`, `running:browser-qa-r1`) and `pid` to `job.json`, clearing them in `finally:`.
 - `run_factory` writes `factory/jobs/.factory.pid` and removes it on exit.
 - `factory status` probes `os.kill(pid, 0)` on both `.factory.pid` and each active job, printing `Factory: RUNNING (pid=..., active_jobs=..., queued=...)` vs `Factory: NOT RUNNING` and marking interrupted jobs `stale (running:slice-2/2)`.
@@ -229,14 +229,14 @@ Making OS-level liveness a first-class signal fixed this ([`e5006d4`](https://gi
 ### 11. Watchdogs Cut Both Ways: How a `45s` Timeout Fired 15 Automated Rollbacks
 The nastiest bugs in headless agent orchestration are silent subprocess hangs -- and our own first attempt to fix them caused our biggest incident in Wave 2.
 
-In Wave 1 (`job-524`), a QA agent spawned a background helper that kept pipes open after the agent went idle. To prevent zombie hangs, we shipped a process-group watchdog ([`e6463e8`](https://github.com/melcutz/software-factory-agy/commit/e6463e8)) that watched `stderr` for `root agent idle; waiting up to ... for N background task(s)` and killed the session after **`45 seconds`**.
+In Wave 1 (`job-524`), a QA agent spawned a background helper that kept pipes open after the agent went idle. To prevent zombie hangs, we shipped a process-group watchdog ([`e6463e8`](https://github.com/melcutz/software-factory/commit/e6463e8)) that watched `stderr` for `root agent idle; waiting up to ... for N background task(s)` and killed the session after **`45 seconds`**.
 
 When we launched Wave 2 across `example-app` and `example-site`, **9 jobs suddenly escalated to `needs-human`** (`32` watchdog kills in the logs!). Inspecting the `agy` transcripts revealed why:
 - `agy`'s `run_command` tool has a `10s` synchronous cap (`WaitMsBeforeAsync <= 10000ms`). **Any** foreground command taking longer than `10s` (`pytest` under parallel load, first-run `uv sync`, or a `60-110s` multi-persona Playwright `run_qa.py` script against live staging) is **automatically backgrounded by `agy`** while the root agent idles waiting for the completion wakeup!
 - At `55 seconds` (`10s` sync + `45s` grace), our watchdog shot `agy` mid-flight: `job-564`'s Playwright script had literally just passed `pro` regression and all three import-quota assertions when the `45s` timer killed it, and `job-132`'s `pytest` run in `example-site` was at `83%` green dots!
 - Worse, because the kill happened inside `staging_qa`, the pipeline treated all 5 killed QA runs (`job-564, 565, 569, 570, 571`) as staging failures -- **executing 15 consecutive PR reverts on `main` and 15 Cloudflare Worker rollbacks** across 3 QA rounds before escalating!
 
-Fixing the watchdog to inspect `/proc` descendants, unlatch cleanly when backgrounded children exit, reap `setsid` grandchildren, and raise the grace window to `600s` ([`8dba8d7`](https://github.com/melcutz/software-factory-agy/commit/8dba8d7), `example-app` `4bb5cce`) resolved the false kills immediately -- `job-564`, `job-565`, and `job-571` resumed and merged cleanly (`#594`, `#595`, `#596`). And the incident proved an unexpected silver lining: **even when a buggy watchdog triggered 15 unattended staging rollbacks in a row, `main` and `staging.example-app.com/health` never once broke**, and every job's built code survived intact on its `factory/job-*-qa3` branch.
+Fixing the watchdog to inspect `/proc` descendants, unlatch cleanly when backgrounded children exit, reap `setsid` grandchildren, and raise the grace window to `600s` ([`8dba8d7`](https://github.com/melcutz/software-factory/commit/8dba8d7), `example-app` `4bb5cce`) resolved the false kills immediately -- `job-564`, `job-565`, and `job-571` resumed and merged cleanly (`#594`, `#595`, `#596`). And the incident proved an unexpected silver lining: **even when a buggy watchdog triggered 15 unattended staging rollbacks in a row, `main` and `staging.example-app.com/health` never once broke**, and every job's built code survived intact on its `factory/job-*-qa3` branch.
 
 **Takeaway:** Understand your agent CLI's async tool-execution model before writing idle watchdogs -- and make your rollback path rock-solid, because sooner or later your own orchestrator will test it in anger.
 
@@ -255,4 +255,4 @@ If you're building an autonomous coding pipeline, here is the checklist we wish 
 7. **Schedule with a dependency DAG** (`planner.py` + `TopologicalSorter`) before turning concurrency above `1`.
 8. **Verify OS-level PID liveness (`os.kill(pid, 0)`)** in `factory status` and supervise `setsid` process groups with child-aware watchdogs and per-step `$`/token telemetry.
 
-You can explore the generic orchestrator, test harness, and commit history in [`software-factory-agy`](https://github.com/melcutz/software-factory-agy).
+You can explore the generic orchestrator, test harness, and commit history in [`software-factory-agy`](https://github.com/melcutz/software-factory).

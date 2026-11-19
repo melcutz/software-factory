@@ -1,10 +1,10 @@
-# software-factory-agy
+# software-factory
 
 [![Sponsor this project](https://img.shields.io/badge/Sponsor-this%20project-ea4aaa?logo=githubsponsors&logoColor=white)](https://buy.stripe.com/eVq6oI94c1SL5ne37i4Vy01)
 
-`software-factory-agy` (`v0.3.0`) is an autonomous, issue-to-merge software factory for your own GitHub repositories. It runs coding agents on your own machines—either one-shot on a single workstation or across a multi-machine fleet—turning labeled GitHub issues into tested, reviewed, and merged pull requests with zero central server or database.
+`software-factory` (`v0.3.0`, formerly named `software-factory-agy`) is an autonomous, issue-to-merge software factory for your own GitHub repositories. It runs coding agents on your own machines—either one-shot on a single workstation or across a multi-machine fleet—turning labeled GitHub issues into tested, reviewed, and merged pull requests with zero central server or database.
 
-*(Looking for the simpler `v0.1.0` single-machine baseline? Check out the [`v0.1.0` release](https://github.com/melcutz/software-factory-agy/releases/tag/v0.1.0).)*
+*(Looking for the simpler `v0.1.0` single-machine baseline? Check out the [`v0.1.0` release](https://github.com/melcutz/software-factory/releases/tag/v0.1.0).)*
 
 ---
 
@@ -112,8 +112,8 @@ When `models.<role>` is a list (for example `["gpu:decision-model", "opencode/mi
 Clone the repository and install the `factory` CLI in editable mode:
 
 ```bash
-git clone https://github.com/melcutz/software-factory-agy.git
-cd software-factory-agy
+git clone https://github.com/melcutz/software-factory.git
+cd software-factory
 pip install -e .
 # On Ubuntu 24.04+ / externally managed Python environments:
 # python3 -m pip install --user --break-system-packages --no-deps -e .
@@ -416,6 +416,7 @@ Unpriced models record `$0.0` (`priced: false`) while still tracking call counts
 ## 9. Troubleshooting
 
 - **Preflight check (`factory doctor`)**: Validates Python, `git`, `gh`, `agy`, `opencode` (when configured), `gpu.mcp_url` reachability, merged config layers (printing layer paths without values), `factory/checks.sh`, and `.gitignore`.
+- **`factory fleet update` cannot locate checkout**: `factory fleet update` locates the checkout via `import factory` and falls back to `FACTORY_HOME`. If `factory` is not importable by `python3` on a machine (e.g., isolated virtualenv), set `FACTORY_HOME` to the `software-factory` checkout path.
 - **Cooldowns**: Active rate-limit cooldowns in `refs/factory/quota` appear in `factory status`. Chains automatically fall through to the next configured model while a bucket is cooling down.
 - **Stuck or failed jobs**:
   - `factory logs <job-id>` shows stage, `last_error`, `checks.md` tail, and review findings.
