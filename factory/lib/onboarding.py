@@ -13,6 +13,7 @@ REQUIRED_GITIGNORE = (
     "/factory/jobs/*",
     "!/factory/jobs/.gitkeep",
     "/.worktrees/",
+    "factory/config.local.json",
 )
 
 

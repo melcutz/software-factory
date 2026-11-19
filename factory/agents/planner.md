@@ -11,7 +11,7 @@ Given a batch of queued GitHub issues (numbers, titles, and bodies), produce an 
    - Never add self-dependencies or cycles.
    - Only reference issue numbers present in the provided batch.
 2. **High-Conflict Surface Prediction (`predicted_surfaces`)**:
-   - List **specific source or template file paths** each issue is likely to modify (e.g. `factory/lib/pipeline.py`, `src/keepfor_cloud/ingest.py`, `templates/reader.html`), or ordered schema migration directories (`migrations/`, `control_migrations/`).
+   - List **specific source or template file paths** each issue is likely to modify (e.g. `factory/lib/pipeline.py`, `src/my_app/ingest.py`, `templates/reader.html`), or ordered schema migration directories (`migrations/`, `control_migrations/`).
    - **NEVER** list broad container directories (`tests/`, `docs/`, `src/`, `templates/`, `static/`, `src/<pkg>/static/`, or package directories) -- listing shared directories falsely serializes independent issues.
    - Do **not** serialize truly independent issues unnecessarily; maximize safe parallel execution across workers.
 3. **Output**:

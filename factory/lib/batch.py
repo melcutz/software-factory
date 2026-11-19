@@ -9,8 +9,8 @@ import os
 import re
 import threading
 
-from factory.lib.agy_runner import QuotaExhaustedError, run_agent
-from factory.lib.config import estimate_usage_cost_usd, resolve_reviewers
+from factory.lib.agy_runner import QuotaExhaustedError, classify_model_provider, run_agent, run_agent_chain
+from factory.lib.config import estimate_usage_cost_usd, model_chain, resolve_model_tier, resolve_reviewers
 from factory.lib.gate_runner import find_protected_violations, run_gate
 from factory.lib.git_ops import (
     GitHubClient,
@@ -342,7 +342,10 @@ def triage_and_plan_queue(
     issue_by_num = {int(iss["number"]): iss for iss in issues}
 
     prompt = _build_batch_planner_prompt(issues, repo_map)
-    model = str((config.get("models") or {}).get("planner") or "gemini-3.8-flash-low")
+    raw_planner_model = (config.get("models") or {}).get("planner") or "gemini-3.8-flash-low"
+    model: str | list[str] = (
+        list(raw_planner_model) if isinstance(raw_planner_model, list) else str(raw_planner_model)
+    )
     if planner_runner is not None:
         payload, usage, duration = planner_runner(
             prompt,
@@ -351,7 +354,7 @@ def triage_and_plan_queue(
             model=model,
         )
     else:
-        payload, usage, duration = run_agent(
+        payload, usage, duration = run_agent_chain(
             factory_dir,
             jobs_dir,
             repo_root,
@@ -361,6 +364,8 @@ def triage_and_plan_queue(
             prompt,
             SCHEMAS["batch_plan"],
             int(config.get("agent_timeout_sec", 900)),
+            config=config,
+            runner_fn=run_agent,
             sandbox=True,
             clean_worktree=False,
             log_name="batch-planner",
@@ -433,11 +438,22 @@ def triage_and_plan_queue(
             )
             job_id = f"job-{it.issue}"
             if usage:
+                fallback_model = (
+                    str(model[0]).strip() if isinstance(model, list) and model else str(model or "").strip()
+                )
+                used_model = str(usage.get("model") or fallback_model).strip()
+                prov, _ = classify_model_provider(used_model)
+                tier = resolve_model_tier(used_model, config)
                 scaled = {
                     k: int(v // n_items) if isinstance(v, int) else v
                     for k, v in usage.items()
                 }
-                cost = estimate_usage_cost_usd(model, scaled, config)
+                if "cost_usd" in usage and isinstance(usage["cost_usd"], (int, float)):
+                    scaled["cost_usd"] = float(usage["cost_usd"]) / n_items
+                scaled.setdefault("provider", prov)
+                scaled.setdefault("tier", tier)
+                scaled["model"] = used_model
+                cost = estimate_usage_cost_usd(used_model, scaled, config)
                 record_usage(jobs_dir, job_id, scaled, duration / n_items, cost_usd=cost)
             if it.decision in {"NEEDS_INFO", "REJECT"}:
                 _transition_non_accept(jobs_dir, it, config, gh, board)
@@ -491,11 +507,18 @@ def _record_batch_usage(
     issues: list[TriageItem],
     usage: dict | None,
     duration: float,
-    model_spec: str,
+    model_spec: str | list[str],
     config: dict,
 ) -> None:
     if not issues or not usage:
         return
+    if isinstance(model_spec, list):
+        fallback_spec = str(model_spec[0]).strip() if model_spec else ""
+    else:
+        fallback_spec = str(model_spec or "").strip()
+    effective_spec = str(usage.get("model") or fallback_spec).strip()
+    prov, _ = classify_model_provider(effective_spec)
+    tier = resolve_model_tier(effective_spec, config)
     total_w = sum(max(1, it.complexity_weight) for it in issues)
     for it in issues:
         ratio = max(1, it.complexity_weight) / total_w
@@ -503,7 +526,12 @@ def _record_batch_usage(
             k: int(round(v * ratio)) if isinstance(v, int) else v
             for k, v in usage.items()
         }
-        cost = estimate_usage_cost_usd(model_spec, scaled, config)
+        if "cost_usd" in usage and isinstance(usage["cost_usd"], (int, float)):
+            scaled["cost_usd"] = float(usage["cost_usd"]) * ratio
+        scaled.setdefault("provider", prov)
+        scaled.setdefault("tier", tier)
+        scaled["model"] = effective_spec
+        cost = estimate_usage_cost_usd(effective_spec, scaled, config)
         record_usage(jobs_dir, f"job-{it.issue}", scaled, duration * ratio, cost_usd=cost)
 
 
@@ -675,6 +703,8 @@ def _run_batch_review(
     config: dict,
     jobs_dir: str,
     agent_runner: Callable[..., tuple[dict, dict, float]],
+    *,
+    state_store: GitStateStore | None = None,
 ) -> tuple[bool, str]:
     base_branch = config.get("base_branch", "main")
     stat = diff_stat(worktree, base_branch)
@@ -700,7 +730,7 @@ def _run_batch_review(
             f"Review the batch diff against `origin/{base_branch}` for issues:\n{issue_summary}\n\n"
             f"## Diff Stat\n{stat}\n"
         )
-        payload, usage, dur = agent_runner(
+        payload, usage, dur = run_agent_chain(
             factory_dir,
             batch_job_dir,
             worktree,
@@ -710,6 +740,9 @@ def _run_batch_review(
             prompt,
             SCHEMAS["review"],
             int(config.get("agent_timeout_sec", 900)),
+            config=config,
+            state_store=state_store,
+            runner_fn=agent_runner,
             sandbox=True,
             clean_worktree=True,
             log_name=f"review-{role}",
@@ -752,20 +785,23 @@ def execute_batch(
         advance_stage(jobs_dir, job_id, "intake")
         advance_stage(jobs_dir, job_id, "build")
 
-    builder_model = str((config.get("models") or {}).get("batch_builder") or config["models"]["builder"])
+    models_cfg = config.get("models") or {}
+    raw_builder = models_cfg.get("batch_builder") or config["models"]["builder"]
+    builder_model: str | list[str] = list(raw_builder) if isinstance(raw_builder, list) else str(raw_builder)
     if (
         len(batch.issues) == 1
         and batch.issues[0].risk == "low"
         and batch.issues[0].complexity_weight == 1
-        and (config.get("models") or {}).get("builder_low")
+        and model_chain(config, "builder_low")
     ):
-        builder_model = str(config["models"]["builder_low"])
+        raw_low = config["models"]["builder_low"]
+        builder_model = list(raw_low) if isinstance(raw_low, list) else str(raw_low)
 
     batch_job_dir = os.path.join(jobs_dir, batch.id)
     os.makedirs(batch_job_dir, exist_ok=True)
     timeout_sec = min(2400, int(config.get("agent_timeout_sec", 900)) + 240 * (len(batch.issues) - 1))
     build_prompt = _build_batch_builder_prompt(batch, repo_map)
-    build_payload, usage, dur = runner(
+    build_payload, usage, dur = run_agent_chain(
         factory_dir,
         batch_job_dir,
         wt,
@@ -775,6 +811,9 @@ def execute_batch(
         build_prompt,
         SCHEMAS["batch_build"],
         timeout_sec,
+        config=config,
+        state_store=state_store,
+        runner_fn=runner,
         sandbox=False,
         clean_worktree=True,
         log_name="batch-builder",
@@ -833,7 +872,9 @@ def execute_batch(
         if gate_ok:
             for it in surviving:
                 advance_stage(jobs_dir, f"job-{it.issue}", "review")
-            review_ok, rev_out = _run_batch_review(repo_root, factory_dir, wt, batch, surviving, config, jobs_dir, runner)
+            review_ok, rev_out = _run_batch_review(
+                repo_root, factory_dir, wt, batch, surviving, config, jobs_dir, runner, state_store=state_store
+            )
             if review_ok:
                 break
             feedback = f"Review findings:\n{rev_out}"
@@ -844,7 +885,7 @@ def execute_batch(
             for it in surviving:
                 advance_stage(jobs_dir, f"job-{it.issue}", "build", last_error=feedback)
             fix_prompt = _build_batch_builder_prompt(batch, repo_map, fix_feedback=feedback)
-            _, fix_usage, fix_dur = runner(
+            _, fix_usage, fix_dur = run_agent_chain(
                 factory_dir,
                 batch_job_dir,
                 wt,
@@ -854,6 +895,9 @@ def execute_batch(
                 fix_prompt,
                 SCHEMAS["batch_build"],
                 timeout_sec,
+                config=config,
+                state_store=state_store,
+                runner_fn=runner,
                 sandbox=False,
                 clean_worktree=True,
                 log_name=f"batch-builder-round-{rnd + 1}",
@@ -885,7 +929,9 @@ def execute_batch(
             if surviving:
                 for it in surviving:
                     advance_stage(jobs_dir, f"job-{it.issue}", "review")
-                review_ok, _ = _run_batch_review(repo_root, factory_dir, wt, batch, surviving, config, jobs_dir, runner)
+                review_ok, _ = _run_batch_review(
+                    repo_root, factory_dir, wt, batch, surviving, config, jobs_dir, runner, state_store=state_store
+                )
                 gate_ok = True
 
         if not surviving or not (gate_ok and review_ok):
@@ -989,7 +1035,7 @@ def run_batch_factory(
 
     def _planner_hook(prompt: str, **kw):
         model = kw["model"]
-        return runner(
+        return run_agent_chain(
             factory_dir,
             jobs_dir,
             repo_root,
@@ -999,6 +1045,9 @@ def run_batch_factory(
             prompt,
             SCHEMAS["batch_plan"],
             int(config.get("agent_timeout_sec", 900)),
+            config=config,
+            state_store=state_store,
+            runner_fn=runner,
             sandbox=True,
             clean_worktree=False,
             log_name="batch-planner",

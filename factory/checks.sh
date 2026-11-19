@@ -49,3 +49,5 @@ for t in sorted(targets):
 else
   python3 -m pytest -q
 fi
+
+python3 scripts/check_leaks.py

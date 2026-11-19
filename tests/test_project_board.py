@@ -104,7 +104,7 @@ class ProjectBoardTests(unittest.TestCase):
         board = ProjectBoardSync(
             project_id="PVT_2",
             project_number=2,
-            owner="melcutz",
+            owner="example-owner",
             status_field_id="F_STATUS",
             options_by_name={
                 "Ready": "OPT_READY",
@@ -117,7 +117,7 @@ class ProjectBoardTests(unittest.TestCase):
             runner=fake_runner,
         )
 
-        url = "https://github.com/melcutz/repo/issues/42"
+        url = "https://github.com/example-owner/example-repo/issues/42"
         self.assertTrue(board.sync_stage(url, "queued"))
         self.assertTrue(board.sync_stage(url, "intake"))
         # Subsequent active stages map to Building -> cached, no extra gh call!

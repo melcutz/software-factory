@@ -39,13 +39,13 @@ The design is cohesive end-to-end and implemented in three ordered, independentl
 flowchart TD
     subgraph MachineA["Homelab Machine A (herdr-core / hc)"]
         WA["Controller Terminal: factory worker --all"]
-        JA1["Child Terminal (hc run --bg): keepfor-cloud-620"]
+        JA1["Child Terminal (hc run --bg): example-app-620"]
         WA -->|spawns / monitors| JA1
     end
 
     subgraph MachineB["Homelab Machine B (herdr-core / hc)"]
         WB["Controller Terminal: factory worker --all"]
-        JB1["Child Terminal (hc run --bg): keepfor-cloud-621"]
+        JB1["Child Terminal (hc run --bg): example-app-621"]
         WB -->|spawns / monitors| JB1
     end
 
@@ -92,13 +92,13 @@ All cross-machine coordination inside each target repo lives under `refs/factory
 1. **Lease Structure inside `job.json`:**
    ```json
    "lease": {
-     "worker_id": "ryzen-box",
-     "hostname": "ryzen-box",
+     "worker_id": "worker-a",
+     "hostname": "worker-a",
      "pid": 48210,
      "fencing_token": 4,
      "acquired_at": "2026-11-15T20:00:00Z"
    },
-   "last_worker_id": "ryzen-box"
+   "last_worker_id": "worker-a"
    ```
 2. **Determining Lease Validity:** A job lease is **active** if `lease` is non-null AND the holder's `refs/factory/workers/<worker_id>` ref exists with `expires_at > now_utc` (with a 60s clock-skew safety margin: takeover requires `now_utc > expires_at + 60s`, i.e., 7 minutes of silence after crash, whereas explicit lease release sets `lease = null` for **0-second** takeover).
 3. **Atomic Claim (`claim_job_lease`):**
@@ -134,7 +134,7 @@ Machines operate as peer **competing consumers** governed by `~/.config/factory/
 
 ```json
 {
-  "machine_id": "desktop-linux",
+  "machine_id": "worker-a",
   "max_workers": 3,
   "poll_interval_sec": 90,
   "ramp_up_delay_sec": 15,
@@ -197,7 +197,7 @@ Workers also check `refs/factory/control` via lightweight `git ls-remote` every 
 - **`factory status [--all]`:**
   - Fetches `refs/factory/control`, `refs/factory/workers/*`, `refs/factory/quota`, and `refs/factory/jobs/*` (falling back to local `factory/jobs/` for legacy history) and prints:
     1. Fleet banner (`RUNNING` vs `HALTED`, active quota cooldowns, live connected machines with `slots`, `CPU%`, `free RAM`, `state`).
-    2. Per-repo job table adding a `MACHINE` column (`ryzen-box`, `-` when unleased/completed).
+    2. Per-repo job table adding a `MACHINE` column (`worker-a`, `-` when unleased/completed).
 
 ---
 
@@ -220,7 +220,7 @@ Workers also check `refs/factory/control` via lightweight `git ls-remote` every 
 | :--- | :--- |
 | **Machine power loss / kernel panic mid-slice** | Uncommitted partial files stay on dead machine; `refs/factory/workers/<dead>` expires after 6m (+60s skew buffer). Peer machine CAS-claims `job-<N>`, checks out `refs/factory/checkpoints/job-<N>` (last completed slice), and resumes at `completed_slices + 1`. |
 | **Wi-Fi drop > 6m while `agy` is still running (Split-Brain)** | Disconnected machine fails worker heartbeat renewals; at 5m30s (`expires_at - 30s`) local `LeaseLostError` kills child `agy` process group. Even if process hung, `--force-with-lease` rejects any stale checkpoint push because peer incremented `fencing_token`. |
-| **Two machines merge to `keepfor-cloud` simultaneously** | Both enter `_execute_staging_train_batch` and contend on `refs/factory/locks/staging` via `--force-with-lease`. Winner runs merge + deploy + Playwright QA; loser waits/polls until lock releases or expires, then syncs against the new `origin/main` tip and runs its own train. |
+| **Two machines merge to `example-app` simultaneously** | Both enter `_execute_staging_train_batch` and contend on `refs/factory/locks/staging` via `--force-with-lease`. Winner runs merge + deploy + Playwright QA; loser waits/polls until lock releases or expires, then syncs against the new `origin/main` tip and runs its own train. |
 | **`factory halt` issued while `deploy_to_staging` is mid-flight** | Default `factory halt` lets the active `deploy_to_staging` / `rollback_staging` subprocess finish atomically so staging Workers are never left half-deployed, then halts before browser QA or next stage. `factory halt --force` kills immediately. |
 | **LLM 429 burst across 3 machines simultaneously** | Each affected job catches `QuotaExhaustedError`, checkpoints without incrementing `round`, releases lease, and CAS-merges cooldown into `refs/factory/quota`. Fleet idles until `cooldown_until`, then resumes smoothly. |
 

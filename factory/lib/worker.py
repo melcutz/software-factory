@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from factory.lib.config import load_config
+from factory.lib.config import expand_path_prepend, load_config
 from factory.lib.git_ops import GitHubClient
 from factory.lib.git_state import SKEW_MARGIN_SEC, TERMINAL_STAGES, GitStateStore
 import factory.lib.governor as _governor
@@ -224,11 +224,19 @@ def select_next_candidate(
 
 def exec_job_command(repo_root: str, issue_number: int) -> int:
     """Execute one factory job inside an hc child terminal or local worker thread."""
-    local_bin = os.path.expanduser("~/.local/bin")
-    path_parts = os.environ.get("PATH", "").split(os.pathsep)
-    if os.path.isdir(local_bin) and local_bin not in path_parts:
-        os.environ["PATH"] = os.pathsep.join([local_bin, *(p for p in path_parts if p)])
     repo_root = os.path.abspath(repo_root)
+    try:
+        repo_cfg = load_config(os.path.join(repo_root, "factory"))
+    except Exception:
+        repo_cfg = None
+    path_parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    prepend = [
+        b
+        for b in expand_path_prepend(repo_cfg)
+        if os.path.isdir(b) and b not in path_parts
+    ]
+    if prepend:
+        os.environ["PATH"] = os.pathsep.join([*prepend, *path_parts])
     host_cfg = load_host_config()
     bridge = HerdrBridge.from_env()
     store = GitStateStore(repo_root, host_cfg.machine_id)
@@ -343,7 +351,7 @@ def run_worker(
             _write_heartbeats(len(active_local_jobs))
             last_hb = now
 
-        if last_prune is None or now - last_prune >= 86400.0:
+        if last_prune is None or now - last_prune >= 24 * 3600.0:
             for store in stores.values():
                 try:
                     store.prune_stale_refs()
@@ -389,18 +397,16 @@ def run_worker(
 
                 cfg = load_config(os.path.join(repo, "factory"))
                 try:
-                    from factory.lib.config import split_model_and_effort
+                    from factory.lib.config import model_chain
                     from factory.lib.governor import is_model_in_cooldown
 
                     quota_state = store.get_quota_state()
-                    models_cfg = cfg.get("models") or {}
                     in_cd = False
                     for role in ("intake", "spec_writer", "builder"):
-                        raw_spec = str(models_cfg.get(role) or "").strip()
-                        if not raw_spec:
+                        chain = model_chain(cfg, role)
+                        if not chain:
                             continue
-                        base_model = split_model_and_effort(raw_spec)[0].split(":", 1)[0].split()[0]
-                        if base_model and is_model_in_cooldown(quota_state, base_model)[0]:
+                        if all(is_model_in_cooldown(quota_state, m, config=cfg)[0] for m in chain):
                             in_cd = True
                             break
                     if in_cd:
