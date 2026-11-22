@@ -127,17 +127,8 @@ class GitStateStore:
         return res.stdout.decode("utf-8").strip()
 
     def _commit_tree(self, tree_sha: str, message: str, parent_sha: str | None = None) -> str:
-        args = ["commit-tree", tree_sha]
-        parent = (parent_sha or "").strip()
-        if parent and parent != ZERO_SHA:
-            chk = _run_git(self.repo_root, "cat-file", "-e", f"{parent}^{{commit}}", check=False)
-            if chk.returncode != 0:
-                _run_git(self.repo_root, "fetch", "--no-tags", "--quiet", self.remote, parent, check=False)
-                chk = _run_git(self.repo_root, "cat-file", "-e", f"{parent}^{{commit}}", check=False)
-            if chk.returncode == 0:
-                args.extend(["-p", parent])
-        args.extend(["-m", message])
-        res = self._git_raw(*args)
+        del parent_sha  # Snapshot refs use zero-parent orphan commits so history never grows unboundedly.
+        res = self._git_raw("commit-tree", tree_sha, "-m", message)
         return res.stdout.decode("utf-8").strip()
 
     def _ls_remote(self, pattern: str = "refs/factory/*") -> dict[str, str]:
@@ -561,6 +552,17 @@ class GitStateStore:
         except (ValueError, UnicodeDecodeError):
             return None
 
+    def get_remote_job(self, job_id: str) -> dict | None:
+        """Fetch and return a single remote job record from refs/factory/jobs/<job_id>."""
+        ref = f"refs/factory/jobs/{job_id}"
+        remote_sha = self._ls_remote_one(ref)
+        if not remote_sha:
+            return None
+        commit_sha = self._fetch_ref(ref, expected_sha=remote_sha)
+        if not commit_sha:
+            return None
+        return self._read_json_from_commit(commit_sha, "job.json")
+
     def list_remote_jobs(self) -> list[dict]:
         refs = self._ls_remote("refs/factory/jobs/*")
         jobs: list[dict] = []
@@ -631,6 +633,9 @@ class GitStateStore:
     # Distributed staging lock
     # ------------------------------------------------------------------
 
+    def _staging_holder_id(self) -> str:
+        return f"{self.machine_id}:{os.getpid()}:{threading.get_ident()}:{id(self)}"
+
     def acquire_staging_lock(
         self,
         job_ids: list[str],
@@ -640,19 +645,26 @@ class GitStateStore:
     ) -> bool:
         ts = time.time() if now_ts is None else now_ts
         ref = "refs/factory/locks/staging"
+        my_holder_id = self._staging_holder_id()
         old_sha = self._ls_remote_one(ref)
         if old_sha:
-            fetched = self._fetch_ref(ref)
+            fetched = self._fetch_ref(ref, expected_sha=old_sha)
             if fetched:
                 old_sha = fetched
                 lock_data = self._read_json_from_commit(old_sha, "lock.json") or {}
+                holder_id = str(lock_data.get("holder_id") or "")
                 holder = lock_data.get("holder")
                 expires_at = float(lock_data.get("expires_at_ts") or 0.0)
-                if holder and holder != self.machine_id and ts <= expires_at:
+                is_other = (
+                    (bool(holder_id) and holder_id != my_holder_id)
+                    or (not holder_id and bool(holder) and holder != self.machine_id)
+                )
+                if is_other and ts <= expires_at:
                     return False
 
         payload = {
             "holder": self.machine_id,
+            "holder_id": my_holder_id,
             "hostname": self.hostname,
             "job_ids": list(job_ids),
             "acquired_at": _iso(ts),
@@ -663,14 +675,20 @@ class GitStateStore:
 
     def release_staging_lock(self) -> None:
         ref = "refs/factory/locks/staging"
+        my_holder_id = self._staging_holder_id()
         old_sha = self._ls_remote_one(ref)
         if not old_sha:
             return
-        fetched = self._fetch_ref(ref)
+        fetched = self._fetch_ref(ref, expected_sha=old_sha)
         if fetched:
             lock_data = self._read_json_from_commit(fetched, "lock.json") or {}
+            holder_id = str(lock_data.get("holder_id") or "")
             holder = lock_data.get("holder")
-            if holder and holder != self.machine_id:
+            is_other = (
+                (bool(holder_id) and holder_id != my_holder_id)
+                or (not holder_id and bool(holder) and holder != self.machine_id)
+            )
+            if is_other:
                 return
         self._delete_remote_ref(ref)
 

@@ -230,7 +230,18 @@ def _extract_job_pitfalls(jdir: str) -> list[str]:
         if data.get("verdict") == "PASS":
             continue
         for item in data.get("findings") or []:
-            msg = item.get("message") if isinstance(item, dict) else str(item)
+            if isinstance(item, dict):
+                raw_msg = item.get("issue") or item.get("message") or ""
+                loc = str(item.get("file") or "").strip()
+                line_no = item.get("line")
+                if loc and line_no:
+                    msg = f"{loc}:{line_no}: {raw_msg}" if raw_msg else ""
+                elif loc and raw_msg:
+                    msg = f"{loc}: {raw_msg}"
+                else:
+                    msg = str(raw_msg)
+            else:
+                msg = str(item)
             clean = " ".join(str(msg or "").split()).strip()
             if clean:
                 bullets.append(clean[:180])
@@ -315,9 +326,9 @@ def learn_from_jobs(repo_root: str, job_id: str | None = None) -> list[str]:
                 existing_bullets.append(bullet)
 
         if not job.get("learned"):
-            job["learned"] = True
-            with open(jfile, "w", encoding="utf-8") as f:
-                json.dump(job, f, indent=2)
+            from factory.lib.state import update_job
+
+            update_job(jobs_dir, jid, learned=True)
 
     if newly_added:
         os.makedirs(fdir, exist_ok=True)

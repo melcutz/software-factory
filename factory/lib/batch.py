@@ -768,6 +768,8 @@ def execute_batch(
     repo_map: str = "",
 ) -> BatchExecutionOutcome:
     """Execute one BatchSpec in a single worktree and hot builder session."""
+    from factory.lib.pipeline import check_halt_or_lease
+
     repo_root = os.path.abspath(repo_root)
     factory_dir = os.path.join(repo_root, "factory")
     jobs_dir = os.path.join(factory_dir, "jobs")
@@ -776,6 +778,90 @@ def execute_batch(
 
     if not repo_map:
         repo_map = generate_repo_map(repo_root)
+
+    # Check fleet/local halt before claiming leases
+    from factory.lib.pipeline import JobHaltedError, is_local_halted
+
+    if is_local_halted():
+        raise JobHaltedError("local halt.signal active")
+    if state_store is not None:
+        ctrl = state_store.get_control_state()
+        if ctrl.get("halted"):
+            raise JobHaltedError(f"fleet halted: {ctrl.get('reason') or 'operator halt'}")
+
+    # Claim distributed leases for batch issues when state_store is active; drop already-leased issues & dependents.
+    claimed_items: list[TriageItem] = []
+    claimed_ids: list[str] = []
+    skipped_unleased: set[int] = set()
+    for it in batch.issues:
+        job_id = f"job-{it.issue}"
+        if any(d in skipped_unleased for d in batch.hard_deps.get(it.issue, set())):
+            skipped_unleased.add(it.issue)
+            continue
+        if state_store is not None:
+            try:
+                cur_job = load_job(jobs_dir, job_id)
+            except FileNotFoundError:
+                cur_job = {"id": job_id, "issue": it.issue, "stage": "queued", "last_worker_id": state_store.machine_id}
+            ok_claim, _ = state_store.claim_job_lease(job_id, cur_job)
+            if not ok_claim:
+                skipped_unleased.add(it.issue)
+                continue
+            claimed_ids.append(job_id)
+        claimed_items.append(it)
+
+    if not claimed_items:
+        return BatchExecutionOutcome(batch.id, [], [], [])
+
+    active_batch = BatchSpec(
+        id=batch.id,
+        issues=claimed_items,
+        solo_only=batch.solo_only,
+        total_weight=sum(it.complexity_weight for it in claimed_items),
+        predicted_files=list(batch.predicted_files),
+        hard_deps=batch.hard_deps,
+    )
+
+    try:
+        return _execute_claimed_batch(
+            repo_root,
+            factory_dir,
+            jobs_dir,
+            base_branch,
+            active_batch,
+            config=config,
+            gh=gh,
+            board=board,
+            state_store=state_store,
+            runner=runner,
+            repo_map=repo_map,
+        )
+    finally:
+        if state_store is not None:
+            for jid in claimed_ids:
+                try:
+                    jdir = os.path.join(jobs_dir, jid)
+                    jdata = load_job(jobs_dir, jid)
+                    state_store.checkpoint_job(jid, jdir, jdata, release_lease=True)
+                except Exception:
+                    pass
+
+
+def _execute_claimed_batch(
+    repo_root: str,
+    factory_dir: str,
+    jobs_dir: str,
+    base_branch: str,
+    batch: BatchSpec,
+    *,
+    config: dict,
+    gh: GitHubClient,
+    board: ProjectBoardSync | None,
+    state_store: GitStateStore | None,
+    runner: Callable[..., tuple[dict, dict, float]],
+    repo_map: str,
+) -> BatchExecutionOutcome:
+    from factory.lib.pipeline import check_halt_or_lease
 
     batch_branch = f"factory/{batch.id}"
     wt, batch_branch = ensure_worktree(repo_root, batch.id, base_branch, branch=batch_branch)
@@ -882,10 +968,11 @@ def execute_batch(
             feedback = f"Gate failed:\n{gate_out[-1200:]}"
 
         if rnd < max_rounds:
+            check_halt_or_lease(repo_root, f"job-{surviving[0].issue}", state_store)
             for it in surviving:
                 advance_stage(jobs_dir, f"job-{it.issue}", "build", last_error=feedback)
             fix_prompt = _build_batch_builder_prompt(batch, repo_map, fix_feedback=feedback)
-            _, fix_usage, fix_dur = run_agent_chain(
+            fix_payload, fix_usage, fix_dur = run_agent_chain(
                 factory_dir,
                 batch_job_dir,
                 wt,
@@ -903,6 +990,10 @@ def execute_batch(
                 log_name=f"batch-builder-round-{rnd + 1}",
             )
             _record_batch_usage(jobs_dir, surviving, fix_usage, fix_dur, builder_model, config)
+            for entry in (fix_payload.get("results") or []):
+                if isinstance(entry, dict) and entry.get("issue") is not None:
+                    reported_by_num[int(entry["issue"])] = entry
+            issue_commits = _collect_issue_commits(wt, base_branch, reported_by_num)
 
     if not (gate_ok and review_ok):
         if len(surviving) > 1 and not gate_ok:
@@ -988,10 +1079,10 @@ def execute_batch(
                 failed_issues.append(it.issue)
             remove_worktree(repo_root, wt)
             return BatchExecutionOutcome(batch.id, [], [], failed_issues)
+        check_halt_or_lease(repo_root, f"job-{surviving[0].issue}", state_store)
         push_branch(wt, batch_branch)
-        pr = gh.ensure_draft_pr(branch=batch_branch, base=base_branch, title=pr_title, body=pr_body, draft=False)
-        pr_num = int(pr["number"])
-        pr_url = str(pr.get("url") or "")
+        pr_num, pr_url = gh.ensure_draft_pr(wt, batch_branch, base_branch, pr_title, pr_body)
+        gh.mark_pr_ready(pr_num)
         for it in surviving:
             update_job(jobs_dir, f"job-{it.issue}", pr_number=pr_num, pr_url=pr_url)
 
@@ -1136,6 +1227,8 @@ def run_batch_factory(
                 except QuotaExhaustedError:
                     raise
                 except Exception as exc:
+                    if type(exc).__name__ in {"JobHaltedError", "LeaseLostError"}:
+                        raise
                     for it in by_id[bid].issues:
                         _escalate_issue(jobs_dir, it, str(exc), config, gh, board)
                         with unmerged_lock:

@@ -168,15 +168,18 @@ def load_repo_map(factory_dir: str) -> str:
         return f.read().strip()
 
 
-def _load_self_host_prompt_note(factory_dir: str) -> str:
-    cfg_path = os.path.join(factory_dir, "config.json")
-    if not os.path.isfile(cfg_path):
-        return ""
-    try:
-        with open(cfg_path, encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, ValueError):
-        return ""
+def _load_self_host_prompt_note(factory_dir: str, config: dict | None = None) -> str:
+    raw: dict | None = config if isinstance(config, dict) else None
+    if raw is None:
+        cfg_path = os.path.join(factory_dir, "config.json")
+        if not os.path.isfile(cfg_path):
+            return ""
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            raw = loaded if isinstance(loaded, dict) else None
+        except (OSError, ValueError):
+            return ""
     if not isinstance(raw, dict) or not raw.get("allow_self_host"):
         return ""
     prot = raw.get("protected_paths")
@@ -209,12 +212,14 @@ def build_agent_prompt(
     stage: str,
     agent_name: str,
     task_prompt: str,
+    *,
+    config: dict | None = None,
 ) -> str:
     """Assemble headless subagent prompt with optional REPO_MAP and PITFALLS context."""
     instructions = load_agent_instructions(factory_dir, agent_name)
     parts = [f"{SUBAGENT_PREAMBLE}\n{instructions}"]
     if stage != "plan":
-        self_host_note = _load_self_host_prompt_note(factory_dir)
+        self_host_note = _load_self_host_prompt_note(factory_dir, config=config)
         if self_host_note:
             parts.append(self_host_note)
         repo_map = load_repo_map(factory_dir)
@@ -526,9 +531,17 @@ def _invoke_agy_process(
     return returncode, "".join(stdout_chunks), "".join(stderr_chunks), killed_reason
 
 
-def _resolve_idle_bg_grace_sec(factory_dir: str, explicit: float | None) -> float:
+def _resolve_idle_bg_grace_sec(
+    factory_dir: str,
+    explicit: float | None,
+    config: dict | None = None,
+) -> float:
     if explicit is not None:
         return float(explicit)
+    if isinstance(config, dict):
+        val = config.get("idle_bg_grace_sec")
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 5:
+            return float(val)
     cfg_path = os.path.join(factory_dir, "config.json")
     if os.path.isfile(cfg_path):
         try:
@@ -724,13 +737,13 @@ def run_agent(
     from factory.lib.config import resolve_model_tier
 
     runtime_cfg = _load_runtime_config(factory_dir, config)
-    effective_idle_grace = _resolve_idle_bg_grace_sec(factory_dir, idle_bg_grace_sec)
+    effective_idle_grace = _resolve_idle_bg_grace_sec(factory_dir, idle_bg_grace_sec, config=runtime_cfg)
     provider, _ = classify_model_provider(model)
     tier = resolve_model_tier(model, runtime_cfg)
     is_opencode = provider in {"opencode", "opencode-go", "openrouter"}
     is_gpu = provider == "gpu"
 
-    full_prompt = "" if is_gpu else build_agent_prompt(factory_dir, stage, agent_name, task_prompt)
+    full_prompt = "" if is_gpu else build_agent_prompt(factory_dir, stage, agent_name, task_prompt, config=runtime_cfg)
 
     logs_dir = os.path.join(job_dir, "logs")
     os.makedirs(logs_dir, exist_ok=True)
@@ -774,6 +787,7 @@ def run_agent(
                         idle_grace_sec=effective_idle_grace,
                         abort_check=_wrapped_abort_check if abort_check is not None else None,
                         config=runtime_cfg,
+                        log_path=os.path.join(logs_dir, f"{effective_log}.json"),
                     )
                 elif is_gpu:
                     from factory.lib.gpu_runner import run_gpu_stage
@@ -833,8 +847,22 @@ def run_agent(
             if not isinstance(raw_structured, dict):
                 raise AgentExecutionError(f"{provider} envelope missing dict structured_output")
 
-            with open(os.path.join(logs_dir, f"{effective_log}.json"), "w", encoding="utf-8") as f:
-                json.dump(envelope, f, indent=2)
+            log_out_path = os.path.join(logs_dir, f"{effective_log}.json")
+            merged_log = dict(envelope)
+            if os.path.isfile(log_out_path):
+                try:
+                    with open(log_out_path, encoding="utf-8") as rf:
+                        prev_log = json.load(rf)
+                    if isinstance(prev_log, dict):
+                        merged_log = {**prev_log, **envelope}
+                except (OSError, ValueError):
+                    pass
+            merged_log.setdefault("agent", agent_name)
+            merged_log.setdefault("stage", stage)
+            merged_log.setdefault("model", model)
+            merged_log.setdefault("provider", provider)
+            with open(log_out_path, "w", encoding="utf-8") as f:
+                json.dump(merged_log, f, indent=2)
 
             validated = validate_stage_output(stage, raw_structured)
             usage = dict(envelope.get("usage")) if isinstance(envelope.get("usage"), dict) else {}
@@ -919,7 +947,7 @@ def run_agent_chain(
     cooldown_remainings: list[float] = []
 
     for idx, model_spec in enumerate(chain):
-        if len(chain) > 1 and isinstance(quota_state, dict) and quota_state.get("models"):
+        if isinstance(quota_state, dict) and quota_state.get("models"):
             in_cd, rem = is_model_in_cooldown(quota_state, model_spec, config=runtime_cfg)
             if in_cd:
                 cooldown_remainings.append(rem)

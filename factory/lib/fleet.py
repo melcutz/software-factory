@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -123,7 +124,7 @@ def _run_on_machine(machine: dict, cmd: list[str], *, bg: bool = False, name: st
 
     target = machine.get("target") or machine["name"]
     res = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", target, " ".join(cmd)],
+        ["ssh", "-o", "BatchMode=yes", target, shlex.join(cmd)],
         capture_output=True,
         text=True,
         timeout=15.0,
@@ -139,10 +140,10 @@ def fleet_status() -> list[dict]:
     return machines
 
 
-def _factory_shell_cmd(*args: str, config: dict | None = None) -> list[str]:
+def _factory_shell_cmd(*args: str, config: dict | None = None, remote: bool = False) -> list[str]:
     from factory.lib.config import _user_config_path, expand_path_prepend
 
-    quoted = " ".join(args)
+    quoted = shlex.join(args)
     cfg = config
     if cfg is None:
         user_cfg_path = _user_config_path()
@@ -154,7 +155,22 @@ def _factory_shell_cmd(*args: str, config: dict | None = None) -> list[str]:
                     cfg = loaded
             except (OSError, ValueError):
                 pass
-    prepend = expand_path_prepend(cfg)
+    if remote:
+        raw_prepend = (cfg or {}).get("path_prepend") if isinstance(cfg, dict) else None
+        prepend: list[str] = []
+        if isinstance(raw_prepend, list):
+            for item in raw_prepend:
+                if not isinstance(item, str) or not item.strip():
+                    continue
+                s = item.strip()
+                if s == "~":
+                    s = "$HOME"
+                elif s.startswith("~/"):
+                    s = "$HOME/" + s[2:]
+                if s not in prepend:
+                    prepend.append(s)
+    else:
+        prepend = expand_path_prepend(cfg)
     if prepend:
         joined = ":".join(prepend)
         return ["sh", "-lc", f'export PATH="{joined}:$PATH"; exec factory {quoted}']
@@ -169,7 +185,7 @@ def fleet_wake(machine: str | None = None) -> list[tuple[str, int, str]]:
     for m in machines:
         rc, out = _run_on_machine(
             m,
-            _factory_shell_cmd("worker", "--all"),
+            _factory_shell_cmd("worker", "--all", remote=m.get("via") != "local"),
             bg=True,
             name=sanitize_hc_name(f"factory-worker-{m['name']}"),
         )
@@ -184,10 +200,11 @@ def fleet_pause(machine: str | None = None, *, drain: bool = False) -> list[tupl
     if not machine:
         set_host_paused(True, drain=drain)
         return [("local", 0, "paused")]
-    cmd = _factory_shell_cmd("pause", "--drain") if drain else _factory_shell_cmd("pause")
     results: list[tuple[str, int, str]] = []
     for m in discover_machines():
         if m["name"] == machine:
+            remote = m.get("via") != "local"
+            cmd = _factory_shell_cmd("pause", "--drain", remote=remote) if drain else _factory_shell_cmd("pause", remote=remote)
             rc, out = _run_on_machine(m, cmd)
             results.append((m["name"], rc, out))
     return results
@@ -200,7 +217,7 @@ def fleet_unpause(machine: str | None = None) -> list[tuple[str, int, str]]:
     results: list[tuple[str, int, str]] = []
     for m in discover_machines():
         if m["name"] == machine:
-            rc, out = _run_on_machine(m, _factory_shell_cmd("unpause"))
+            rc, out = _run_on_machine(m, _factory_shell_cmd("unpause", remote=m.get("via") != "local"))
             results.append((m["name"], rc, out))
     return results
 

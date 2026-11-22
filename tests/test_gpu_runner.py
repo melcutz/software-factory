@@ -11,7 +11,6 @@ from factory.lib.agy_runner import run_agent
 from factory.lib.gpu_runner import (
     GpuAbstain,
     McpStreamableClient,
-    classify,
     clear_gpu_availability_cache,
     decide,
     gpu_available,
@@ -157,11 +156,16 @@ def _clean_gpu_cache():
 @pytest.mark.parametrize("sse_mode", [False, True])
 def test_mcp_client_sse_and_plain_json_responses(sse_mode: bool):
     state = _FakeMcpState(sse_mode=sse_mode)
-    state.classify_payload = {"kept": [{"id": 1, "category": "bug"}], "dropped": []}
+    state.decide_payload = {
+        "decision": "ACCEPT",
+        "confidence": 0.9,
+        "reasoning": "clear fix",
+        "escalate": False,
+    }
     server, url = _start_fake_mcp_server(state)
     try:
-        out = classify(url, [{"id": 1, "text": "fix crash"}], ["bug", "docs"])
-        assert out == {"kept": [{"id": 1, "category": "bug"}], "dropped": []}
+        out = decide(url, "fix crash", [{"id": "accept", "question": "Accept?"}])
+        assert out["decision"] == "ACCEPT"
         assert state.seen_methods == ["initialize", "notifications/initialized", "tools/call"]
         assert state.seen_session_headers[0] is None
         assert state.seen_session_headers[1] == "mcp-test-session-42"

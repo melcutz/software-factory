@@ -1,4 +1,5 @@
 import subprocess
+import time
 
 import pytest
 
@@ -275,7 +276,9 @@ def test_pipeline_clears_quota_cooldown_on_successful_agent_call(tmp_path, monke
 
     store = GitStateStore(str(repo), "m0")
     store.write_worker_heartbeat(1, 2, False)
-    store.record_quota_cooldown("gemini-4-argon", "prior 429", retry_after_sec=60)
+    # Record an expired cooldown for gemini-4-argon (stale entry still in refs/factory/quota)
+    # and an active cooldown for gemini-4-hydrogen.
+    store.record_quota_cooldown("gemini-4-argon", "prior 429", retry_after_sec=60, now_ts=time.time() - 300)
     store.record_quota_cooldown("gemini-4-hydrogen", "other model 429", retry_after_sec=60)
     assert "gemini-4-argon" in store.get_quota_state()["models"]
 

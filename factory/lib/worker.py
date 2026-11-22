@@ -143,6 +143,7 @@ def _collect_active_local_jobs(
     active_threads: list[tuple[str, int, threading.Thread]],
     *,
     now_ts: float | None = None,
+    snapshots: dict[str, tuple[list[dict], dict[str, dict]]] | None = None,
 ) -> set[tuple[str, str]]:
     ts = time.time() if now_ts is None else now_ts
     active: set[tuple[str, str]] = {(r, f"job-{i}") for (r, i, t) in active_threads if t.is_alive()}
@@ -152,6 +153,8 @@ def _collect_active_local_jobs(
             workers = store.list_worker_heartbeats()
         except Exception:
             continue
+        if snapshots is not None:
+            snapshots[repo] = (remote_jobs, workers)
         for j in remote_jobs:
             if _is_active_leased_job(j, workers, ts) and (j.get("lease") or {}).get("worker_id") == machine_id:
                 active.add(_job_key(repo, j))
@@ -342,10 +345,47 @@ def run_worker(
                 }
             except Exception:
                 pass
-        active_local_jobs = _collect_active_local_jobs(host_cfg.machine_id, stores, active_threads)
+        repo_snapshots: dict[str, tuple[list[dict], dict[str, dict]]] = {}
+        active_local_jobs = _collect_active_local_jobs(
+            host_cfg.machine_id,
+            stores,
+            active_threads,
+            snapshots=repo_snapshots,
+        )
         for repo_key, issue_key in active_hc_terminals:
             active_local_jobs.add((repo_key, f"job-{issue_key}"))
         now = time.monotonic()
+
+        def _spawn_job(repo_path: str, issue_num: int) -> None:
+            job_id = f"job-{issue_num}"
+            active_local_jobs.add((repo_path, job_id))
+            bridge.emit_status("working")
+            name = f"{os.path.basename(repo_path)}-{issue_num}"
+            if bridge.enabled:
+                factory_bin = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                    "bin",
+                    "factory",
+                )
+                exec_cmd = (
+                    [factory_bin]
+                    if os.path.isfile(factory_bin) and os.access(factory_bin, os.X_OK)
+                    else [sys.executable, "-m", "factory.cli"]
+                )
+                tid = bridge.spawn_job_terminal(
+                    name,
+                    repo_path,
+                    [*exec_cmd, "_exec-job", "--repo", repo_path, str(issue_num)],
+                )
+                if tid:
+                    from factory.lib.herdr_bridge import sanitize_hc_name
+
+                    active_hc_terminals[(repo_path, issue_num)] = sanitize_hc_name(name)
+                    return
+
+            t = threading.Thread(target=exec_job_command, args=(repo_path, issue_num), daemon=True)
+            t.start()
+            active_threads.append((repo_path, issue_num, t))
 
         if last_hb is None or now - last_hb >= 120.0:
             _write_heartbeats(len(active_local_jobs))
@@ -391,7 +431,11 @@ def run_worker(
                 try:
                     from factory.lib.pipeline import reconcile_ready_jobs
 
-                    reconcile_ready_jobs(repo, state_store=store)
+                    reconcile_ready_jobs(
+                        repo,
+                        state_store=store,
+                        spawn_fn=lambda _r, inum: _spawn_job(repo, inum),
+                    )
                 except Exception:
                     pass
 
@@ -414,8 +458,11 @@ def run_worker(
                 except Exception:
                     pass
 
-                remote_jobs = store.list_remote_jobs()
-                workers = store.list_worker_heartbeats()
+                if repo in repo_snapshots:
+                    remote_jobs, workers = repo_snapshots[repo]
+                else:
+                    remote_jobs = store.list_remote_jobs()
+                    workers = store.list_worker_heartbeats()
                 now_ts = time.time()
                 for j in remote_jobs:
                     if _is_active_leased_job(j, workers, now_ts) and (j.get("lease") or {}).get("worker_id") == host_cfg.machine_id:
@@ -485,36 +532,9 @@ def run_worker(
                 if not ok:
                     continue
 
-                active_local_jobs.add((repo, job_id))
                 pacer.record_claim()
                 claimed_any = True
-                bridge.emit_status("working")
-                name = f"{os.path.basename(repo)}-{issue_num}"
-                if bridge.enabled:
-                    factory_bin = os.path.join(
-                        os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
-                        "bin",
-                        "factory",
-                    )
-                    exec_cmd = (
-                        [factory_bin]
-                        if os.path.isfile(factory_bin) and os.access(factory_bin, os.X_OK)
-                        else [sys.executable, "-m", "factory.cli"]
-                    )
-                    tid = bridge.spawn_job_terminal(
-                        name,
-                        repo,
-                        [*exec_cmd, "_exec-job", "--repo", repo, str(issue_num)],
-                    )
-                    if tid:
-                        from factory.lib.herdr_bridge import sanitize_hc_name
-
-                        active_hc_terminals[(repo, issue_num)] = sanitize_hc_name(name)
-                        continue
-
-                t = threading.Thread(target=exec_job_command, args=(repo, issue_num), daemon=True)
-                t.start()
-                active_threads.append((repo, issue_num, t))
+                _spawn_job(repo, issue_num)
             except Exception as exc:
                 print(f"[worker] warning: poll error for {repo}: {exc}", file=sys.stderr)
                 continue

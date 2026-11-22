@@ -18,8 +18,6 @@ DEFAULT_GPU_TOOLS: dict[str, str | None] = {
 _GPU_AVAIL_LOCK = threading.Lock()
 _GPU_AVAIL_CACHE: dict[tuple[str, str | None], tuple[float, bool]] = {}
 
-_RISK_LOW_RE = re.compile(r"\bRISK\s*:\s*low\b", re.IGNORECASE)
-_RISK_HIGH_MED_RE = re.compile(r"\bRISK\s*:\s*(?:medium|high)\b", re.IGNORECASE)
 _ISSUE_HEADER_RE = re.compile(r"(?m)^##\s+Issue\s+#\d+")
 
 
@@ -270,21 +268,6 @@ def decide(
     return McpStreamableClient(mcp_url, connect_timeout=5.0, call_timeout=timeout_sec).call_tool(
         tool_name or "decide",
         {"state": state, "decisions": decisions},
-    )
-
-
-def classify(
-    mcp_url: str,
-    items: list[dict],
-    allowed_categories: list[str],
-    *,
-    timeout_sec: float = 60.0,
-    tool_name: str = "classify",
-) -> dict:
-    """Call configured MCP classify tool."""
-    return McpStreamableClient(mcp_url, connect_timeout=5.0, call_timeout=timeout_sec).call_tool(
-        tool_name or "classify",
-        {"items": items, "allowed_categories": allowed_categories},
     )
 
 

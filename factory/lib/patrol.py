@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import time
 
+from factory.lib.config import load_config
 from factory.lib.git_ops import GitHubClient
 from factory.lib.state import list_jobs
 
@@ -17,6 +19,7 @@ def _load_patrol_hooks(repo_root: str):
     if spec is None or spec.loader is None:
         return None
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -71,6 +74,12 @@ def run_patrol(repo_root: str, *, dry_run: bool = False, gh: GitHubClient | None
     open_issues = client.list_open_issues()
     open_blobs = [f"{iss.get('title') or ''}\n{iss.get('body') or ''}" for iss in open_issues]
 
+    try:
+        cfg = load_config(os.path.join(repo_root, "factory"))
+        queue_label = str((cfg.get("labels") or {}).get("queue") or "factory")
+    except Exception:
+        queue_label = "factory"
+
     actions: list[dict] = []
     for f in findings:
         fp = str(f["fingerprint"]).strip()
@@ -80,7 +89,7 @@ def run_patrol(repo_root: str, *, dry_run: bool = False, gh: GitHubClient | None
         title = str(f["title"]).strip()
         body = f"{str(f.get('body') or '').strip()}\n\n{marker}".strip()
         if not dry_run:
-            created = client.create_issue(title, body, labels=("factory",))
+            created = client.create_issue(title, body, labels=(queue_label,))
             actions.append({"fingerprint": fp, "title": title, "created": True, "url": created.get("url", "")})
         else:
             actions.append({"fingerprint": fp, "title": title, "created": False})

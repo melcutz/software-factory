@@ -609,13 +609,15 @@ class CliHelpTests(unittest.TestCase):
             }
             fake_git = MagicMock(returncode=0, stdout="https://example.com/repo.git\n", stderr="")
             fake_store = MagicMock()
-            fake_store.list_remote_jobs.return_value = [remote_job]
+            fake_store.get_remote_job.return_value = remote_job
 
             buf = io.StringIO()
             with patch("factory.cli._run_git", return_value=fake_git), patch("factory.cli.GitStateStore", return_value=fake_store):
                 with contextlib.redirect_stdout(buf):
                     rc = cli.main(["logs", "--repo", repo, "job-77"])
             self.assertEqual(rc, 0)
+            fake_store.get_remote_job.assert_called_once_with("job-77")
+            fake_store.list_remote_jobs.assert_not_called()
             out = buf.getvalue()
             self.assertIn("Stage: needs-human | Round: 3 | Worker: host-a", out)
             self.assertIn("Last error: Staging QA failed 3/3 rounds", out)

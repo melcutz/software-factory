@@ -285,8 +285,9 @@ def test_execute_batch_happy_path_three_issues_non_squash_and_proportional_metri
 
     batch = BatchSpec(id="batch-1", issues=items, solo_only=False, total_weight=6, predicted_files=["f1.py", "f2.py", "f3.py"])
 
-    gh = MagicMock()
-    gh.ensure_draft_pr.return_value = {"number": 50, "url": "https://github.com/o/r/pull/50"}
+    from factory.lib.git_ops import GitHubClient
+    gh = MagicMock(spec=GitHubClient)
+    gh.ensure_draft_pr.return_value = (50, "https://github.com/o/r/pull/50")
 
     def fake_agent(factory_dir, job_dir, wt, stage, agent_name, model, prompt, schema, timeout_sec, **kwargs):
         if stage == "batch_build":
@@ -314,8 +315,9 @@ def test_execute_batch_happy_path_three_issues_non_squash_and_proportional_metri
     assert outcome.failed_issues == []
     # Multi-issue batch overrides "squash" -> "merge" to preserve per-issue commits.
     gh.merge_pr.assert_called_once_with(50, "merge")
-    pr_kwargs = gh.ensure_draft_pr.call_args.kwargs
-    assert "Closes #1" in pr_kwargs["body"] and "Closes #2" in pr_kwargs["body"] and "Closes #3" in pr_kwargs["body"]
+    pr_args = gh.ensure_draft_pr.call_args.args
+    assert "Closes #1" in pr_args[4] and "Closes #2" in pr_args[4] and "Closes #3" in pr_args[4]
+    gh.mark_pr_ready.assert_called_once_with(50)
     assert not (repo / ".worktrees" / "batch-1").exists()
 
     j1 = load_job(jobs_dir, "job-1")
@@ -338,8 +340,9 @@ def test_execute_batch_handles_blocked_and_skipped_dep_mid_batch(tmp_path):
     for it in items:
         enqueue_job(jobs_dir, {"number": it.issue, "title": it.title, "body": it.body, "url": it.url}, max_rounds=3)
     batch = BatchSpec(id="batch-1", issues=items, solo_only=False, total_weight=3, predicted_files=["f1.py", "f2.py", "f3.py"], hard_deps={1: set(), 2: set(), 3: {2}})
-    gh = MagicMock()
-    gh.ensure_draft_pr.return_value = {"number": 51, "url": "https://github.com/o/r/pull/51"}
+    from factory.lib.git_ops import GitHubClient
+    gh = MagicMock(spec=GitHubClient)
+    gh.ensure_draft_pr.return_value = (51, "https://github.com/o/r/pull/51")
 
     def fake_agent(factory_dir, job_dir, wt, stage, agent_name, model, prompt, schema, timeout_sec, **kwargs):
         if stage == "batch_build":
@@ -410,8 +413,9 @@ def test_salvage_passing_commits_drops_broken_commit_and_ships_healthy_subset(tm
     for it in items:
         enqueue_job(jobs_dir, {"number": it.issue, "title": it.title, "body": it.body, "url": it.url}, max_rounds=1)
     batch = BatchSpec(id="batch-1", issues=items, solo_only=False, total_weight=3, predicted_files=["f1.py", "FAIL_GATE", "f3.py"])
-    gh = MagicMock()
-    gh.ensure_draft_pr.return_value = {"number": 52, "url": "https://github.com/o/r/pull/52"}
+    from factory.lib.git_ops import GitHubClient
+    gh = MagicMock(spec=GitHubClient)
+    gh.ensure_draft_pr.return_value = (52, "https://github.com/o/r/pull/52")
 
     def fake_agent(factory_dir, job_dir, wt, stage, agent_name, model, prompt, schema, timeout_sec, **kwargs):
         if stage == "batch_build":
@@ -455,8 +459,9 @@ def test_run_batch_factory_skips_downstream_dependent_of_failed_parent(tmp_path)
         {"number": 3, "title": "Child of 2", "body": "Depends on #2", "url": "https://x/3"},
         {"number": 4, "title": "Child of 1", "body": "Depends on #1", "url": "https://x/4"},
     ]
-    gh = MagicMock()
-    gh.ensure_draft_pr.return_value = {"number": 60, "url": "https://github.com/o/r/pull/60"}
+    from factory.lib.git_ops import GitHubClient
+    gh = MagicMock(spec=GitHubClient)
+    gh.ensure_draft_pr.return_value = (60, "https://github.com/o/r/pull/60")
 
     def fake_agent(factory_dir, job_dir, wt, stage, agent_name, model, prompt, schema, timeout_sec, **kwargs):
         if stage == "batch_plan":

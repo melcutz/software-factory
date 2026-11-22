@@ -18,52 +18,6 @@ from factory.lib.config import expand_path_prepend
 from factory.lib.governor import quota_cooldown_for_model
 from factory.lib.schemas import validate_stage_output
 
-_FREE_ROUTES: dict[str, list[str]] = {
-    "lint": [
-        "openrouter/cohere/north-mini-code:free",
-        "openrouter/nvidia/nemotron-3.5-super-vl:free",
-        "opencode/deepseek-v4.1-flash-free",
-        "opencode/mimo-v2.6-flash-free",
-        "opencode/big-pickle",
-    ],
-    "ui": [
-        "openrouter/nvidia/nemotron-3.5-super-vl:free",
-        "openrouter/google/gemma-4-31b-it:free",
-        "opencode/nemotron-3.5-super-vl-free",
-        "opencode/deepseek-v4.1-flash-free",
-        "opencode/inkling-2-small-free",
-    ],
-    "longctx": [
-        "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
-        "openrouter/thinkingmachines/inkling-2-small:free",
-        "opencode/deepseek-v4.1-flash-free",
-        "opencode/longcat-2.5-free",
-        "opencode/hy4-flash-free",
-    ],
-    "tests": [
-        "openrouter/cohere/north-mini-code:free",
-        "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
-        "opencode/deepseek-v4.1-flash-free",
-        "opencode/nemotron-3.5-super-vl-free",
-        "opencode/flint-40b-free",
-    ],
-    "plan": [
-        "openrouter/thinkingmachines/inkling-2-small:free",
-        "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
-        "opencode/deepseek-v4.1-flash-free",
-        "opencode/hy4-flash-free",
-        "opencode/iceman-free",
-    ],
-    "default": [
-        "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
-        "openrouter/thinkingmachines/inkling-2-small:free",
-        "openrouter/cohere/north-mini-code:free",
-        "opencode/deepseek-v4.1-flash-free",
-        "opencode/mimo-v2.6-flash-free",
-        "opencode/beam-free",
-    ],
-}
-
 _OPENROUTER_LIMIT_RE = re.compile(
     r"(?:rate[ _-]?limit|\b429\b|free-models-per|limit exceeded|insufficient credits|quota)",
     re.IGNORECASE,
@@ -102,11 +56,6 @@ def resolve_opencode_bin(config: dict | None = None, path: str | None = None) ->
     if found:
         return found
     return "opencode"
-
-
-def route_free_models(task_kind: str = "default") -> list[str]:
-    """Return ordered free model fallback list (OpenRouter :free then Zen free) for task_kind."""
-    return list(_FREE_ROUTES.get(task_kind, _FREE_ROUTES["default"]))
 
 
 def build_opencode_prompt(full_prompt: str, schema: dict) -> str:
@@ -341,6 +290,8 @@ def _run_opencode_cmd(
     idle_grace_sec: float,
     abort_check: Callable[[], BaseException | None] | None,
     config: dict | None = None,
+    log_path: str | None = None,
+    stage: str = "",
 ) -> tuple[str, str | None, dict, float]:
     t0 = time.monotonic()
     returncode, stdout_text, stderr_text, killed_reason = _invoke_agy_process(
@@ -354,6 +305,27 @@ def _run_opencode_cmd(
         idle_output_timeout_sec=idle_grace_sec,
     )
     elapsed = round(time.monotonic() - t0, 3)
+
+    if log_path:
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "provider": "opencode",
+                        "stage": stage,
+                        "model": model,
+                        "returncode": returncode,
+                        "killed_reason": killed_reason,
+                        "duration_seconds": elapsed,
+                        "stdout": stdout_text,
+                        "stderr": stderr_text,
+                    },
+                    f,
+                    indent=2,
+                )
+        except OSError:
+            pass
 
     if killed_reason:
         raise AgentExecutionError(f"{killed_reason}: {(stderr_text or stdout_text)[:400]}")
@@ -383,6 +355,7 @@ def run_opencode_turn(
     idle_grace_sec: float = 600.0,
     abort_check: Callable[[], BaseException | None] | None = None,
     config: dict | None = None,
+    log_path: str | None = None,
 ) -> dict:
     """Run one opencode turn with JSONL parsing and at most 1 in-session validation re-ask."""
     oc_bin = resolve_opencode_bin(config=config, path=(extra_env or {}).get("PATH"))
@@ -398,6 +371,8 @@ def run_opencode_turn(
         idle_grace_sec=idle_grace_sec,
         abort_check=abort_check,
         config=config,
+        log_path=log_path,
+        stage=stage,
     )
 
     err_msg = ""
@@ -433,6 +408,9 @@ def run_opencode_turn(
         session_id,
         reask_prompt,
     ]
+    reask_log_path = (
+        log_path[:-5] + "-reask.json" if log_path and log_path.endswith(".json") else log_path
+    )
     text2, _, usage2, duration2 = _run_opencode_cmd(
         reask_cmd,
         worktree=worktree,
@@ -442,6 +420,8 @@ def run_opencode_turn(
         idle_grace_sec=idle_grace_sec,
         abort_check=abort_check,
         config=config,
+        log_path=reask_log_path,
+        stage=stage,
     )
     total_usage = _merge_usage(usage, usage2)
     total_duration = round(duration + duration2, 3)

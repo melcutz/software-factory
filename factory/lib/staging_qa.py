@@ -401,30 +401,10 @@ def plan_staging_deploy(
 
 def revert_commit_on_base(deploy_wt: str, base_branch: str, merged_sha: str) -> str:
     """Revert merged_sha on origin/<base_branch> (handling merge and single-parent commits)."""
-    _run_git(deploy_wt, "fetch", "origin", base_branch)
-    _run_git(deploy_wt, "checkout", "--detach", f"origin/{base_branch}")
-    _run_git(deploy_wt, "reset", "--hard", f"origin/{base_branch}")
-    _run_git(deploy_wt, "clean", "-fd")
-
-    rev_line = _run_git(deploy_wt, "rev-list", "--parents", "-n", "1", merged_sha).stdout.strip()
-    tokens = rev_line.split()
-    parent_count = max(0, len(tokens) - 1)
-    cmd = (
-        ["revert", "--no-edit", "-m", "1", merged_sha]
-        if parent_count >= 2
-        else ["revert", "--no-edit", merged_sha]
-    )
-    res = _run_git(deploy_wt, *cmd, check=False)
-    if res.returncode != 0:
-        detail = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
-        _run_git(deploy_wt, "revert", "--abort", check=False)
-        if "nothing to commit" in detail.lower() or "working tree clean" in detail.lower():
-            return head_sha(deploy_wt)
-        raise subprocess.CalledProcessError(res.returncode, res.args, output=res.stdout, stderr=res.stderr)
-
-    revert_sha = head_sha(deploy_wt)
-    _run_git(deploy_wt, "push", "origin", f"HEAD:{base_branch}")
-    return revert_sha
+    ok, revert_map, detail = try_revert_commits_on_base(deploy_wt, base_branch, [merged_sha])
+    if not ok:
+        raise subprocess.CalledProcessError(1, ["git", "revert", merged_sha], output="", stderr=detail)
+    return revert_map.get(merged_sha.strip()) or head_sha(deploy_wt)
 
 
 def try_revert_commits_on_base(
@@ -582,9 +562,9 @@ def deploy_to_staging(
     if hooks is not None and hasattr(hooks, "deploy_to_staging"):
         return hooks.deploy_to_staging(deploy_wt, deploy_env, timeout_sec, extra_args=extra_args)
 
-    deploy_cmd = (staging_cfg or {}).get("deploy_cmd")
+    deploy_cmd = (staging_cfg or {}).get("deploy_command") or (staging_cfg or {}).get("deploy_cmd")
     if not deploy_cmd:
-        return True, "No staging deploy hook or deploy_cmd configured."
+        return True, "No staging deploy hook or deploy_command configured."
 
     cmd = deploy_cmd if isinstance(deploy_cmd, list) else ["bash", "-lc", str(deploy_cmd)]
     proc = subprocess.run(

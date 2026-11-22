@@ -442,10 +442,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "  specific `job_id`), extracts root-cause lessons, and appends new\n"
             "  guardrails to `factory/PITFALLS.md` for future agent runs."
         ),
-        epilog="Examples:\n  factory learn\n  factory learn job-12 --deterministic",
+        epilog="Examples:\n  factory learn\n  factory learn job-12",
     )
     p_learn.add_argument("job_id", nargs="?", help="Optional specific job ID (e.g. job-12)")
-    p_learn.add_argument("--deterministic", action="store_true", help="Use deterministic extraction without LLM")
 
     p_stats = sub.add_parser(
         "stats",
@@ -578,17 +577,26 @@ def main(argv: list[str] | None = None) -> int:
                     print("  ".join("-" * w for w in widths))
             return 0
         if args.action == "wake":
+            exit_code = 0
             for name, rc, out in fleet_wake(args.machine):
                 print(_format_fleet_result(name, rc, out))
-            return 0
+                if rc != 0:
+                    exit_code = 1
+            return exit_code
         if args.action == "pause":
+            exit_code = 0
             for name, rc, out in fleet_pause(args.machine, drain=args.drain):
                 print(_format_fleet_result(name, rc, out))
-            return 0
+                if rc != 0:
+                    exit_code = 1
+            return exit_code
         if args.action == "unpause":
+            exit_code = 0
             for name, rc, out in fleet_unpause(args.machine):
                 print(_format_fleet_result(name, rc, out))
-            return 0
+                if rc != 0:
+                    exit_code = 1
+            return exit_code
         if args.action == "update":
             exit_code = 0
             for name, rc, out in fleet_update(args.machine):
@@ -685,11 +693,24 @@ def main(argv: list[str] | None = None) -> int:
             if multi:
                 print("Error: job_id lookup requires a single repository.", file=sys.stderr)
                 return 1
-            jobs_dir = os.path.join(repos[0], "factory", "jobs")
+            repo = repos[0]
+            jobs_dir = os.path.join(repo, "factory", "jobs")
+            job: dict | None = None
             try:
                 job = load_job(jobs_dir, args.job_id)
-            except FileNotFoundError as exc:
-                print(f"Error: {exc}", file=sys.stderr)
+            except FileNotFoundError:
+                job = None
+            remote_check = _run_git(repo, "remote", "get-url", "origin", check=False)
+            if remote_check.returncode == 0:
+                try:
+                    rj = GitStateStore(repo, "status-viewer").get_remote_job(args.job_id)
+                    if rj is not None:
+                        if job is None or int(rj.get("round") or 0) >= int(job.get("round") or 0):
+                            job = rj
+                except Exception:
+                    pass
+            if job is None:
+                print(f"Error: Job {args.job_id} not found in {jobs_dir}", file=sys.stderr)
                 return 1
             print(json.dumps(job, indent=2))
             return 0
@@ -833,6 +854,9 @@ def main(argv: list[str] | None = None) -> int:
 
             if os.path.isdir(jobs_dir):
                 gh = GitHubClient(repo)
+                clean_store: GitStateStore | None = None
+                if _run_git(repo, "remote", "get-url", "origin", check=False).returncode == 0:
+                    clean_store = GitStateStore(repo, "cleaner")
                 for entry in sorted(os.listdir(jobs_dir)):
                     if entry == "_planner":
                         planner_dir = os.path.join(jobs_dir, entry)
@@ -862,10 +886,32 @@ def main(argv: list[str] | None = None) -> int:
                         continue
                     if str(iss.get("state") or "").upper() != "CLOSED":
                         continue
+                    remote_stage = ""
+                    if clean_store is not None:
+                        try:
+                            rj = clean_store.get_remote_job(entry)
+                            if isinstance(rj, dict):
+                                remote_stage = str(rj.get("stage") or "")
+                        except Exception:
+                            pass
+                    pr_merged = False
+                    if remote_stage == "merged":
+                        pr_merged = True
+                    elif job_data.get("pr_number"):
+                        try:
+                            pr_merged = bool(gh.get_pr_merge_commit(int(job_data["pr_number"])))
+                        except Exception:
+                            pr_merged = False
                     has_logs = os.path.isdir(os.path.join(jdir, "logs")) or any(
                         d.startswith("round-") for d in os.listdir(jdir)
                     )
-                    if stage == "queued" and not has_logs:
+                    if pr_merged:
+                        reclaimed.append(f"{entry} (mark merged, logs preserved)")
+                        terminal_ids.add(entry)
+                        if not args.dry_run:
+                            job_data["stage"] = "merged"
+                            _atomic_write_job(jobs_dir, entry, job_data)
+                    elif stage == "queued" and not has_logs:
                         reclaimed.append(jdir)
                         closed_stub_ids.add(entry)
                         if not args.dry_run:
@@ -1045,12 +1091,10 @@ def main(argv: list[str] | None = None) -> int:
         remote_check = _run_git(repo, "remote", "get-url", "origin", check=False)
         if remote_check.returncode == 0:
             try:
-                store = GitStateStore(repo, "logs-viewer")
-                for rj in store.list_remote_jobs():
-                    if rj.get("id") == args.job_id:
-                        if job is None or int(rj.get("round") or 0) >= int(job.get("round") or 0):
-                            job = rj
-                        break
+                rj = GitStateStore(repo, "logs-viewer").get_remote_job(args.job_id)
+                if rj is not None:
+                    if job is None or int(rj.get("round") or 0) >= int(job.get("round") or 0):
+                        job = rj
             except Exception:
                 pass
         if job is None:
@@ -1088,7 +1132,13 @@ def main(argv: list[str] | None = None) -> int:
                 if findings:
                     print(f"\n--- {os.path.basename(rev_path)} findings ---")
                     for item in findings:
-                        msg = item.get("message") if isinstance(item, dict) else str(item)
+                        if isinstance(item, dict):
+                            raw_msg = item.get("issue") or item.get("message") or ""
+                            loc = str(item.get("file") or "").strip()
+                            line_no = item.get("line")
+                            msg = f"{loc}:{line_no}: {raw_msg}" if (loc and line_no) else (f"{loc}: {raw_msg}" if loc else str(raw_msg))
+                        else:
+                            msg = str(item)
                         print(f"- {msg}")
             except (OSError, ValueError):
                 pass

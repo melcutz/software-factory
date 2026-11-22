@@ -13,7 +13,7 @@ from factory.lib.batch import BatchSpec, TriageItem, _record_batch_usage, _run_b
 from factory.lib.config import DEFAULT_CONFIG, model_chain, resolve_reviewers
 from factory.lib.git_state import LeaseLostError
 from factory.lib.gpu_runner import GpuAbstain
-from factory.lib.pipeline import JobHaltedError, _call_run_agent, _record_and_format_step, select_builder_chain, select_builder_model
+from factory.lib.pipeline import JobHaltedError, _call_run_agent, _record_and_format_step, select_builder_model
 from factory.lib.state import enqueue_job, load_job
 
 
@@ -302,7 +302,7 @@ class FallbackChainsTest(unittest.TestCase):
             ["opencode/deepseek-v4.1-flash-free", "gemini-4-hydrogen-medium"],
         )
         self.assertEqual(
-            select_builder_chain(cfg_chain, {"risk": "medium"}, attempt=1, is_fix_round=True),
+            select_builder_model(cfg_chain, {"risk": "medium"}, attempt=1, is_fix_round=True),
             ["opencode-go/kimi-k2.5", "gemini-4-argon-high"],
         )
         revs = resolve_reviewers(cfg_chain, "high", ["security"])

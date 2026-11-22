@@ -17,7 +17,6 @@ from factory.lib.opencode_runner import (
     extract_json_from_text,
     parse_opencode_jsonl,
     resolve_opencode_bin,
-    route_free_models,
 )
 from factory.lib.schemas import SCHEMAS
 
@@ -432,15 +431,6 @@ def test_detect_opencode_error_catches_error_json_event_and_stderr():
     assert isinstance(err_free, QuotaExhaustedError)
     assert err_free.bucket == "opencode-free"
     assert err_free.retry_after_sec == 3600
-
-
-def test_route_free_models_all_task_kinds():
-    for kind in ("lint", "ui", "longctx", "tests", "plan", "default", "unknown-kind"):
-        models = route_free_models(kind)
-        assert len(models) >= 5
-        assert models[0].startswith("openrouter/") and models[0].endswith(":free")
-        assert any(m.startswith("opencode/") for m in models)
-        assert all(m.endswith(":free") or m.endswith("-free") or m == "opencode/big-pickle" for m in models)
 
 
 def test_pipeline_default_config_chains_never_executes_real_opencode(tmp_path: Path, monkeypatch):

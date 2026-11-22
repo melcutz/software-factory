@@ -134,51 +134,6 @@ class HerdrBridge:
         except (OSError, subprocess.TimeoutExpired):
             return None
 
-    def is_terminal_live(self, terminal_id: str) -> bool:
-        """Return True if `terminal_id` (id or name) is live in `hc ls --json`."""
-        if not self.hc_bin or not terminal_id:
-            return False
-        try:
-            res = subprocess.run(
-                [self.hc_bin, "ls", "--json"],
-                capture_output=True,
-                text=True,
-                timeout=5.0,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        if res.returncode != 0:
-            return False
-        try:
-            data = json.loads(res.stdout or "{}")
-        except ValueError:
-            return False
-        return any(
-            isinstance(t, dict)
-            and t.get("state") == "live"
-            and (t.get("id") == terminal_id or t.get("name") == terminal_id)
-            for t in (data.get("terminals") or [])
-        )
-
-    def list_terminals(self) -> list[str]:
-        """Return lines from `hc ls`, or [] if hc is unavailable."""
-        if not self.hc_bin:
-            return []
-        try:
-            res = subprocess.run(
-                [self.hc_bin, "ls"],
-                capture_output=True,
-                text=True,
-                timeout=5.0,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return []
-        if res.returncode != 0:
-            return []
-        return [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
-
     def list_live_terminal_names(self) -> set[str]:
         """Return names of currently live `hc` terminals via `hc ls --json`, or empty set."""
         if not self.hc_bin:

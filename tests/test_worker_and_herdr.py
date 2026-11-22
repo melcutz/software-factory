@@ -1,4 +1,5 @@
 import io
+import subprocess
 import sys
 
 from factory.lib.herdr_bridge import HerdrBridge
@@ -155,10 +156,22 @@ def test_fleet_update_runs_git_pull_on_all_machines(tmp_path, monkeypatch):
     monkeypatch.setenv("HC_BIN_PATH", str(fake_hc))
     monkeypatch.setenv("FACTORY_HOST_DIR", str(tmp_path))
 
+    real_run = subprocess.run
+    local_cmds: list[list[str]] = []
+
+    def fake_fleet_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd and cmd[0] == str(fake_hc):
+            return real_run(cmd, *args, **kwargs)
+        local_cmds.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="Already up to date.\n", stderr="")
+
+    monkeypatch.setattr("factory.lib.fleet.subprocess.run", fake_fleet_run)
+
     from factory import cli
     assert cli.main(["fleet", "update"]) == 0
     lines = log_file.read_text().splitlines()
     assert any("run --on lenovo -- sh -lc" in ln and "pull --ff-only origin" in ln for ln in lines)
+    assert any(cmd[:2] == ["sh", "-lc"] and "pull --ff-only origin" in cmd[2] for cmd in local_cmds)
 
 
 def test_fleet_update_falls_back_to_factory_home(tmp_path, monkeypatch):
@@ -549,7 +562,7 @@ def test_herdr_bridge_labels_wait_and_live(tmp_path, monkeypatch):
     tid = bridge.spawn_job_terminal("job-1", str(tmp_path), ["echo", "hi"], labels={"issue": "1", "stage": "queued"})
     assert tid == "t99"
     assert bridge.set_labels({"stage": "build", "round": "1"}) is True
-    assert bridge.is_terminal_live("t99") is True
+    assert "job-1" in bridge.list_live_terminal_names()
     assert bridge.wait_terminal("t99", timeout_sec=5.0) == 0
 
     lines = hc_log.read_text(encoding="utf-8").splitlines()
