@@ -102,8 +102,8 @@ When `models.<role>` is a list (for example `["gpu:decision-model", "opencode/mi
 - **Python 3.10+** (standard library only; zero third-party runtime dependencies)
 - **Git** with a GitHub `origin` remote and `user.name` / `user.email` configured
 - **GitHub CLI (`gh >= 2.67`)** authenticated (`gh auth status`) with push and PR permissions *(older `gh` versions can hit deprecated Projects classic GraphQL errors on `gh pr edit`)*
-- **At least one coding agent CLI**:
-  - **Antigravity CLI (`agy`)** installed and authenticated on `PATH` (or configured via `providers.agy.bin` / `path_prepend`)
+- **Coding agent CLIs**:
+  - **Antigravity CLI (`agy`)** (required prerequisite) installed and authenticated on `PATH` (or configured via `providers.agy.bin` / `path_prepend`)
   - **Optional**: **OpenCode CLI (`opencode`)** if any role uses `opencode/*`, `openrouter/*`, or `opencode-go/*`
 - **Optional (for multi-machine desktop/SSH visibility)**: [`herdr-core` (`hc`) / `herdr-app`](https://herdr.dev/)
 
@@ -209,7 +209,7 @@ See [factory/config.example.json](factory/config.example.json) for a complete, a
 | `labels.queue` | `string` | `"factory"` | Issue label that queues an issue for the factory. |
 | `labels.needs_info` | `string` | `"factory:needs-info"` | Label applied when `intake` requests clarification. |
 | `labels.needs_human` | `string` | `"factory:needs-human"` | Label applied when a job escalates for human intervention. |
-| `labels.ship` | `string` | *(optional)* | Optional label used in `config.example.json` (`"factory:ship"`). |
+| `labels.ship` | `string` | `"factory:ship"` *(when polled)* | Optional PR label checked alongside GitHub approvals for human-approved `ready` PRs (`config.example.json` sets `"factory:ship"`). |
 
 #### `models`
 
