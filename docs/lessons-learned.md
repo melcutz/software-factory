@@ -4,7 +4,7 @@ If you use AI coding agents every day, you eventually hit the same bottleneck: *
 
 We wanted something different: **minimum human effort to reliably ship high-quality code for real, multi-file features.** You file a GitHub issue, slap a `factory` label on it, and walk away. Clean changes should spec, build, test, review, merge, deploy to staging, verify themselves in a real browser, and either stay live or automatically roll back if anything regresses. Ambiguous issues should pause and ask a concrete question instead of guessing.
 
-That goal became [`software-factory-agy`](https://github.com/melcutz/software-factory), an MIT-licensed autonomous software factory powered by Google Antigravity (`agy`), battle-tested on our product (`example-site` open core and `example-app`, a multi-tenant Cloudflare Python Workers + D1 SaaS with 3,260+ automated tests).
+That goal became [`software-factory`](https://github.com/melcutz/software-factory) (formerly `software-factory-agy`), an MIT-licensed autonomous software factory originally powered by Google Antigravity (`agy`), battle-tested on our product (`example-site` open core and `example-app`, a multi-tenant Cloudflare Python Workers + D1 SaaS with 3,260+ automated tests).
 
 What surprised us most was **where the time and failures actually lived.** We expected to spend most of our effort tuning prompts and waiting on LLMs. Instead:
 
@@ -255,4 +255,4 @@ If you're building an autonomous coding pipeline, here is the checklist we wish 
 7. **Schedule with a dependency DAG** (`planner.py` + `TopologicalSorter`) before turning concurrency above `1`.
 8. **Verify OS-level PID liveness (`os.kill(pid, 0)`)** in `factory status` and supervise `setsid` process groups with child-aware watchdogs and per-step `$`/token telemetry.
 
-You can explore the generic orchestrator, test harness, and commit history in [`software-factory-agy`](https://github.com/melcutz/software-factory).
+You can explore the generic orchestrator, test harness, and commit history in [`software-factory`](https://github.com/melcutz/software-factory) (formerly `software-factory-agy`).

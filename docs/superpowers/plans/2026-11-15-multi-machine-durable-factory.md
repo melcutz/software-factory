@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn `software-factory-agy` into a durable, multi-machine autonomous factory using Git-native `refs/factory/*` coordination, `herdr-core` (`hc`) + `herdr-app` live visibility/intervention (OSC 7501 + `hc run --bg`), a global kill switch (`factory halt`/`resume`), and a polite host/LLM quota governor.
+**Goal:** Turn `software-factory` (formerly `software-factory-agy`) into a durable, multi-machine autonomous factory using Git-native `refs/factory/*` coordination, `herdr-core` (`hc`) + `herdr-app` live visibility/intervention (OSC 7501 + `hc run --bg`), a global kill switch (`factory halt`/`resume`), and a polite host/LLM quota governor.
 
 **Architecture:** Peer machines run `factory worker --all` inside `herdr-core` (`hc`) without any central coordinator server (falling back to local threads/subprocesses in plain terminals). All leases, checkpoints, locks, DAG cache, halt control, and 429 quota cooldowns live in orphan Git commits under `refs/factory/*` updated via `--force-with-lease`.
 
