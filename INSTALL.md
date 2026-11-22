@@ -11,8 +11,8 @@ For all configuration keys and layer precedence rules, see the [Configuration Re
 - **Python 3.10+** (standard library only; zero third-party runtime dependencies)
 - **Git** with `user.name` and `user.email` configured
 - **GitHub CLI (`gh >= 2.67`)** authenticated (`gh auth status`) with push and PR permissions *(older `gh` versions can hit deprecated Projects classic GraphQL errors on `gh pr edit`)*
-- **At least one coding agent CLI**:
-  - **Antigravity CLI (`agy`)** installed and authenticated on `PATH` (or configured via `providers.agy.bin` / `path_prepend`)
+- **Coding agent CLIs**:
+  - **Antigravity CLI (`agy`)** (required prerequisite) installed and authenticated on `PATH` (or configured via `providers.agy.bin` / `path_prepend`)
   - **Optional**: **OpenCode CLI (`opencode`)** if any role uses `opencode/*`, `openrouter/*`, or `opencode-go/*`
 - **Tooling used by your target repo's `factory/checks.sh`** (e.g., `pytest`, `npm`, `cargo`, `go`)
 - **Optional (for multi-machine fleet visibility)**: [`herdr-core` (`hc`) / `herdr-app`](https://herdr.dev/)
@@ -68,6 +68,8 @@ Next:
    gh label create "factory" --color "0E8A16" --description "Queued for autonomous software factory" --force
    gh label create "factory:needs-info" --color "FBCA04" --description "Waiting for issue clarification" --force
    gh label create "factory:needs-human" --color "D93F0B" --description "Escalated for human review" --force
+   # Optional label for human-approved ready PRs (labels.ship):
+   gh label create "factory:ship" --color "1D76DB" --description "Approved by human for factory merge" --force
    ```
 4. *(Optional)* **Create a GitHub ProjectV2 Board**:
    ```bash

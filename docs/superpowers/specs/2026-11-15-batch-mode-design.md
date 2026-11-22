@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-15  
 **Status:** Draft (Pending User Review)  
-**Repository:** `software-factory-agy`
+**Repository:** `software-factory` (formerly `software-factory-agy`)
 
 ---
 

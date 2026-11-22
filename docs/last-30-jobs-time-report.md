@@ -1,7 +1,7 @@
 # Factory Last-30-Jobs Time, Bottleneck & Tuning Report
 
 **Window analyzed:** `2026-11-15 20:01 UTC` -> `2026-11-17 04:30 UTC` across `worker-a` + `worker-b`
-**Cohort:** Last **30 jobs** across `example-app` (24), `software-factory-agy` (5), and `example-site` (1)
+**Cohort:** Last **30 jobs** across `example-app` (24), `software-factory` (5, recorded under former name `software-factory-agy`†), and `example-site` (1)
 **Outcomes:** **25 merged (`83.3%`)** -- **18 in 1 round (`72%` of merges)**, 4 in R2, 2 in R3, 1 in R4 | **4 rejected/superseded** | **1 `needs-human`** (`#640`, external Cloudflare Speed Brain setting)
 **Spend & Tokens:** **`$27.83` total** (**`$0.62` median** per merged job, `$0.93` mean) | **`17.64M` non-cache tokens** + **`113.39M` cached tokens (`86.5%` cache hit rate)**
 
@@ -151,3 +151,5 @@ Depending on whether you want **maximum velocity** or **maximum staging safety**
 
 > [!TIP]
 > **Projected Combined Impact:** Applying Levers 1-4 brings a typical `example-app` PR from **`~20-23 minutes` active wall-clock down to `~9-12 minutes`**, while **doubling to tripling batch merge throughput** (`~9 PRs/hr -> ~20-25 PRs/hr`) across `worker-a` + `worker-b`.
+
+*† Historical note: Job keys prefixed with `software-factory-agy:` reflect the repository's original name at the time of recording; the repository was later renamed to `software-factory`.*

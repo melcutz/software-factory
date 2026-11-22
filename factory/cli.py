@@ -110,7 +110,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="factory",
-        description="Autonomous Software Factory for Google Antigravity (agy)",
+        description=(
+            "Autonomous issue-to-merge software factory with pluggable coding agent "
+            "backends (agy, optional OpenCode, optional local gpu:* decision gate)"
+        ),
         formatter_class=_FMT,
         epilog=(
             "How it works:\n"
@@ -227,14 +230,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "doctor",
         parents=[repo_flags],
         formatter_class=_FMT,
-        help="Verify git, gh, agy, config.json, checks.sh, and .gitignore",
+        help="Verify git, gh, agy, optional opencode/gpu, config.json, checks.sh, and .gitignore",
         description=(
             "Verify repository and host prerequisites for running the factory.\n\n"
             "How it works:\n"
-            "  Checks that `git`, `gh`, and `agy` are installed, `git config user.name`\n"
-            "  and `user.email` are set, `factory/config.json` and executable\n"
-            "  `factory/checks.sh` exist, `python3 -m pytest` works (if referenced by\n"
-            "  `checks.sh`), and `.gitignore` ignores `.worktrees/` and `factory/jobs/`."
+            "  Checks that `git`, `gh`, and `agy` (required CLI prerequisite) are\n"
+            "  installed, `git config user.name` and `user.email` are set, layered\n"
+            "  `config.json` is valid, optional `opencode` / `gpu.mcp_url` backends\n"
+            "  are ready when configured, executable `factory/checks.sh` exists,\n"
+            "  `python3 -m pytest` works (if referenced by `checks.sh`), and\n"
+            "  `.gitignore` ignores `.worktrees/` and `factory/jobs/`."
         ),
         epilog="Examples:\n  factory doctor\n  factory doctor --all",
     )

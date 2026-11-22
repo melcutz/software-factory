@@ -3,13 +3,18 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "software-factory-agy"
+name = "software-factory"
 version = "0.3.0"
-description = "Autonomous Software Factory for Google Antigravity (agy)"
+description = "Autonomous issue-to-merge software factory with pluggable coding agent backends (agy, optional OpenCode, optional local gpu:* decision gate) and Git-native coordination"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/melcutz/software-factory"
+Repository = "https://github.com/melcutz/software-factory"
+Issues = "https://github.com/melcutz/software-factory/issues"
 
 [project.scripts]
 factory = "factory.cli:main"

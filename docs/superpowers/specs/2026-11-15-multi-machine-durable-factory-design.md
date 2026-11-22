@@ -2,13 +2,13 @@
 
 **Date:** 2026-11-15  
 **Status:** Draft (Pending User Review)  
-**Repository:** `software-factory-agy`
+**Repository:** `software-factory` (formerly `software-factory-agy`)
 
 ---
 
 ## 1. Overview & Goals
 
-Transform `software-factory-agy` from a single-machine, one-shot CLI (`factory run`) into a **durable, multi-machine autonomous software factory** tailored for personal desktops, laptops, and homelab machines connected via Tailscale SSH and GitHub.
+Transform `software-factory` (formerly `software-factory-agy`) from a single-machine, one-shot CLI (`factory run`) into a **durable, multi-machine autonomous software factory** tailored for personal desktops, laptops, and homelab machines connected via Tailscale SSH and GitHub.
 
 ### Core Goals
 1. **Zero Central Infrastructure:** No central coordinator server, daemon, message broker, or cloud database to host or maintain. All cross-machine coordination uses **native Git refs (`refs/factory/*`) with atomic `--force-with-lease` Compare-And-Swap** on GitHub.

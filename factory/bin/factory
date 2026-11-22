@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""factory/bin/factory — Autonomous Software Factory CLI wrapper for Google Antigravity (agy)."""
+"""factory/bin/factory — Autonomous Software Factory CLI wrapper (pluggable backends)."""
 from __future__ import annotations
 
 import os
