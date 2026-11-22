@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Medium Copy-Paste Ready: Autonomous Software Factory, Part 2</title>
+  <style>
+    body { font-family: Georgia, Cambria, "Times New Roman", Times, serif; max-width: 720px; margin: 40px auto; padding: 0 20px; color: #242424; line-height: 1.65; font-size: 18px; }
+    .toolbar { position: sticky; top: 0; background: #fff; border-bottom: 1px solid #e5e5e5; padding: 12px 0; margin-bottom: 24px; display: flex; gap: 12px; align-items: center; font-family: system-ui, -apple-system, sans-serif; font-size: 14px; }
+    button { background: #1a8917; color: #fff; border: 0; border-radius: 999px; padding: 8px 18px; font-size: 14px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #156d12; }
+    #status { color: #555; }
+    h1 { font-family: system-ui, -apple-system, sans-serif; font-size: 34px; line-height: 1.2; margin-bottom: 12px; }
+    h2 { font-family: system-ui, -apple-system, sans-serif; font-size: 24px; margin-top: 36px; }
+    h3 { font-family: system-ui, -apple-system, sans-serif; font-size: 20px; margin-top: 28px; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.85em; background: #f2f2f2; padding: 2px 5px; border-radius: 3px; }
+    hr { border: 0; border-top: 1px solid #ddd; margin: 32px 0; }
+    li { margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button onclick="copyForMedium()">Copy Article for Medium</button>
+    <span id="status">Or select the article below and press Ctrl+C, then paste directly into Medium.</span>
+  </div>
+  <article id="article">
+<h1>Building an Autonomous Software Factory, Part 2: Going Multi-Machine Without a Server (and Every Way It Broke)</h1>
+<p><em>War stories, 30-job fleet telemetry, and 10 distributed-systems lessons from scaling an autonomous coding factory across a homelab -- including letting it build itself.</em></p>
+<p>In Part 1, we showed how optimizing test gates, deploys, and model tiering on a single workstation cut our autonomous PR cost 35x (<code>$14.25</code> -&gt; <code>$0.27</code>) and dropped delivery time from <code>52.2</code> minutes to ~<code>20</code>.</p>
+<p>The obvious next question was: <strong>"Great -- now run it continuously across multiple machines and multiple repos without running a Kubernetes cluster or babysitting terminals."</strong></p>
+<p>So we did. Over four intense days, we separated the orchestrator engine from target repositories, built a <strong>zero-infrastructure multi-machine coordinator on native Git refs (<code>refs/factory/*</code>)</strong>, wired it into <strong><code>herdr-core</code> (<code>hc</code>) + OSC 7501</strong> for live fleet visibility, <strong>pointed the factory at itself</strong>, shipped <strong>Smart Batch Mode (<code>v0.3.0</code>)</strong>, ran <strong>30 instrumented fleet jobs</strong> across two 8-core machines (plus tried to recruit a third), and added <strong>pluggable multi-provider coder chains</strong> (<code>agy</code>, <code>opencode</code>, and an optional local GPU decision gate).</p>
+<p>What we discovered the hard way: <strong>going from 1 machine to 2 machines doesn't double your complexity -- it turns every single-process assumption you ever made into a distributed systems bug.</strong> At one point, our shiny 2-machine, 16-core fleet took 4 hours to stumble through 2 issues while a single interactive session finished 7 issues in 20 minutes -- and we came within an inch of rolling back to <code>v0.1.0</code>.</p>
+<p>Here is the architecture that survived, the 30-job fleet telemetry that surprised us <em>again</em>, and the 10 hard-won lessons from going multi-machine.</p>
+<hr>
+<h2>The Multi-Machine Architecture in 60 Seconds</h2>
+<p>Personal desktops and homelab boxes are not dedicated cloud servers -- humans still use them, laptops sleep, Wi-Fi drops, and nobody wants to maintain Redis or Postgres just to coordinate coding agents. So we built a <strong>peer-to-peer competing-consumer fleet</strong> with three core layers:</p>
+<ol>
+  <li><strong>Git Refs <em>Are</em> the Database (<code>refs/factory/*</code>):</strong> Every target repo coordinates workers via zero-parent orphan commits pushed with <code>git push --force-with-lease</code> Compare-And-Swap -- atomic job leases (<code>refs/factory/jobs/job-*</code>), mid-build slice checkpoints (<code>refs/factory/checkpoints/job-*</code>), worker heartbeats (<code>refs/factory/workers/&lt;machine&gt;</code>), a cross-machine staging mutex (<code>refs/factory/locks/staging</code>), a global kill switch (<code>refs/factory/control</code>), and shared <code>429</code> cooldowns (<code>refs/factory/quota</code>). Because custom <code>refs/factory/*</code> sit outside <code>refs/heads/*</code> and <code>refs/tags/*</code>, they trigger <strong>zero GitHub Actions runs</strong>, burn <strong>zero private-repo CI minutes</strong>, and never touch a checked-out worktree.</li>
+  <li><strong>Homelab-Polite Workers Inside Herdr (<code>hc</code>) + OSC 7501:</strong> Each machine runs <code>factory worker --all</code> inside <code>herdr-core</code>, checking local CPU/RAM admission limits before claiming work and spawning each job as a background child terminal that streams OSC 7501 status (<code>working</code>, <code>progress</code>, <code>blocked</code>, <code>done</code>). Spread-first pacing + hashed tie-breaking distributes batches evenly across idle hosts, and <code>factory halt</code> / <code>factory resume</code> stops the entire fleet cleanly within seconds without burning retry rounds.</li>
+  <li><strong>Smart Batch Mode + Pluggable Coder Chains:</strong> A single-call triage pass packs related/overlapping issues into a Batch-DAG executed inside one hot builder session with atomic per-issue commits and cherry-pick salvage if one issue fails. Per-role fallback chains route across <code>agy</code>, <code>opencode</code>, and an optional local GPU MCP decision gate with shared fleet-wide quota cooldown buckets.</li>
+</ol>
+<p><em>[Insert Diagram: Multi-Machine Git-Ref Fleet Architecture -- export from <code>README.md</code>]</em></p>
+<hr>
+<h2>By the Numbers: 30 Instrumented Fleet Jobs Across Two Machines</h2>
+<p>After stabilizing <code>worker-a</code> and <code>worker-b</code>, we pulled full stage-by-stage telemetry across <strong>30 consecutive multi-machine jobs</strong> (<code>example-app</code>: 24, <code>software-factory</code>: 5, <code>example-site</code>: 1) -- plus overall multi-repo fleet stats (<code>69</code> tracked jobs):</p>
+<ul>
+  <li><strong>30-job fleet outcomes:</strong> <strong><code>25 / 30</code> merged (<code>83.3%</code>)</strong> -- <strong><code>18</code> merged in Round 1 (<code>72%</code>)</strong>, <code>4</code> in R2, <code>2</code> in R3, <code>1</code> in R4; <code>4</code> rejected/superseded cleanly; <code>1</code> <code>needs-human</code> (an external Cloudflare setting, not a code bug)</li>
+  <li><strong>Overall multi-repo fleet stats (<code>69</code> jobs):</strong> <strong><code>91.3%</code> merge rate</strong> (<code>63</code> merged), <code>$81.55</code> total spend (<strong><code>$0.57</code> median</strong> per merged job), <strong><code>88.49%</code> prompt-cache hit rate</strong></li>
+  <li><strong>30-job cohort spend &amp; tokens:</strong> <strong><code>$27.83</code> total</strong> (<strong><code>$0.62</code> median</strong> per merged job) across <code>17.64M</code> non-cache + <code>113.39M</code> cached tokens (<code>86.5%</code> cache hit rate)</li>
+  <li><strong>Where active execution time actually went (<code>20.1m - 20.8m</code> median active):</strong>
+    <ul>
+      <li><strong>Writing code (<code>builder</code> Round 1):</strong> just <strong><code>3.1 min</code> (<code>12% - 16%</code> of active time)</strong></li>
+      <li><strong>Single-threaded staging lock, merge sync &amp; failover wait:</strong> <strong><code>29.5% - 38.2%</code></strong></li>
+      <li><strong>Playwright browser QA (running inside the global staging lock):</strong> <strong><code>17.3% - 21.8%</code></strong></li>
+      <li><strong>Repeated <code>checks.sh</code> test gates:</strong> <strong><code>12.6% - 14.0%</code></strong></li>
+      <li><strong>Cloudflare staging deploys:</strong> <strong><code>5.9% - 6.2%</code></strong></li>
+    </ul>
+  </li>
+  <li><strong>Unplanned human hiatus:</strong> <strong><code>54.7%</code> of raw calendar time (<code>1,067.5 min</code>)</strong> was just two jobs (<code>#637</code>, <code>#639</code>) sitting overnight in <code>needs-human</code> because <code>worker-b</code> was missing Playwright/Chromium</li>
+  <li><strong>Reviewer signal vs. ceremony (<code>88</code> reviewer LLM calls):</strong> <strong><code>98.9%</code> pass rate (<code>87 / 88</code>)</strong> -- while <code>review-security</code> on a heavy reasoning model took <strong><code>71.6s</code> median</strong> (the bottleneck in <code>10 / 11</code> rounds with <strong><code>0</code> catches</strong>) and <code>approver</code> rubber-stamped <strong><code>10 / 10</code></strong> clean PRs that only had non-blocking <code>low</code> nits</li>
+</ul>
+<hr>
+<h2>10 Hard-Won Lessons from Going Multi-Machine</h2>
+<h3>1. Going Multi-Process Broke Every Single-Process Assumption Overnight</h3>
+<p>In <code>v0.1.0</code>, one Python process coordinated threads inside one repo. The moment <code>factory worker</code> spawned separate <code>_exec-job</code> processes via <code>hc</code> across two machines, four "impossible" bugs detonated back-to-back:</p>
+<ul>
+  <li><strong>In-process <code>RLock</code> stopped being a lock:</strong> Concurrent <code>_exec-job</code> processes on the same host raced on <code>git fetch</code> and clobbered <code>.git/FETCH_HEAD</code> until we upgraded <code>repo_lock()</code> to combine a thread lock with OS-level <code>fcntl.flock</code> (<a href="https://github.com/melcutz/software-factory/commit/51069c7a5"><code>51069c7</code></a>).</li>
+  <li><strong>In-process <code>pytest-xdist</code> budgeting caused <code>154%</code> CPU starvation:</strong> Our Part 1 <code>_ACTIVE_FULL_GATES</code> counter only knew about threads in its <em>own</em> process! Two sibling <code>_exec-job</code> processes each spawned <code>8</code> pytest workers (<code>16+</code> Python processes on an 8-core box), spiking load to <strong><code>154.1%</code></strong>, tripping our own Host Admission Governor (<code>&gt;= 85%</code>), blocking new claims, and causing wall-clock latency assertions (<code>time.perf_counter()</code>) to fail under CPU starvation. Moving gate slot counting to OS-level PID files (<code>/tmp/factory-gate-slots-&lt;uid&gt;/</code>) fixed it immediately (<a href="https://github.com/melcutz/software-factory/commit/0a822fab5"><code>0a822fa</code></a>).</li>
+  <li><strong>Silent lease expiry triggered cross-host double-runs:</strong> Any stage taking <code>&gt; 6</code> minutes expired its <code>360s</code> job lease and got stolen mid-flight by the other machine. Worse, our first <code>renew_job_lease()</code> patch had a subtle bug that failed quietly -- burning <strong><code>37.1 minutes</code> of duplicate cross-host reruns</strong> before we caught and fixed it (<a href="https://github.com/melcutz/software-factory/commit/1486a05eb"><code>1486a05</code></a>, <a href="https://github.com/melcutz/software-factory/commit/51069c7a5"><code>51069c7</code></a>).</li>
+  <li><strong>Orphaned staging train tickets caused standalone + batched double-processing:</strong> When <code>worker-b</code> restarted mid-merge, its leftover <code>refs/factory/train/job-628</code> ticket was scooped up into <code>worker-a</code>'s <code>train_size=2</code> staging batch <em>while</em> another worker simultaneously ran <code>#628</code> standalone (<a href="https://github.com/melcutz/software-factory/commit/73a3fe031"><code>73a3fe0</code></a>).</li>
+</ul>
+<h3>2. Homelab Machines Are Snowflakes: Non-Login <code>PATH</code>, Missing Browsers, and <code>SIGILL</code></h3>
+<p>Our design spec started with an optimistic sentence: <em>"Every machine is provisioned to pass <code>factory doctor</code>."</em> Reality tested that immediately:</p>
+<ul>
+  <li><strong>The <code>SIGILL</code> (<code>-4</code>) CPU trap:</strong> Our third homelab machine (a 1st-gen Intel Core i7 laptop with <code>sse4_2</code> only, no <code>AVX</code>/<code>AVX2</code>) passed Python, <code>git</code>, <code>gh</code>, and all 8 staging secrets -- then died instantly on <code>agy --version</code> with <strong><code>exit -4</code> (<code>SIGILL</code> -- Illegal Instruction)</strong>. That single check birthed <code>factory fleet remove</code> (<a href="https://github.com/melcutz/software-factory/commit/084c735ea"><code>084c735</code></a>).</li>
+  <li><strong>Environment drift cost us 14.6 overnight hours:</strong> <code>worker-b</code> lacked <code>git config user.name</code>, lacked <code>pytest</code> on <code>/usr/bin/python3</code>, had an old <code>/usr/bin/gh</code> (<code>2.46.0</code>, hitting deprecated <code>projectCards</code> GraphQL errors), missed <code>uv</code> and <code>node</code> in non-login <code>hc</code> shells (where <code>~/.local/bin</code> isn't on <code>PATH</code>), and lacked Playwright + Chromium system libraries -- stalling <code>#637</code> and <code>#639</code> overnight for <strong><code>880</code> combined minutes</strong>.</li>
+  <li><strong>Fix:</strong> Treat <code>factory doctor</code> as a strict admission gate that actually tests <code>git</code> identity, <code>pytest</code>, Playwright Chromium launch, and the repo's exact <code>WRANGLER</code> command before a worker is allowed to claim a single issue (<a href="https://github.com/melcutz/software-factory/commit/7b648243d"><code>7b64824</code></a>, <a href="https://github.com/melcutz/software-factory/commit/21b62c253"><code>21b62c2</code></a>, <a href="https://github.com/melcutz/software-factory/commit/0cb8f423f"><code>0cb8f42</code></a>).</li>
+</ul>
+<h3>3. Adding Machines Can't Outrun a Single Global Lock (Amdahl's Law Hits Hard)</h3>
+<p>In Part 1, we found that 66% of time wasn't LLMs. After scaling to two 8-core machines, the 30-job telemetry showed an even starker split: <strong>writing code (<code>builder</code> Round 1) took a median of just <code>3.1 minutes</code> (<code>12% - 16%</code> of active time).</strong></p>
+<p>Over <strong>70% of active wall-clock time</strong> happened <em>after</em> the code was written -- and <strong><code>29.5% - 38.2%</code></strong> was spent waiting single-file behind <strong><code>refs/factory/locks/staging</code></strong>, because there is only one live <code>staging.example-app.com</code> environment! Worse:</p>
+<ul>
+  <li><code>qa.md</code> launched full headless Chromium login + screenshots (<code>5 - 10 min</code>) even on backend-only OAuth/MCP/header PRs -- <em>while holding the global staging lock</em>.</li>
+  <li><code>coalesce_window_sec: 15</code> was narrower than issue arrival stagger, so <strong><code>train_size</code> was <code>1</code> on 100% of a 9-job batch</strong>. Every waiting PR saw <code>origin/main</code> advance ahead of it, invalidating <code>verified_gate_sha</code> and forcing another <code>~2 min</code> full pre-merge test gate.</li>
+  <li>Math is unforgiving: <code>1.4m deploy + 5.1m browser QA = ~6.5m</code> inside a global mutex capped fleet merge throughput at <strong>~9 PRs/hour whether you ran 2 machines or 10</strong>.</li>
+</ul>
+<p><strong>What broke the logjam (<a href="https://github.com/melcutz/software-factory/commit/52a469f4b"><code>52a469f</code></a>):</strong> Widening <code>coalesce_window_sec</code> from <code>15s -&gt; 60s</code>, adding an HTTP/API fast-mode to Staging QA for non-UI PRs (<code>~40s</code> instead of <code>5 - 10m</code>), conditionalizing Tailwind CSS rebuilds in <code>checks.sh</code>, and waking the claim loop on <code>ramp_up_delay_sec</code> instead of sleeping a full <code>poll_interval_sec</code> after every single claim.</p>
+<h3>4. Letting the Factory Build Itself Was Brutally Humbling -- and Birthed Smart Batch Mode</h3>
+<p>Right after shipping <code>v0.2.0</code>, we enabled <code>allow_self_host: true</code> and filed Issues <code>#1</code>–<code>#9</code> so the factory could build its own upgrades. It <em>did</em> ship <code>#1</code> (<code>PR #10</code>, <code>$3.26</code>), <code>#2</code> (<code>PR #11</code>, <code>$7.90</code>), and later <code>#12</code> (<code>PR #13</code>, <code>$0.42</code>).</p>
+<p>But watching our 2-machine, 16-core fleet spend <strong>4 hours stumbling through 2 issues</strong> -- while <code>reviewer-code</code> tried to edit <code>pipeline.py</code> and run <code>git commit</code> inside a read-only review turn, a background daemon collided with <code>factory run</code>, and 6–10 cold subprocesses re-read the same ~5k-LOC repo on every stage -- pushed us to the brink of reverting to <code>v0.1.0</code>. Meanwhile, finishing <code>#3</code>–<code>#9</code> in one continuous hot session took <strong>~20 minutes</strong>.</p>
+<p>That stark contrast sparked <strong>Smart Batch Mode (<code>v0.3.0</code>)</strong>:</p>
+<ul>
+  <li><strong>AST-enriched <code>REPO_MAP.md</code> (<code>&lt;= 150</code> lines):</strong> Stdlib <code>ast.parse()</code> indexes top-level classes, functions, line numbers, and <code>src &lt;-&gt; test</code> pairs so builders stop cold-grepping (<a href="https://github.com/melcutz/software-factory/commit/ca37770f2"><code>ca37770</code></a>).</li>
+  <li><strong>Single-call triage + deterministic Batch-DAG packer (<code>pack_batches()</code>):</strong> Packs file-overlapping and dependent issues into one batch (up to <code>5</code> issues / weight <code>6</code>), schedules disjoint batches in parallel, and isolates human-gated risk into solo batches (<a href="https://github.com/melcutz/software-factory/commit/758a59787"><code>758a597</code></a>).</li>
+  <li><strong>One hot <code>batch-builder</code> session + cherry-pick commit salvage:</strong> Implements issues in topological order with one <code>(#N)</code> commit per issue (merged non-squash so every issue stays individually revertible). If one issue breaks <code>checks.sh</code> even after a retry, Python cherry-picks the passing commits onto a clean branch, ships the healthy subset, and escalates <em>only</em> the broken issue (<a href="https://github.com/melcutz/software-factory/commit/2bb23da18"><code>2bb23da</code></a>).</li>
+</ul>
+<h3>5. Non-Hermetic Tests Can Literally Halt Your Factory -- or Commit Code to Your Real Repo</h3>
+<p>When autonomous agents run <code>pytest</code> on your orchestrator itself, non-hermetic tests turn into slapstick horror:</p>
+<ul>
+  <li><strong>The Self-Halting Spec Writer (<a href="https://github.com/melcutz/software-factory/commit/7cb3a63bc"><code>7cb3a63</code></a>):</strong> During Issue <code>#12</code>, <code>spec-writer</code> ran <code>pytest</code> on <code>tests/test_git_state.py</code>. One test (<code>test_halt_and_resume_preserves_checkpoint_without_needs_human</code>) forgot to isolate <code>FACTORY_HOST_DIR</code> -- so it wrote <code>"lunch break"</code> to the <em>real</em> <code>~/.config/factory/halt.signal</code>, causing <code>spec-writer</code> to <strong>halt itself mid-run</strong>.</li>
+  <li><strong>The Runaway Test That Committed Real Code:</strong> Later, when wiring <code>opencode</code> fallback chains into <code>factory/config.json</code>, an e2e test wasn't isolating <code>FACTORY_OPENCODE_BIN</code>. <code>pytest</code> dispatched to the <em>real</em> <code>~/.opencode/bin/opencode</code> binary with <code>cwd</code> set to our live repo -- and the real LLM happily wrote <code>fix.py</code> + <code>tests/test_fix.py</code> and <strong>committed <code>af18f54</code> directly onto our working branch</strong> before a supervisor killed it!</li>
+</ul>
+<p><strong>Rule carved in stone:</strong> Put an <code>autouse</code> fixture in <code>tests/conftest.py</code> that poisons <em>every</em> real coder binary, local MCP URL, <code>HC_TERMINAL_ID</code>, and <code>FACTORY_HOST_DIR</code> so any unmocked call fails loudly in 1 millisecond instead of mutating your machine.</p>
+<h3>6. Git-Ref State Works Great -- Once You Patch Its Five Sharp Edges</h3>
+<p>Using <code>refs/factory/*</code> as a zero-server coordination store worked remarkably well (<code>0</code> Actions minutes, <code>&lt;10ms</code> local object writes, zero branch pollution), once we hunted down five production edge cases:</p>
+<ul>
+  <li><strong><code>git commit-tree</code> empty/unfetched parent (<code>exit 128</code>):</strong> <code>put_train_ticket</code> used <code>git ls-remote</code> instead of <code>git fetch</code>, so when a peer machine owned the previous ref, the parent commit SHA wasn't in our local <code>.git/objects</code> yet and <code>commit-tree -p</code> crashed (<a href="https://github.com/melcutz/software-factory/commit/73a3fe031"><code>73a3fe0</code></a>, <a href="https://github.com/melcutz/software-factory/commit/21b62c253"><code>21b62c2</code></a>).</li>
+  <li><strong>One GitHub blip killed the whole worker daemon:</strong> An unhandled <code>gh issue list</code> network hiccup (<code>error connecting to api.github.com</code>) crashed <code>worker-b</code> silently, leaving <code>worker-a</code> carrying 9 issues solo until we wrapped every poll iteration in <code>try/except</code> (<a href="https://github.com/melcutz/software-factory/commit/0a822fab5"><code>0a822fa</code></a>).</li>
+  <li><strong><code>git pull --ff-only</code> in <code>fleet update</code> broke on multi-branch remotes</strong> (<code>fatal: Cannot fast-forward to multiple branches</code>) -- always pass explicit <code>origin &lt;branch&gt;</code> (<a href="https://github.com/melcutz/software-factory/commit/6f798a536"><code>6f798a5</code></a>), and remember that pulling code on disk doesn't reload long-lived Python worker daemons (<code>factory fleet restart</code>, <a href="https://github.com/melcutz/software-factory/commit/21b62c253"><code>21b62c2</code></a>).</li>
+  <li><strong>Split-brain local vs. remote state:</strong> When <code>worker-a</code> merged or cleaned a job, <code>worker-b</code> still kept stale local <code>factory/jobs/job-N/</code> and old <code>factory/job-N</code> branches -- causing retries to resume empty branches and <code>factory status</code> to print <code>NOT RUNNING / stale</code> for jobs actively running on the other machine! Reconciling against remote refs, adding a local <code>cat-file -e</code> fast path (cutting <code>factory status</code> from <code>~7.5s</code> to <code>~1.7s</code>), and making <code>factory clean</code> reconcile closed issues without deleting logs made status trustworthy again (<a href="https://github.com/melcutz/software-factory/commit/b58bd3f69"><code>b58bd3f</code></a>, <a href="https://github.com/melcutz/software-factory/commit/51069c7a5"><code>51069c7</code></a>).</li>
+</ul>
+<h3>7. Background Rescue Shells Silently Wedge Your Worker Slots -- and QA Fix Rounds Need Their Own Evidence</h3>
+<p>Two deceptively small bugs caused hours of head-scratching:</p>
+<ul>
+  <li><strong>The PTY Rescue-Shell Trap (<a href="https://github.com/melcutz/software-factory/commit/003a91569"><code>003a915</code></a>):</strong> In our Herdr design, if a job hit <code>needs-human</code> inside a TTY, <code>_exec-job</code> dropped into an interactive <code>/bin/bash</code> shell in the worktree so a human could debug immediately. Sounds helpful -- except <code>hc run --bg</code> allocates a real PTY (<code>sys.stdin.isatty() == True</code>)! Every escalated background job parked an idle <code>/bin/bash</code> forever, permanently hogging worker slots until the machine looked full while doing nothing.</li>
+  <li><strong>Blind QA Fix Rounds Across Machines (<a href="https://github.com/melcutz/software-factory/commit/f2c1c7a1c"><code>f2c1c7a</code></a>):</strong> After a staging QA failure and rollback, <code>qa-failure.md</code> wasn't being injected into the Round-2 builder prompt, <em>and</em> the restored rollback branch wasn't synced back to <code>refs/factory/checkpoints/*</code>. If <code>worker-b</code> picked up the retry after <code>worker-a</code> rolled back staging, Builder literally had to guess why staging failed!</li>
+</ul>
+<h3>8. Teach QA to Recognize <code>external_blocker</code> -- Code Edits Can't Fix Dashboard Toggles</h3>
+<p>On <code>job-640</code>, our factory cleanly removed <code>&lt;script type="speculationrules"&gt;</code> from templates and JS, deployed to staging, and Playwright <em>still</em> recorded <code>HTTP 503</code> (<code>cf-speculation-refused</code>) across <strong>3 consecutive QA rounds</strong> and 3 automated rollbacks.</p>
+<p>The culprit wasn't in the repo at all: <strong>Cloudflare Speed Brain</strong> was enabled at the zone level, injecting <code>speculation-rules: "/cdn-cgi/speculation"</code> into every response header at the edge!</p>
+<p>No amount of Builder retries could flip a Cloudflare dashboard toggle. Adding an explicit <code>external_blocker</code> field to the QA output schema (<a href="https://github.com/melcutz/software-factory/commit/21b62c253"><code>21b62c2</code></a>) lets QA escalate immediately on Round 1 instead of burning 3 revert-and-rebuild cycles -- paired with a structured <code>### Factory Escalation</code> comment (<strong>Root Cause</strong> + <strong>Action Needed</strong> at the top) and remote <code>factory logs</code> fallback so you can debug a failure on <code>worker-b</code> from <code>worker-a</code> (<a href="https://github.com/melcutz/software-factory/commit/488c95dd5"><code>488c95d</code></a>).</p>
+<h3>9. Audit Reviewers and Approvers With Data -- Ceremony Masquerades as Safety</h3>
+<p>Across <strong>88 reviewer LLM calls</strong> in our 30-job telemetry report:</p>
+<ul>
+  <li><code>review-code</code>, <code>review-security</code>, <code>review-ux</code>, and <code>review-ui</code> returned <code>PASS</code> <strong>87 / 88 times (<code>98.9%</code>)</strong>.</li>
+  <li><code>review-security</code> (running on a heavy reasoning model) averaged <strong><code>71.6s</code> median</strong> (<code>7x</code> slower than <code>review-code</code> at <code>10.2s</code>), was the wall-clock bottleneck in <strong><code>10 / 11</code> security-tagged rounds (<code>91%</code>)</strong>, and caught <strong><code>0</code> failures</strong>.</li>
+  <li><code>approver</code> triggered sequentially on <code>10 / 20</code> jobs whenever any reviewer left a harmless non-blocking <code>low</code> nit, adding <code>31 - 46s</code> and approving <strong><code>10 / 10</code> (<code>100%</code>)</strong>.</li>
+</ul>
+<p>Telemetry let us trim ~<code>25% - 30%</code> of latency and cost without weakening real safety gates: relax <code>auto_approve_clean</code> to skip <code>approver</code> when every reviewer returns <code>PASS</code> with zero blocking findings, drop <code>intake</code> and <code>planner</code> to low-effort tiers, and only escalate <code>review-security</code> to frontier reasoning when <code>risk == "high"</code> (<a href="https://github.com/melcutz/software-factory/commit/52a469f4b"><code>52a469f</code></a>).</p>
+<h3>10. Multi-Provider Fallback Chains + Layered Config Make an Open-Source Factory Usable</h3>
+<p>Depend on one coding CLI and one quota bucket, and a single <code>429</code> stalls your entire fleet. Hardcode your personal model tiers, pricing tables, and machine hostnames in <code>factory/config.json</code>, and open-sourcing becomes a leak hazard.</p>
+<p>Our latest milestone (<a href="https://github.com/melcutz/software-factory/commit/3db5ae36f">PR <code>#15</code></a>) fixed both:</p>
+<ul>
+  <li><strong>Pluggable coder backends &amp; per-role fallback chains:</strong> Every role accepts an ordered provider chain across <code>agy</code>, <code>opencode</code> (including free/low-cost tiers), and an optional local GPU MCP decision gate (<code>gpu:*</code>, which abstains cleanly below <code>0.9</code> confidence so the chain falls through).</li>
+  <li><strong>Shared cooldown buckets (<code>refs/factory/quota</code>):</strong> A <code>429</code> puts <em>only that provider bucket</em> in fleet-wide cooldown while the chain fails over immediately to the next tier -- never escalating to <code>needs-human</code>.</li>
+  <li><strong>Layered config + denylist leak checks:</strong> <code>DEFAULT_CONFIG</code> -&gt; <code>~/.config/factory/config.json</code> -&gt; <code>&lt;repo&gt;/factory/config.json</code> -&gt; <code>&lt;repo&gt;/factory/config.local.json</code> (gitignored), backed by a denylist-driven <code>scripts/check_leaks.py</code> gate in <code>checks.sh</code> so private domains, hostnames, and endpoints never sneak into public commits.</li>
+</ul>
+<hr>
+<h2>If You're Scaling Your Factory Beyond One Machine, Start Here</h2>
+<ol>
+  <li><strong>Promote every local lock and counter to OS or Git scope</strong> -- thread <code>RLock</code>s and in-process CPU counters break the instant you spawn multi-process workers.</li>
+  <li><strong>Gate every worker on a ruthless <code>doctor</code> check</strong> -- non-login <code>PATH</code>, missing Chromium libs, old CLIs, and <code>SIGILL</code> CPUs will burn more overnight hours than any LLM hallucination.</li>
+  <li><strong>Watch Amdahl's Law on shared staging</strong> -- widen deploy-train batching windows and keep slow browser QA out of backend-only PRs, or 10 machines will run no faster than 1.</li>
+  <li><strong>Make your test suite aggressively hermetic</strong> -- poison every real coder binary, MCP URL, and host config path in <code>conftest.py</code> before letting agents run <code>pytest</code> on your orchestrator.</li>
+  <li><strong>Batch related work in hot sessions, and teach QA to stop on external blockers</strong> -- cold multi-stage subprocesses and 3-round retries on dashboard toggles are pure token waste.</li>
+</ol>
+<p>You can explore the zero-server multi-machine orchestrator (<code>v0.3.0</code>), Smart Batch Mode, pluggable coder backends, and full 30-job telemetry report in <a href="https://github.com/melcutz/software-factory"><code>software-factory</code></a>.</p>
+  </article>
+  <script>
+    async function copyForMedium() {
+      const el = document.getElementById("article");
+      const status = document.getElementById("status");
+      try {
+        const htmlBlob = new Blob([el.innerHTML], { type: "text/html" });
+        const textBlob = new Blob([el.innerText], { type: "text/plain" });
+        await navigator.clipboard.write([new ClipboardItem({ "text/html": htmlBlob, "text/plain": textBlob })]);
+        status.textContent = "Copied rich HTML! Paste directly into Medium (Ctrl+V).";
+      } catch (e) {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        document.execCommand("copy");
+        status.textContent = "Copied via selection fallback! Paste into Medium (Ctrl+V).";
+      }
+    }
+  </script>
+</body>
+</html>
